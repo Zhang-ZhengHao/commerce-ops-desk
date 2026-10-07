@@ -5,11 +5,12 @@ from __future__ import annotations
 import math
 import re
 from datetime import datetime
-from typing import Annotated, Protocol, cast
+from typing import Annotated, Any, Protocol, cast
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from app.auth.csrf import derive_csrf_token, require_csrf, require_same_origin
@@ -18,6 +19,7 @@ from app.auth.session import (
     SESSION_COOKIE_NAME,
     SESSION_COOKIE_PATH,
     AuthContext,
+    TokenFactory,
     as_utc,
     create_session,
     derive_bootstrap_session_token,
@@ -26,7 +28,7 @@ from app.auth.session import (
     load_auth_context,
 )
 from app.config import Settings
-from app.models import CommandReceipt, Membership, Role
+from app.models import CommandReceipt, Membership, Organization, Role
 from app.services.bootstrap_idempotency import (
     claim_bootstrap_receipt,
     complete_bootstrap_receipt,
@@ -340,6 +342,91 @@ def get_session(
         available_roles=_available_roles(database, context.organization.id),
         csrf_token=derive_csrf_token(settings, context.raw_token),
     )
+
+
+@router.post(
+    "/demo/reset",
+    response_model=SessionPayload,
+    status_code=status.HTTP_201_CREATED,
+)
+def reset_workspace(
+    request: Request,
+    response: Response,
+    database: Annotated[Session, Depends(get_database)],
+    context: Annotated[AuthContext, Depends(get_current_auth)],
+) -> SessionPayload:
+    """Atomically replace one authenticated synthetic demo workspace."""
+    require_same_origin(request)
+    settings = _settings(request)
+    if not context.organization.is_demo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Resource not found",
+        )
+    require_csrf(request, context, settings)
+
+    now = _clock(request)
+    source_address = client_source_address(request, settings)
+    initial_role = cast(Role, context.membership.role)
+    token_factory = cast(TokenFactory, request.app.state.token_factory)
+
+    try:
+        delete_result = database.execute(
+            delete(Organization).where(
+                Organization.id == context.organization.id,
+                Organization.is_demo.is_(True),
+            )
+        )
+        delete_cursor = cast(CursorResult[Any], delete_result)
+        if delete_cursor.rowcount != 1:
+            database.rollback()
+            raise _authentication_required()
+        created = create_demo_workspace(
+            database,
+            initial_role=initial_role,
+            source_address=source_address,
+            settings=settings,
+            now=now,
+            token_factory=token_factory,
+        )
+        replacement_context = AuthContext(
+            session=created.session,
+            membership=created.membership,
+            user=created.user,
+            organization=created.organization,
+            raw_token=created.raw_session_token,
+        )
+        result = _session_payload(
+            context=replacement_context,
+            available_roles=list(created.available_roles),
+            csrf_token=derive_csrf_token(settings, created.raw_session_token),
+        )
+        database.commit()
+    except DemoRateLimitExceeded as exc:
+        database.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Demo workspace rate limit reached",
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from None
+    except DemoCapacityExceeded:
+        database.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Demo workspace capacity reached",
+        ) from None
+    except Exception:
+        database.rollback()
+        raise
+
+    _set_session_cookie(
+        response,
+        settings=settings,
+        raw_token=created.raw_session_token,
+        expires_at=created.organization.expires_at,
+        now=now,
+    )
+    return result
 
 
 def _validated_idempotency_key(raw_key: str | None) -> str:

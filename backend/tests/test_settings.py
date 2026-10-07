@@ -19,6 +19,7 @@ def test_settings_default_to_the_local_sqlite_boundary() -> None:
     assert settings.demo_active_workspace_limit == 500
     assert settings.demo_workspace_ttl_hours == 4
     assert settings.demo_role_write_limit == 32
+    assert settings.demo_case_note_limit == 200
     assert settings.api_max_request_body_bytes == 16 * 1024
     assert settings.trusted_proxy_cidrs == ()
     assert settings.secure_cookies is False
@@ -64,6 +65,7 @@ def test_demo_limits_and_trusted_proxy_networks_are_validated() -> None:
         demo_source_hourly_limit=3,
         demo_active_workspace_limit=7,
         demo_role_write_limit=5,
+        demo_case_note_limit=11,
         api_max_request_body_bytes=2 * 1024,
         trusted_proxy_cidrs=("192.0.2.0/24", "2001:db8::/32"),
     )
@@ -71,6 +73,7 @@ def test_demo_limits_and_trusted_proxy_networks_are_validated() -> None:
     assert settings.demo_source_hourly_limit == 3
     assert settings.demo_active_workspace_limit == 7
     assert settings.demo_role_write_limit == 5
+    assert settings.demo_case_note_limit == 11
     assert settings.api_max_request_body_bytes == 2 * 1024
     assert tuple(str(network) for network in settings.trusted_proxy_networks) == (
         "192.0.2.0/24",
@@ -99,6 +102,14 @@ def test_demo_limits_and_trusted_proxy_networks_are_validated() -> None:
             environment="test",
             session_secret="test-secret-that-is-long-enough-for-hmac-only",
             demo_role_write_limit=0,
+        )
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            environment="test",
+            session_secret="test-secret-that-is-long-enough-for-hmac-only",
+            demo_case_note_limit=0,
         )
 
 

@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     demo_active_workspace_limit: int = Field(default=500, gt=0)
     demo_workspace_ttl_hours: int = Field(default=4, gt=0, le=24)
     demo_role_write_limit: int = Field(default=32, gt=0)
+    demo_case_note_limit: int = Field(default=200, gt=0)
     api_max_request_body_bytes: int = Field(default=16 * 1024, gt=0)
     trusted_proxy_cidrs: tuple[str, ...] = ()
 

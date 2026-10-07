@@ -33,9 +33,9 @@ test.describe('I01 hosted foundation', () => {
       page.getByRole('heading', { level: 2, name: 'Built for a safe public demo' }),
     ).toBeVisible();
     await expect(
-      page.getByRole('heading', { level: 2, name: 'Planned workflow' }),
+      page.getByRole('heading', { level: 2, name: 'Operational workflow' }),
     ).toBeVisible();
-    await expect(page.getByText(/product direction.*not implemented in I02/i)).toBeVisible();
+    await expect(page.getByText(/available in the temporary I03 workspace/i)).toBeVisible();
     await expect(page.getByText('Synthetic data only')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Enter as Manager' })).toBeEnabled();
     await expect(page.getByRole('button', { name: 'Enter as Agent' })).toBeEnabled();

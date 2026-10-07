@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,6 +19,15 @@ from app.models import CommandReceipt
 
 class IdempotencyConflictError(Exception):
     """The command key was already bound to a different canonical payload."""
+
+
+IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[!-~]{1,128}$")
+
+
+def valid_idempotency_key(raw_key: str | None) -> str | None:
+    if raw_key is None or IDEMPOTENCY_KEY_PATTERN.fullmatch(raw_key) is None:
+        return None
+    return raw_key
 
 
 @dataclass(frozen=True)

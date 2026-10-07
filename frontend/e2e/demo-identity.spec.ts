@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
+import type { Page } from '@playwright/test';
+
 import { expect, test } from './fixtures';
 
 interface SessionPayload {
@@ -18,6 +20,12 @@ function isApiCall(response: { url(): string; request(): { method(): string } },
   return (
     new URL(response.url()).pathname === path && response.request().method() === 'POST'
   );
+}
+
+function identityCard(page: Page) {
+  return page.getByRole('article').filter({
+    has: page.getByRole('heading', { name: 'Server-issued identity' }),
+  });
 }
 
 test.describe('I02 demo identity', () => {
@@ -42,7 +50,7 @@ test.describe('I02 demo identity', () => {
       page.getByRole('heading', { level: 1, name: 'Manager workspace' }),
     ).toBeVisible();
     await expect(page.getByText(created.workspace.name)).toBeVisible();
-    await expect(page.getByText('Demo Manager')).toBeVisible();
+    await expect(identityCard(page).getByText('Demo Manager', { exact: true })).toBeVisible();
     await expect(page.getByText('Manager access')).toBeVisible();
 
     const initialCookie = (await context.cookies()).find(
@@ -66,7 +74,7 @@ test.describe('I02 demo identity', () => {
     const restored = (await restoreResponse.json()) as SessionPayload;
     expect(restored.workspace.id).toBe(created.workspace.id);
     expect(restored.identity.membership_id).toBe(created.identity.membership_id);
-    await expect(page.getByText('Demo Manager')).toBeVisible();
+    await expect(identityCard(page).getByText('Demo Manager', { exact: true })).toBeVisible();
 
     const switchResponsePromise = page.waitForResponse((response) =>
       isApiCall(response, '/api/demo/role'),
@@ -77,7 +85,7 @@ test.describe('I02 demo identity', () => {
     const switched = (await switchResponse.json()) as SessionPayload;
     expect(switched.identity.role).toBe('agent');
     expect(switched.csrf_token).not.toBe(restored.csrf_token);
-    await expect(page.getByText('Demo Agent')).toBeVisible();
+    await expect(identityCard(page).getByText('Demo Agent', { exact: true })).toBeVisible();
     await expect(
       page.getByRole('heading', { level: 1, name: 'Agent workspace' }),
     ).toBeVisible();
@@ -122,7 +130,7 @@ test.describe('I02 demo identity', () => {
 
     expect(created.identity.role).toBe('agent');
     expect(created.identity.display_name).toBe('Demo Agent');
-    await expect(page.getByText('Demo Agent')).toBeVisible();
+    await expect(identityCard(page).getByText('Demo Agent', { exact: true })).toBeVisible();
     await expect(
       page.getByRole('heading', { level: 1, name: 'Agent workspace' }),
     ).toBeVisible();

@@ -214,7 +214,12 @@ class HostedSessionSecretContractTest(unittest.TestCase):
 
     def test_production_requires_an_explicit_secret_source(self) -> None:
         result, capture_file = self.hosted.run(
-            overrides={"COMMERCE_OPS_ENVIRONMENT": "production"}
+            overrides={
+                "COMMERCE_OPS_ENVIRONMENT": "production",
+                "COMMERCE_OPS_DATABASE_URL": (
+                    f"sqlite+pysqlite:///{self.hosted.root / 'production.sqlite3'}"
+                ),
+            }
         )
 
         self.assertNotEqual(result.returncode, 0)

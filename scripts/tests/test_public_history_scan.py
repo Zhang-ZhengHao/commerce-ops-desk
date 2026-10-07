@@ -191,6 +191,27 @@ class PublicHistoryScanTest(unittest.TestCase):
         self.assertNotIn(personal_email, output)
         self.assertNotIn(fake_token, output)
 
+    def test_detached_head_history_is_scanned(self) -> None:
+        self.seed_clean_commit()
+        personal_email = "pull-request-author" + "@personal." + "example"
+        self.repository.git("checkout", "--quiet", "--detach")
+        self.repository.git("config", "user.email", personal_email)
+        self.repository.git(
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--message",
+            "detached pull request head",
+        )
+
+        result = self.run_scan()
+        output = self.output(result)
+
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("identity.personal_email", output)
+        self.assertIn("history-meta:commit:", output)
+        self.assertNotIn(personal_email, output)
+
     def test_annotated_tag_metadata_is_scanned(self) -> None:
         self.seed_clean_commit()
         personal_email = "tagger" + "@private." + "example"
