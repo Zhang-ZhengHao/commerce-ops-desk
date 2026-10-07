@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   createCommandKey,
   createDemoWorkspace,
+  resetDemoWorkspace,
   restoreDemoSession,
   switchDemoRole,
   type DemoRole,
@@ -11,6 +12,7 @@ import {
 import { DemoEntry } from '../features/demo/DemoEntry';
 import {
   DemoWorkspace,
+  type ResetOperation,
   type RoleOperation,
 } from '../features/demo/DemoWorkspace';
 import './App.css';
@@ -27,6 +29,11 @@ interface PendingCommand {
   idempotencyKey: string;
 }
 
+interface PendingResetRecovery {
+  previousWorkspaceId: string;
+  message: string;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Please try again.';
 }
@@ -37,6 +44,9 @@ export function App() {
   const [pendingCreate, setPendingCreate] = useState<PendingCommand | null>(null);
   const [pendingSwitch, setPendingSwitch] = useState<PendingCommand | null>(null);
   const [roleOperation, setRoleOperation] = useState<RoleOperation>({ kind: 'idle' });
+  const [resetOperation, setResetOperation] = useState<ResetOperation>({ kind: 'idle' });
+  const [pendingResetRecovery, setPendingResetRecovery] =
+    useState<PendingResetRecovery | null>(null);
 
   const recoverSession = useCallback(async () => {
     setEntryState({ kind: 'checking' });
@@ -110,9 +120,18 @@ export function App() {
 
   const startRoleSwitch = useCallback(
     (role: DemoRole) => {
+      if (
+        resetOperation.kind === 'confirming' ||
+        resetOperation.kind === 'resetting' ||
+        resetOperation.kind === 'checking'
+      ) {
+        return;
+      }
+      setResetOperation({ kind: 'idle' });
+      setPendingResetRecovery(null);
       void runSwitch({ role, idempotencyKey: createCommandKey() });
     },
-    [runSwitch],
+    [resetOperation.kind, runSwitch],
   );
 
   const retryRoleSwitch = useCallback(() => {
@@ -148,6 +167,76 @@ export function App() {
     })();
   }, [pendingSwitch, runSwitch]);
 
+  const verifyResetOutcome = useCallback(async (pending: PendingResetRecovery) => {
+    setResetOperation({ kind: 'checking' });
+    try {
+      const restored = await restoreDemoSession();
+      if (!restored) {
+        setSession(null);
+        setEntryState({ kind: 'ready' });
+        setPendingResetRecovery(null);
+        setResetOperation({ kind: 'idle' });
+        return;
+      }
+
+      setSession(restored);
+      if (restored.workspace.id !== pending.previousWorkspaceId) {
+        setPendingResetRecovery(null);
+        setResetOperation({ kind: 'idle' });
+        return;
+      }
+
+      setResetOperation({ kind: 'error', message: pending.message });
+    } catch (error) {
+      setResetOperation({
+        kind: 'verification-error',
+        message: `${pending.message} Could not verify the active workspace. ${errorMessage(error)}`,
+      });
+    }
+  }, []);
+
+  const confirmReset = useCallback(() => {
+    if (
+      !session ||
+      roleOperation.kind === 'switching' ||
+      resetOperation.kind !== 'confirming'
+    ) {
+      return;
+    }
+    const previousWorkspaceId = session.workspace.id;
+    setPendingSwitch(null);
+    setRoleOperation({ kind: 'idle' });
+    setResetOperation({ kind: 'resetting' });
+    void (async () => {
+      try {
+        const reset = await resetDemoWorkspace(session.csrf_token);
+        setSession(reset);
+        setPendingResetRecovery(null);
+        setResetOperation({ kind: 'idle' });
+      } catch (error) {
+        const pending = {
+          previousWorkspaceId,
+          message: errorMessage(error),
+        };
+        setPendingResetRecovery(pending);
+        await verifyResetOutcome(pending);
+      }
+    })();
+  }, [resetOperation.kind, roleOperation.kind, session, verifyResetOutcome]);
+
+  const requestReset = useCallback(() => {
+    if (roleOperation.kind === 'switching') return;
+    setResetOperation({ kind: 'confirming' });
+  }, [roleOperation.kind]);
+
+  const cancelReset = useCallback(() => {
+    setResetOperation({ kind: 'idle' });
+  }, []);
+
+  const retryResetCheck = useCallback(() => {
+    if (pendingResetRecovery) void verifyResetOutcome(pendingResetRecovery);
+  }, [pendingResetRecovery, verifyResetOutcome]);
+
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">
@@ -170,10 +259,16 @@ export function App() {
       <main id="main-content" className="main-content">
         {session ? (
           <DemoWorkspace
+            key={`${session.workspace.id}:${session.identity.membership_id}`}
             session={session}
             roleOperation={roleOperation}
+            resetOperation={resetOperation}
             onSwitch={startRoleSwitch}
             onRetrySwitch={retryRoleSwitch}
+            onRequestReset={requestReset}
+            onCancelReset={cancelReset}
+            onConfirmReset={confirmReset}
+            onRetryResetCheck={retryResetCheck}
           />
         ) : (
           <DemoEntry

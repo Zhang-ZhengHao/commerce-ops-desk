@@ -10,6 +10,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.api.audit import router as audit_router
+from app.api.cases import router as cases_router
+from app.api.dashboard import router as dashboard_router
 from app.api.health import router as health_router
 from app.auth.session import TokenFactory, default_token_factory
 from app.config import Settings
@@ -63,6 +66,9 @@ def create_app(
         return JSONResponse(VALIDATION_FAILED_RESPONSE, status_code=422)
 
     application.include_router(health_router)
+    application.include_router(dashboard_router)
+    application.include_router(cases_router)
+    application.include_router(audit_router)
     if resolved_settings.demo_mode:
         from app.api.demo import router as demo_router
 

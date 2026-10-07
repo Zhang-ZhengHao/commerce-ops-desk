@@ -162,3 +162,18 @@ export async function switchDemoRole(
 
   return sessionFrom(response);
 }
+
+export async function resetDemoWorkspace(
+  csrfToken: string,
+): Promise<DemoSession> {
+  const response = await fetch('/api/demo/reset', {
+    credentials: 'same-origin',
+    headers: {
+      Accept: 'application/json',
+      'X-CSRF-Token': csrfToken,
+    },
+    method: 'POST',
+  });
+
+  return sessionFrom(response);
+}

@@ -28,6 +28,7 @@ from app.models import (
     Role,
     User,
 )
+from app.services.seeding import seed_demo_order_cases
 
 GLOBAL_CAPACITY_LOCK_DIGEST = hashlib.sha256(b"commerce-ops:demo-capacity-lock:v1").hexdigest()
 
@@ -267,6 +268,12 @@ def create_demo_workspace(
         (manager_user, manager_membership)
         if initial_role == "manager"
         else (agent_user, agent_membership)
+    )
+    seed_demo_order_cases(
+        db,
+        organization=organization,
+        agent_membership=agent_membership,
+        now=now,
     )
     db.flush()
     session_record, raw_token = create_session(

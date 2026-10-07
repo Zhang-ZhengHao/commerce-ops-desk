@@ -72,6 +72,60 @@ cd "$PRODUCT_DIR"
 
 export COMMERCE_OPS_ENVIRONMENT="${COMMERCE_OPS_ENVIRONMENT:-demo}"
 
+if [[ -z "${COMMERCE_OPS_DATABASE_URL:-}" ]]; then
+  if [[ "$COMMERCE_OPS_ENVIRONMENT" == "production" ]]; then
+    echo "[commerce-ops-desk] production requires an explicit database URL" >&2
+    exit 78
+  fi
+
+  if [[ "$COMMERCE_OPS_ENVIRONMENT" == "demo" ]]; then
+    LOCAL_DATABASE_DIR="/var/tmp/commerce-ops-desk"
+    "$PYTHON_BIN" -c '
+import os
+import stat
+import sys
+
+path = os.path.abspath(sys.argv[1])
+
+
+def fail() -> None:
+    print(
+        "[commerce-ops-desk] local database directory must be a real directory owned by the service user",
+        file=sys.stderr,
+    )
+    raise SystemExit(78)
+
+
+try:
+    os.mkdir(path, 0o700)
+except FileExistsError:
+    pass
+except OSError:
+    fail()
+
+descriptor = -1
+try:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        fail()
+    os.fchmod(descriptor, 0o700)
+except OSError:
+    fail()
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+' "$LOCAL_DATABASE_DIR"
+    export COMMERCE_OPS_DATABASE_URL="sqlite+pysqlite:///$LOCAL_DATABASE_DIR/commerce_ops.db"
+  fi
+fi
+
 if [[ -z "${COMMERCE_OPS_SESSION_SECRET:-}" ]]; then
   if [[ "$COMMERCE_OPS_ENVIRONMENT" == "production" ]] && \
     [[ -z "${COMMERCE_OPS_SESSION_SECRET_FILE:-}" ]]; then

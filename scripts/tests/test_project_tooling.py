@@ -9,7 +9,7 @@ PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ProjectToolingContractTest(unittest.TestCase):
-    def test_makefile_exposes_the_complete_i02_verification_surface(self) -> None:
+    def test_makefile_exposes_the_complete_i03_verification_surface(self) -> None:
         makefile = PRODUCT_ROOT / "Makefile"
         self.assertTrue(makefile.is_file(), "Makefile must exist")
 
@@ -32,9 +32,9 @@ class ProjectToolingContractTest(unittest.TestCase):
                 "build",
                 "verify",
             }.issubset(targets),
-            f"missing I02 targets: {targets}",
+            f"missing I03 targets: {targets}",
         )
-        self.assertIn("complete I02 verification gate", makefile.read_text())
+        self.assertIn("complete I03 verification gate", makefile.read_text())
 
     def test_environment_example_is_runnable_without_containing_credentials(
         self,
@@ -51,17 +51,19 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertRegex(contents, r"(?m)^PORT=[0-9]+$")
         self.assertNotRegex(contents, r"(?i)(password|secret|token)\s*=\s*[^\s#]+")
 
-    def test_ci_uses_full_history_least_privilege_and_every_i02_gate(self) -> None:
+    def test_ci_uses_full_history_least_privilege_and_every_i03_gate(self) -> None:
         workflow = PRODUCT_ROOT / ".github" / "workflows" / "verify.yml"
         self.assertTrue(workflow.is_file(), "verify workflow must exist")
         contents = workflow.read_text()
 
         self.assertRegex(contents, r"(?m)^permissions:\n  contents: read$")
         self.assertIn("fetch-depth: 0", contents)
-        self.assertIn("i02-demo-identity:", contents)
-        self.assertIn("name: Demo identity and access boundaries", contents)
+        self.assertIn("i03-order-case-workflow:", contents)
+        self.assertIn("name: Order and case workflow", contents)
         for command in (
+            "make setup",
             "make backend-test",
+            "make project-test",
             "make frontend-test",
             "make sqlite-migrate-test",
             "make hosted-smoke",
@@ -111,7 +113,7 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertIn("frontend/playwright-report/", contents)
         self.assertIn("frontend/test-results/", contents)
 
-    def test_public_docs_separate_verified_i02_scope_from_the_product_plan(
+    def test_public_docs_separate_verified_i03_scope_from_the_roadmap(
         self,
     ) -> None:
         readme = (PRODUCT_ROOT / "README.md").read_text()
@@ -120,34 +122,63 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertTrue(security_model_path.is_file())
         security_model = security_model_path.read_text()
 
-        self.assertIn("## Current verified scope", readme)
-        self.assertIn("I02 — Demo identity and access boundaries", readme)
-        self.assertIn("docs/assets/demo-entry.png", readme)
-        self.assertIn("docs/assets/manager-workspace.png", readme)
-        self.assertIn("## Planned product workflow", readme)
+        for heading in (
+            "## What you can verify",
+            "### 90-second walkthrough",
+            "## Architecture",
+            "## Run locally",
+            "## Verified scope and limits",
+        ):
+            self.assertIn(heading, readme)
+        self.assertIn("I03 order/case vertical slice", readme)
+        self.assertIn("docs/assets/demo-entry-i03.png", readme)
+        self.assertIn("docs/assets/exception-workflow.png", readme)
+        self.assertIn("Signed webhook intake, transactional outbox processing", readme)
+        self.assertIn("remain roadmap work", readme)
+
         self.assertIn("## Current verified slice", design_summary)
-        self.assertIn("I02", design_summary)
-        self.assertIn("## Target product outcome (planned)", design_summary)
-        self.assertIn("guardrail, not proof", design_summary)
+        self.assertIn(
+            "I03 delivers the first complete order-exception workflow",
+            design_summary,
+        )
+        for heading in (
+            "## Product outcome",
+            "## Users and authorization",
+            "## System boundaries",
+            "## Reliability model",
+            "## Security and privacy boundaries",
+            "## Verification evidence",
+        ):
+            self.assertIn(heading, design_summary)
+        self.assertIn("Signed webhook intake, the outbox worker", design_summary)
+        self.assertIn("remain planned", design_summary)
+
         for heading in (
             "## Threat model",
-            "## Session and CSRF controls",
+            "## Session and write controls",
             "## Tenant and role boundaries",
-            "## Abuse controls",
-            "## Database-backed idempotency",
-            "## Deployment limits",
+            "## Transaction and idempotency boundaries",
+            "## Abuse and resource controls",
+            "## Data and deployment limits",
         ):
             self.assertIn(heading, security_model)
-        self.assertIn("workspace-creation command", security_model)
-        self.assertIn("role-change command", security_model)
         self.assertIn(
-            "no live PostgreSQL migration, transaction, locking, or concurrency test has run",
+            "Production fails closed without an explicit secret and database URL",
+            security_model,
+        )
+        self.assertIn("The public demo is single-node", security_model)
+        self.assertIn(
+            "PostgreSQL models and Alembic DDL compile offline",
+            security_model,
+        )
+        self.assertIn(
+            "no live PostgreSQL migration, transaction, lock, or concurrency result is claimed",
             security_model,
         )
 
         for relative_path in (
-            "docs/assets/demo-entry.png",
-            "docs/assets/manager-workspace.png",
+            "docs/assets/demo-entry-i03.png",
+            "docs/assets/exception-workflow.png",
         ):
             self.assertTrue((PRODUCT_ROOT / relative_path).is_file())
 

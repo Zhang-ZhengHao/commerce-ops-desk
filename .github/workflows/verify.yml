@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  i02-demo-identity:
-    name: Demo identity and access boundaries
+  i03-order-case-workflow:
+    name: Order and case workflow
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

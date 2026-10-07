@@ -7,13 +7,17 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 ALEMBIC_CONFIG = BACKEND_ROOT / "alembic.ini"
 FOUNDATION_REVISION = "0001_foundation"
 DEMO_IDENTITY_REVISION = "0002_demo_identity"
 BOOTSTRAP_IDEMPOTENCY_REVISION = "0003_bootstrap_idempotency"
-HEAD_REVISION = BOOTSTRAP_IDEMPOTENCY_REVISION
+ORDER_CASE_REVISION = "0004_order_case"
+HEAD_REVISION = ORDER_CASE_REVISION
 DEMO_IDENTITY_TABLES = {
     "organizations",
     "users",
@@ -49,6 +53,36 @@ def run_upgrade(
             target,
         ],
         cwd=working_directory,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def run_downgrade(
+    database_path: Path,
+    *,
+    target: str,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "COMMERCE_OPS_DATABASE_URL": f"sqlite+pysqlite:///{database_path}",
+            "COMMERCE_OPS_ENVIRONMENT": "test",
+        }
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "alembic",
+            "-c",
+            str(ALEMBIC_CONFIG),
+            "downgrade",
+            target,
+        ],
+        cwd=BACKEND_ROOT,
         env=environment,
         capture_output=True,
         text=True,
@@ -166,7 +200,7 @@ def test_bootstrap_receipts_upgrade_an_already_stamped_identity_database(
     head_result = run_upgrade(database_path)
 
     assert head_result.returncode == 0, head_result.stdout + head_result.stderr
-    assert read_applied_revision(database_path) == BOOTSTRAP_IDEMPOTENCY_REVISION
+    assert read_applied_revision(database_path) == HEAD_REVISION
     assert "bootstrap_receipts" in read_table_names(database_path)
 
 
@@ -276,3 +310,264 @@ def test_bootstrap_receipt_schema_is_source_scoped_and_secret_free(
         database_path,
         "bootstrap_receipts",
     )
+
+
+def test_order_case_migration_adds_tenant_scoped_workflow_tables(tmp_path: Path) -> None:
+    database_path = tmp_path / "order-case-schema.sqlite3"
+
+    previous_result = run_upgrade(database_path, target=BOOTSTRAP_IDEMPOTENCY_REVISION)
+    assert previous_result.returncode == 0, previous_result.stdout + previous_result.stderr
+    assert {
+        "orders",
+        "exception_cases",
+        "case_notes",
+        "audit_events",
+    }.isdisjoint(read_table_names(database_path))
+    assert "case_note_count" not in read_columns(database_path, "organizations")
+
+    head_result = run_upgrade(database_path)
+
+    assert head_result.returncode == 0, head_result.stdout + head_result.stderr
+    assert read_applied_revision(database_path) == ORDER_CASE_REVISION
+    assert {
+        "orders",
+        "exception_cases",
+        "case_notes",
+        "audit_events",
+    } <= read_table_names(database_path)
+    for table in ("orders", "exception_cases", "case_notes", "audit_events"):
+        assert read_columns(database_path, table)["organization_id"] == 1
+    assert read_columns(database_path, "organizations")["case_note_count"] == 1
+
+    case_columns = read_columns(database_path, "exception_cases")
+    assert {
+        "order_id",
+        "source_event_id",
+        "rule_key",
+        "case_type",
+        "severity",
+        "status",
+        "assignee_membership_id",
+        "due_at",
+        "resolution_reason",
+        "resolved_at",
+        "version",
+    } <= case_columns.keys()
+    assert ("organization_id", "source_event_id", "rule_key") in read_unique_indexes(
+        database_path,
+        "exception_cases",
+    )
+    assert ("organization_id", "action_key") in read_unique_indexes(
+        database_path,
+        "audit_events",
+    )
+    case_sql = read_create_table_sql(database_path, "exception_cases")
+    assert "payment_failed" in case_sql
+    assert "refund_review" in case_sql
+    assert "fulfillment_delayed" in case_sql
+    assert "open" in case_sql
+    assert "assigned" in case_sql
+    assert "resolved" in case_sql
+
+
+def test_order_case_migration_downgrades_to_the_previous_schema(tmp_path: Path) -> None:
+    database_path = tmp_path / "order-case-downgrade.sqlite3"
+    head_result = run_upgrade(database_path)
+    assert head_result.returncode == 0, head_result.stdout + head_result.stderr
+
+    downgrade_result = run_downgrade(database_path, target=BOOTSTRAP_IDEMPOTENCY_REVISION)
+
+    assert downgrade_result.returncode == 0, downgrade_result.stdout + downgrade_result.stderr
+    assert read_applied_revision(database_path) == BOOTSTRAP_IDEMPOTENCY_REVISION
+    assert {
+        "orders",
+        "exception_cases",
+        "case_notes",
+        "audit_events",
+    }.isdisjoint(read_table_names(database_path))
+    assert "case_note_count" not in read_columns(database_path, "organizations")
+
+
+def _seed_case_constraint_parents(connection: sqlite3.Connection) -> None:
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute(
+        """
+        INSERT INTO organizations (
+            id, name, is_demo, case_note_count, created_at, expires_at
+        ) VALUES (
+            'organization-1', 'Constraint workspace', 1, 0,
+            '2026-10-07 12:00:00', '2026-10-07 16:00:00'
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO users (id, organization_id, display_name, created_at)
+        VALUES (
+            'user-1', 'organization-1', 'Constraint Agent',
+            '2026-10-07 12:00:00'
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO memberships (id, organization_id, user_id, role, created_at)
+        VALUES (
+            'membership-1', 'organization-1', 'user-1', 'agent',
+            '2026-10-07 12:00:00'
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO orders (
+            id, organization_id, external_order_id, order_number,
+            amount_minor, currency, payment_status, fulfillment_status,
+            created_at, updated_at
+        ) VALUES (
+            'order-1', 'organization-1', 'external-order-1', 'DEMO-CONSTRAINT',
+            1000, 'USD', 'failed', 'unfulfilled',
+            '2026-10-07 12:00:00', '2026-10-07 12:00:00'
+        )
+        """
+    )
+
+
+def _insert_constraint_case(
+    connection: sqlite3.Connection,
+    *,
+    case_id: str,
+    **overrides: Any,
+) -> None:
+    values: dict[str, Any] = {
+        "id": case_id,
+        "organization_id": "organization-1",
+        "order_id": "order-1",
+        "source_event_id": f"event-{case_id}",
+        "rule_key": "payment_failed",
+        "case_type": "payment",
+        "severity": "high",
+        "status": "open",
+        "assignee_membership_id": None,
+        "due_at": "2026-10-07 14:00:00",
+        "resolution_reason": None,
+        "resolved_at": None,
+        "version": 1,
+        "created_at": "2026-10-07 12:00:00",
+        "updated_at": "2026-10-07 12:00:00",
+    }
+    values.update(overrides)
+    connection.execute(
+        """
+        INSERT INTO exception_cases (
+            id, organization_id, order_id, source_event_id, rule_key,
+            case_type, severity, status, assignee_membership_id, due_at,
+            resolution_reason, resolved_at, version, created_at, updated_at
+        ) VALUES (
+            :id, :organization_id, :order_id, :source_event_id, :rule_key,
+            :case_type, :severity, :status, :assignee_membership_id, :due_at,
+            :resolution_reason, :resolved_at, :version, :created_at, :updated_at
+        )
+        """,
+        values,
+    )
+
+
+def test_case_schema_requires_a_source_event_for_idempotency(tmp_path: Path) -> None:
+    database_path = tmp_path / "case-source-event-constraint.sqlite3"
+    result = run_upgrade(database_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    with sqlite3.connect(database_path) as connection:
+        _seed_case_constraint_parents(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_constraint_case(
+                connection,
+                case_id="case-without-source",
+                source_event_id=None,
+            )
+
+
+@pytest.mark.parametrize(
+    ("rule_key", "case_type", "severity"),
+    [
+        ("payment_failed", "refund", "high"),
+        ("refund_review", "refund", "high"),
+        ("fulfillment_delayed", "payment", "medium"),
+    ],
+)
+def test_case_schema_rejects_rule_shape_mismatches(
+    tmp_path: Path,
+    rule_key: str,
+    case_type: str,
+    severity: str,
+) -> None:
+    database_path = tmp_path / f"case-rule-shape-{rule_key}.sqlite3"
+    result = run_upgrade(database_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    with sqlite3.connect(database_path) as connection:
+        _seed_case_constraint_parents(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_constraint_case(
+                connection,
+                case_id=f"case-{rule_key}",
+                rule_key=rule_key,
+                case_type=case_type,
+                severity=severity,
+            )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "overrides"),
+    [
+        ("assigned-without-agent", {"status": "assigned"}),
+        (
+            "open-with-agent",
+            {"status": "open", "assignee_membership_id": "membership-1"},
+        ),
+        (
+            "open-with-resolution",
+            {
+                "status": "open",
+                "resolution_reason": "payment_recovered",
+                "resolved_at": "2026-10-07 12:30:00",
+            },
+        ),
+        (
+            "resolved-without-result",
+            {"status": "resolved", "version": 2},
+        ),
+    ],
+)
+def test_case_schema_rejects_incoherent_lifecycle_fields(
+    tmp_path: Path,
+    case_id: str,
+    overrides: dict[str, Any],
+) -> None:
+    database_path = tmp_path / f"case-lifecycle-{case_id}.sqlite3"
+    result = run_upgrade(database_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    with sqlite3.connect(database_path) as connection:
+        _seed_case_constraint_parents(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_constraint_case(connection, case_id=case_id, **overrides)
+
+
+def test_case_schema_rejects_a_resolution_for_another_rule(tmp_path: Path) -> None:
+    database_path = tmp_path / "case-resolution-rule-constraint.sqlite3"
+    result = run_upgrade(database_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    with sqlite3.connect(database_path) as connection:
+        _seed_case_constraint_parents(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_constraint_case(
+                connection,
+                case_id="case-invalid-resolution",
+                status="resolved",
+                resolution_reason="refund_approved",
+                resolved_at="2026-10-07 12:30:00",
+                version=2,
+            )

@@ -1,4 +1,6 @@
 import { execFileSync } from 'node:child_process';
+import { accessSync, constants, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -52,15 +54,48 @@ if (hostedPort !== undefined) {
 
 const baseURL = externalBaseURL ?? `http://127.0.0.1:${hostedPort}`;
 
+function isWritableDirectory(candidate: string): boolean {
+  try {
+    if (!statSync(candidate).isDirectory()) return false;
+    accessSync(candidate, constants.W_OK | constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function e2eDatabaseDirectory(): string {
+  const configuredDirectory = process.env.COMMERCE_OPS_E2E_DATABASE_DIR?.trim();
+  if (configuredDirectory) {
+    const resolvedDirectory = path.resolve(configuredDirectory);
+    if (!isWritableDirectory(resolvedDirectory)) {
+      throw new Error(
+        `COMMERCE_OPS_E2E_DATABASE_DIR must be a writable directory: ${resolvedDirectory}`,
+      );
+    }
+    return resolvedDirectory;
+  }
+
+  const linuxSharedMemory = '/dev/shm';
+  if (process.platform === 'linux' && isWritableDirectory(linuxSharedMemory)) {
+    return linuxSharedMemory;
+  }
+
+  const fallbackDirectory = tmpdir();
+  if (!isWritableDirectory(fallbackDirectory)) {
+    throw new Error(`The operating-system temp directory is not writable: ${fallbackDirectory}`);
+  }
+  return fallbackDirectory;
+}
+
 function hostedEnvironment(): Record<string, string> {
   if (hostedPort === undefined) {
     throw new Error('The internal E2E web server requires a reserved port.');
   }
 
   const databasePath = path.join(
-    productDirectory,
-    'data',
-    `playwright-${process.pid}-${hostedPort}.sqlite3`,
+    e2eDatabaseDirectory(),
+    `commerce-ops-desk-playwright-${process.pid}-${hostedPort}.sqlite3`,
   );
 
   const inheritedEnvironment = Object.fromEntries(

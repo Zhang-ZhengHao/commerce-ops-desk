@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -31,6 +31,16 @@ const agentSession = {
   csrf_token: 'agent-csrf-token',
 } as const;
 
+const resetManagerSession = {
+  ...managerSession,
+  workspace: {
+    ...managerSession.workspace,
+    id: 'd63c1349-e415-4fb2-b8c9-73d089537d83',
+    name: 'Demo workspace 7D83',
+  },
+  csrf_token: 'reset-manager-csrf-token',
+} as const;
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -38,13 +48,45 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function installFetch(...responses: Response[]) {
-  const fetchMock = vi.fn<typeof fetch>();
-  for (const response of responses) {
-    fetchMock.mockResolvedValueOnce(response);
-  }
+function installFetch(...responses: Array<Response | Error | Promise<Response>>) {
+  let responseIndex = 0;
+  const fetchMock = vi.fn<typeof fetch>(async (input) => {
+    const path = new URL(String(input), window.location.origin).pathname;
+    if (path === '/api/dashboard') {
+      return jsonResponse({
+        generated_at: '2026-10-07T16:00:00Z',
+        summary: { open: 0, approaching_sla: 0, high_severity: 0, resolved: 0 },
+        by_rule: [],
+      });
+    }
+    if (path === '/api/cases') {
+      return jsonResponse({ items: [], total: 0, page: 1, page_size: 20 });
+    }
+    if (path === '/api/agents') return jsonResponse({ items: [] });
+
+    const response = responses[responseIndex++];
+    if (response instanceof Error) throw response;
+    if (!response) throw new Error(`Missing test response for ${path}`);
+    return response;
+  });
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
+function callsTo(fetchMock: ReturnType<typeof installFetch>, path: string) {
+  return fetchMock.mock.calls.filter(
+    ([input]) => new URL(String(input), window.location.origin).pathname === path,
+  );
 }
 
 afterEach(() => {
@@ -72,9 +114,12 @@ describe('CommerceOps Desk demo identity', () => {
       screen.getByRole('heading', { name: /built for a safe public demo/i }),
     ).toBeVisible();
     expect(
-      screen.getByRole('heading', { name: /planned workflow/i }),
+      screen.getByRole('heading', { name: /operational workflow/i }),
     ).toBeVisible();
-    expect(screen.getByText(/product direction.*not implemented in i02/i)).toBeVisible();
+    expect(screen.getByText(/available in the temporary i03 workspace/i)).toBeVisible();
+    expect(screen.getByText('Synthetic exception queue')).toBeVisible();
+    expect(screen.queryByText(/signed commerce event/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/not implemented in i02/i)).not.toBeInTheDocument();
     expect(
       screen.queryByRole('heading', { name: /one accountable path/i }),
     ).not.toBeInTheDocument();
@@ -105,8 +150,8 @@ describe('CommerceOps Desk demo identity', () => {
       screen.getByRole('heading', { name: /session protections/i }),
     ).toBeVisible();
 
-    const [, request] = fetchMock.mock.calls[1];
-    expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/demo/workspaces');
+    const [input, request] = callsTo(fetchMock, '/api/demo/workspaces')[0];
+    expect(input).toBe('/api/demo/workspaces');
     expect(request).toMatchObject({
       credentials: 'same-origin',
       method: 'POST',
@@ -131,7 +176,8 @@ describe('CommerceOps Desk demo identity', () => {
     expect(screen.getByRole('heading', { name: /agent workspace/i })).toBeVisible();
     expect(screen.getByText(/agent access/i)).toBeVisible();
     expect(screen.queryByText('Demo Manager')).not.toBeInTheDocument();
-    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+    const [, request] = callsTo(fetchMock, '/api/demo/workspaces')[0];
+    expect(JSON.parse(String(request?.body))).toEqual({
       initial_role: 'agent',
     });
   });
@@ -158,9 +204,8 @@ describe('CommerceOps Desk demo identity', () => {
 
     expect(await screen.findByText('Demo Agent')).toBeVisible();
     expect(screen.getByRole('heading', { name: /agent workspace/i })).toBeVisible();
-    const [, request] = fetchMock.mock.calls[1];
+    const [, request] = callsTo(fetchMock, '/api/demo/role')[0];
     const headers = new Headers(request?.headers);
-    expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/demo/role');
     expect(request).toMatchObject({
       credentials: 'same-origin',
       method: 'POST',
@@ -170,6 +215,193 @@ describe('CommerceOps Desk demo identity', () => {
     expect(headers.get('Idempotency-Key')).toMatch(/^[0-9a-f-]{36}$/);
     expect(window.localStorage).toHaveLength(0);
     expect(window.sessionStorage).toHaveLength(0);
+  });
+
+  it('does not let a delayed Manager snapshot overwrite the Agent workspace', async () => {
+    const user = userEvent.setup();
+    const managerDashboard = deferred<Response>();
+    let dashboardReads = 0;
+    let caseReads = 0;
+    const dashboard = {
+      generated_at: '2026-10-07T16:00:00Z',
+      summary: { open: 1, approaching_sla: 0, high_severity: 1, resolved: 0 },
+      by_rule: [],
+    };
+    const casePage = (id: string, orderNumber: string) => ({
+      items: [{
+        id,
+        rule_key: 'refund_review',
+        case_type: 'refund',
+        severity: 'high',
+        status: 'assigned',
+        due_at: '2026-10-07T17:15:00Z',
+        updated_at: '2026-10-07T16:10:00Z',
+        version: 1,
+        resolution_reason: null,
+        resolved_at: null,
+        order: {
+          id: `${id}-order`,
+          order_number: orderNumber,
+          amount_minor: 12999,
+          currency: 'USD',
+          payment_status: 'paid',
+          fulfillment_status: 'unfulfilled',
+        },
+        assignee: {
+          membership_id: agentSession.identity.membership_id,
+          display_name: agentSession.identity.display_name,
+        },
+      }],
+      total: 1,
+      page: 1,
+      page_size: 20,
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(String(input), window.location.origin).pathname;
+      if (path === '/api/session') return jsonResponse(managerSession);
+      if (path === '/api/demo/role') return jsonResponse(agentSession);
+      if (path === '/api/dashboard') {
+        dashboardReads += 1;
+        return dashboardReads === 1
+          ? managerDashboard.promise
+          : jsonResponse(dashboard);
+      }
+      if (path === '/api/cases') {
+        caseReads += 1;
+        return jsonResponse(
+          caseReads === 1
+            ? casePage('manager-only-case', 'MANAGER-ONLY')
+            : casePage('agent-only-case', 'AGENT-ONLY'),
+        );
+      }
+      if (path === '/api/agents') return jsonResponse({ items: [] });
+      return jsonResponse({ detail: 'Not Found' }, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await screen.findByText('Demo Manager');
+    await waitFor(() => expect(dashboardReads).toBe(1));
+
+    await user.click(screen.getByRole('button', { name: /switch to agent/i }));
+
+    expect(
+      await screen.findByRole('heading', { name: 'Agent workspace' }),
+    ).toBeVisible();
+    expect(
+      await screen.findByRole('button', { name: 'Open AGENT-ONLY' }),
+    ).toBeVisible();
+
+    await act(async () => {
+      managerDashboard.resolve(jsonResponse(dashboard));
+      await managerDashboard.promise;
+    });
+
+    expect(screen.getByRole('button', { name: 'Open AGENT-ONLY' })).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Open MANAGER-ONLY' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('confirms and resets the workspace with the current CSRF token', async () => {
+    const user = userEvent.setup();
+    const resetResponse = deferred<Response>();
+    const fetchMock = installFetch(
+      jsonResponse(managerSession),
+      resetResponse.promise,
+    );
+
+    render(<App />);
+    await screen.findByRole('heading', { name: /manager workspace/i });
+
+    await user.click(screen.getByRole('button', { name: /reset demo data/i }));
+    expect(screen.getByRole('heading', { name: /reset this workspace/i })).toBeVisible();
+    expect(callsTo(fetchMock, '/api/demo/reset')).toHaveLength(0);
+
+    await user.click(screen.getByRole('button', { name: /^reset workspace$/i }));
+    expect(screen.getByRole('status')).toHaveTextContent(/resetting workspace/i);
+    resetResponse.resolve(jsonResponse(resetManagerSession, 201));
+
+    expect(await screen.findByText('Demo workspace 7D83')).toBeVisible();
+    expect(screen.queryByText('Demo workspace 835C')).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(callsTo(fetchMock, '/api/dashboard')).toHaveLength(2);
+      expect(callsTo(fetchMock, '/api/cases')).toHaveLength(2);
+      expect(callsTo(fetchMock, '/api/agents')).toHaveLength(2);
+    });
+    const [, request] = callsTo(fetchMock, '/api/demo/reset')[0];
+    const headers = new Headers(request?.headers);
+    expect(request).toMatchObject({
+      credentials: 'same-origin',
+      method: 'POST',
+    });
+    expect(headers.get('X-CSRF-Token')).toBe(managerSession.csrf_token);
+    expect(headers.get('Idempotency-Key')).toBeNull();
+  });
+
+  it('checks the session after a failed reset and requires confirmation before another POST', async () => {
+    const user = userEvent.setup();
+    const fetchMock = installFetch(
+      jsonResponse(managerSession),
+      jsonResponse({ detail: 'Reset is temporarily unavailable.' }, 503),
+      jsonResponse(managerSession),
+    );
+
+    render(<App />);
+    await screen.findByRole('heading', { name: /manager workspace/i });
+    await user.click(screen.getByRole('button', { name: /reset demo data/i }));
+    await user.click(screen.getByRole('button', { name: /^reset workspace$/i }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/reset is temporarily unavailable/i);
+    expect(alert).toHaveTextContent(/current workspace is still active/i);
+    expect(callsTo(fetchMock, '/api/session')).toHaveLength(2);
+    expect(callsTo(fetchMock, '/api/demo/reset')).toHaveLength(1);
+    expect(callsTo(fetchMock, '/api/dashboard')).toHaveLength(1);
+    expect(callsTo(fetchMock, '/api/cases')).toHaveLength(1);
+    expect(callsTo(fetchMock, '/api/agents')).toHaveLength(1);
+
+    await user.click(screen.getByRole('button', { name: /try reset again/i }));
+
+    expect(screen.getByRole('heading', { name: /reset this workspace/i })).toBeVisible();
+    expect(callsTo(fetchMock, '/api/demo/reset')).toHaveLength(1);
+  });
+
+  it('accepts a reset committed before its response was lost', async () => {
+    const user = userEvent.setup();
+    const fetchMock = installFetch(
+      jsonResponse(managerSession),
+      new TypeError('The reset response connection closed.'),
+      jsonResponse(resetManagerSession),
+    );
+
+    render(<App />);
+    await screen.findByRole('heading', { name: /manager workspace/i });
+    await user.click(screen.getByRole('button', { name: /reset demo data/i }));
+    await user.click(screen.getByRole('button', { name: /^reset workspace$/i }));
+
+    expect(await screen.findByText('Demo workspace 7D83')).toBeVisible();
+    expect(callsTo(fetchMock, '/api/demo/reset')).toHaveLength(1);
+    expect(callsTo(fetchMock, '/api/session')).toHaveLength(2);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('returns to public entry when reset recovery finds no active session', async () => {
+    const user = userEvent.setup();
+    const fetchMock = installFetch(
+      jsonResponse(managerSession),
+      new TypeError('The reset response connection closed.'),
+      jsonResponse({ detail: 'Not authenticated' }, 401),
+    );
+
+    render(<App />);
+    await screen.findByRole('heading', { name: /manager workspace/i });
+    await user.click(screen.getByRole('button', { name: /reset demo data/i }));
+    await user.click(screen.getByRole('button', { name: /^reset workspace$/i }));
+
+    expect(await screen.findByRole('button', { name: /enter as manager/i })).toBeEnabled();
+    expect(callsTo(fetchMock, '/api/demo/reset')).toHaveLength(1);
+    expect(callsTo(fetchMock, '/api/session')).toHaveLength(2);
   });
 
   it('lets a visitor retry session recovery after a transient error', async () => {
@@ -207,8 +439,8 @@ describe('CommerceOps Desk demo identity', () => {
     await user.click(screen.getByRole('button', { name: /retry role switch/i }));
 
     expect(await screen.findByText('Demo Agent')).toBeVisible();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/session');
+    expect(callsTo(fetchMock, '/api/demo/role')).toHaveLength(1);
+    expect(callsTo(fetchMock, '/api/session')).toHaveLength(2);
   });
 
   it('restores the current CSRF token and reuses the command key before retrying a role switch', async () => {
@@ -229,10 +461,11 @@ describe('CommerceOps Desk demo identity', () => {
     await user.click(screen.getByRole('button', { name: /retry role switch/i }));
 
     expect(await screen.findByText('Demo Agent')).toBeVisible();
-    expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/session');
-    expect(fetchMock.mock.calls[3]?.[0]).toBe('/api/demo/role');
-    const firstHeaders = new Headers(fetchMock.mock.calls[1]?.[1]?.headers);
-    const retryHeaders = new Headers(fetchMock.mock.calls[3]?.[1]?.headers);
+    const roleCalls = callsTo(fetchMock, '/api/demo/role');
+    expect(callsTo(fetchMock, '/api/session')).toHaveLength(2);
+    expect(roleCalls).toHaveLength(2);
+    const firstHeaders = new Headers(roleCalls[0]?.[1]?.headers);
+    const retryHeaders = new Headers(roleCalls[1]?.[1]?.headers);
     expect(retryHeaders.get('Idempotency-Key')).toBe(
       firstHeaders.get('Idempotency-Key'),
     );
@@ -241,13 +474,12 @@ describe('CommerceOps Desk demo identity', () => {
 
   it('replays with the old session when a completed switch lost the response headers', async () => {
     const user = userEvent.setup();
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(jsonResponse(managerSession))
-      .mockRejectedValueOnce(new TypeError('The connection closed before headers arrived.'))
-      .mockResolvedValueOnce(jsonResponse({ detail: 'Not authenticated' }, 401))
-      .mockResolvedValueOnce(jsonResponse(agentSession));
-    vi.stubGlobal('fetch', fetchMock);
+    const fetchMock = installFetch(
+      jsonResponse(managerSession),
+      new TypeError('The connection closed before headers arrived.'),
+      jsonResponse({ detail: 'Not authenticated' }, 401),
+      jsonResponse(agentSession),
+    );
 
     render(<App />);
     await user.click(await screen.findByRole('button', { name: /switch to agent/i }));
@@ -256,10 +488,11 @@ describe('CommerceOps Desk demo identity', () => {
     await user.click(screen.getByRole('button', { name: /retry role switch/i }));
 
     expect(await screen.findByText('Demo Agent')).toBeVisible();
-    expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/session');
-    expect(fetchMock.mock.calls[3]?.[0]).toBe('/api/demo/role');
-    const firstHeaders = new Headers(fetchMock.mock.calls[1]?.[1]?.headers);
-    const replayHeaders = new Headers(fetchMock.mock.calls[3]?.[1]?.headers);
+    const roleCalls = callsTo(fetchMock, '/api/demo/role');
+    expect(callsTo(fetchMock, '/api/session')).toHaveLength(2);
+    expect(roleCalls).toHaveLength(2);
+    const firstHeaders = new Headers(roleCalls[0]?.[1]?.headers);
+    const replayHeaders = new Headers(roleCalls[1]?.[1]?.headers);
     expect(replayHeaders.get('Idempotency-Key')).toBe(
       firstHeaders.get('Idempotency-Key'),
     );
@@ -280,10 +513,11 @@ describe('CommerceOps Desk demo identity', () => {
     await user.click(screen.getByRole('button', { name: /retry manager entry/i }));
 
     expect(await screen.findByText('Demo Manager')).toBeVisible();
-    const firstKey = new Headers(fetchMock.mock.calls[1]?.[1]?.headers).get(
+    const workspaceCalls = callsTo(fetchMock, '/api/demo/workspaces');
+    const firstKey = new Headers(workspaceCalls[0]?.[1]?.headers).get(
       'Idempotency-Key',
     );
-    const retryKey = new Headers(fetchMock.mock.calls[2]?.[1]?.headers).get(
+    const retryKey = new Headers(workspaceCalls[1]?.[1]?.headers).get(
       'Idempotency-Key',
     );
     expect(retryKey).toBe(firstKey);

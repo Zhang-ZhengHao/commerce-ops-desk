@@ -30,7 +30,7 @@ const demoBoundaries = [
 ] as const;
 
 const targetFlow = [
-  ['01', 'Accept', 'Signed commerce event'],
+  ['01', 'Review', 'Synthetic exception queue'],
   ['02', 'Triage', 'Manager owns the queue'],
   ['03', 'Resolve', 'Agent records the outcome'],
   ['04', 'Trace', 'Audit history stays visible'],
@@ -129,8 +129,8 @@ export function DemoEntry({
 
         <aside className="workflow-card" aria-labelledby="workflow-title">
           <div className="workflow-card-header">
-            <h2 id="workflow-title">Planned workflow</h2>
-            <p>Product direction for later slices, not implemented in I02.</p>
+            <h2 id="workflow-title">Operational workflow</h2>
+            <p>Available in the temporary I03 workspace with synthetic case data.</p>
           </div>
 
           <ol className="workflow-list">

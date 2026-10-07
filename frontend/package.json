@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -b && vite build",
+    "capture:demo-entry": "UPDATE_README_SCREENSHOTS=1 playwright test e2e/readme-screenshots.spec.ts --project=desktop-chromium --workers=1",
     "test": "vitest run src",
     "test:e2e": "playwright test --config=playwright.config.ts",
     "test:watch": "vitest src",
