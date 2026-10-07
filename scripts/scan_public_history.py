@@ -66,6 +66,7 @@ RFC1918_NETWORKS = tuple(
         "192." + "168.0.0/16",
     )
 )
+TRANSIENT_PULL_REQUEST_REF = re.compile(rb"refs/(?:pull|remotes/pull)/[0-9]+/merge")
 
 
 def run_git(
@@ -245,9 +246,25 @@ def index_findings(repository: Path) -> set[Finding]:
     return findings
 
 
-def object_paths(repository: Path) -> dict[str, str]:
+def publishable_revision_input(repository: Path) -> bytes:
+    output = run_git(repository, "for-each-ref", "--format=%(refname)", "refs")
+    references: list[bytes] = []
+    for reference in output.splitlines():
+        if TRANSIENT_PULL_REQUEST_REF.fullmatch(reference):
+            continue
+        references.append(reference)
+    if not references:
+        return b""
+    return b"\n".join(references) + b"\n"
+
+
+def object_paths(repository: Path, revisions: bytes) -> dict[str, str]:
     paths: dict[str, str] = {}
-    output = run_git(repository, "rev-list", "--objects", "--all")
+    if not revisions:
+        return paths
+    output = run_git(
+        repository, "rev-list", "--objects", "--stdin", input_bytes=revisions
+    )
     for line in output.splitlines():
         raw_object_id, separator, raw_path = line.partition(b" ")
         if separator and raw_path:
@@ -255,9 +272,18 @@ def object_paths(repository: Path) -> dict[str, str]:
     return paths
 
 
-def reachable_object_types(repository: Path) -> Iterable[tuple[str, str]]:
+def reachable_object_types(
+    repository: Path, revisions: bytes
+) -> Iterable[tuple[str, str]]:
+    if not revisions:
+        return ()
     object_ids = run_git(
-        repository, "rev-list", "--objects", "--all", "--no-object-names"
+        repository,
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        "--stdin",
+        input_bytes=revisions,
     ).splitlines()
     if not object_ids:
         return ()
@@ -281,8 +307,9 @@ def reachable_object_types(repository: Path) -> Iterable[tuple[str, str]]:
 
 def history_findings(repository: Path) -> set[Finding]:
     findings: set[Finding] = set()
-    paths = object_paths(repository)
-    for object_id, object_type in reachable_object_types(repository):
+    revisions = publishable_revision_input(repository)
+    paths = object_paths(repository, revisions)
+    for object_id, object_type in reachable_object_types(repository, revisions):
         if object_type == "blob":
             source = f"history:{object_id[:12]}"
             if object_id in paths:
