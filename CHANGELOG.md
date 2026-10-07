@@ -11,6 +11,7 @@ All notable changes to CommerceOps Desk are documented here. The project follows
 - Atomic synthetic workspace reset with credential rotation and tenant-isolation coverage.
 - Per-workspace note quota, bounded pagination, lifecycle database constraints, and causal audit ordering.
 - Desktop, mobile, and 320-pixel browser coverage for the complete Manager-to-Agent path.
+- Reproducible multi-stage container packaging with a non-root runtime and persistent demo-data mount.
 
 ### Changed
 

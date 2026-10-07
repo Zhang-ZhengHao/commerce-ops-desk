@@ -63,6 +63,22 @@ make verify
 
 It covers backend and frontend tests, fresh migrations, hosted startup, desktop and mobile browser journeys, Python and TypeScript static checks, the production bundle, and a scan of the worktree plus reachable Git history for recognized secrets and internal identifiers.
 
+### Run as a container
+
+The multi-stage image builds the React bundle with Node and ships only the Python runtime. It runs as a non-root user and keeps the demo database plus generated session secret in `/app/data`.
+
+```bash
+docker build -t commerce-ops-desk:0.1.0 .
+docker volume create commerce-ops-desk-data
+docker run --rm --name commerce-ops-desk \
+  -p 8000:8000 \
+  -e COMMERCE_OPS_COOKIE_SECURE=false \
+  -v commerce-ops-desk-data:/app/data \
+  commerce-ops-desk:0.1.0
+```
+
+The cookie override is only for direct local HTTP. Keep secure cookies enabled when TLS terminates in front of the container.
+
 ## Verified scope and limits
 
 This release contains the I01 hosted foundation, I02 demo identity boundary, and I03 order/case vertical slice. SQLite is intentionally limited to the single-node disposable demo. Hosted SQLite is placed on a host-local filesystem because WAL is unsafe on the workspace's NFS mount.
