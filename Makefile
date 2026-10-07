@@ -12,7 +12,7 @@ help:
 	@echo "CommerceOps Desk development targets"
 	@echo "  setup                Install locked Python, Node, and browser dependencies"
 	@echo "  run                  Build and start the local app from .env or safe defaults"
-	@echo "  verify               Run the complete I01 verification gate"
+	@echo "  verify               Run the complete I02 verification gate"
 	@echo "  backend-test         Run backend tests (override with TEST=tests/test_health.py)"
 	@echo "  frontend-test        Run frontend component tests"
 	@echo "  sqlite-migrate-test  Prove an empty SQLite database can migrate to head"

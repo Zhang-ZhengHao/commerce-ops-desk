@@ -16,7 +16,10 @@ class AppManifestContractTest(unittest.TestCase):
             manifest = tomllib.load(manifest_file)
 
         self.assertEqual(manifest["name"], "CommerceOps Desk")
-        self.assertEqual(manifest["start"], "bash scripts/start-hosted.sh")
+        self.assertEqual(
+            manifest["start"],
+            "COMMERCE_OPS_COOKIE_SECURE=false bash scripts/start-hosted.sh",
+        )
         self.assertEqual(manifest["health"], "/health")
         self.assertNotIn("pip install", manifest["start"])
         self.assertNotIn("npm install", manifest["start"])

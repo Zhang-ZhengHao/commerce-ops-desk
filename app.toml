@@ -1,3 +1,5 @@
 name = "CommerceOps Desk"
-start = "bash scripts/start-hosted.sh"
+# ASteam exposes this sandbox on its direct HTTP port. HTTPS deployments omit
+# this transport-specific override and keep the application's Secure default.
+start = "COMMERCE_OPS_COOKIE_SECURE=false bash scripts/start-hosted.sh"
 health = "/health"

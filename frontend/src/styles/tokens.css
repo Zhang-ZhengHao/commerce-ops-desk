@@ -25,9 +25,10 @@
   --color-card-start: rgb(23 35 58 / 0.96);
   --color-card-end: rgb(15 23 42 / 0.96);
 
-  --font-heading: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   --font-body: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
+  --font-heading: var(--font-body);
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
 
   --font-size-xs: 0.75rem;
   --font-size-sm: 0.875rem;

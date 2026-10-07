@@ -9,7 +9,7 @@ PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ProjectToolingContractTest(unittest.TestCase):
-    def test_makefile_exposes_the_complete_i01_verification_surface(self) -> None:
+    def test_makefile_exposes_the_complete_i02_verification_surface(self) -> None:
         makefile = PRODUCT_ROOT / "Makefile"
         self.assertTrue(makefile.is_file(), "Makefile must exist")
 
@@ -32,8 +32,9 @@ class ProjectToolingContractTest(unittest.TestCase):
                 "build",
                 "verify",
             }.issubset(targets),
-            f"missing I01 targets: {targets}",
+            f"missing I02 targets: {targets}",
         )
+        self.assertIn("complete I02 verification gate", makefile.read_text())
 
     def test_environment_example_is_runnable_without_containing_credentials(
         self,
@@ -50,13 +51,15 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertRegex(contents, r"(?m)^PORT=[0-9]+$")
         self.assertNotRegex(contents, r"(?i)(password|secret|token)\s*=\s*[^\s#]+")
 
-    def test_ci_uses_full_history_least_privilege_and_every_i01_gate(self) -> None:
+    def test_ci_uses_full_history_least_privilege_and_every_i02_gate(self) -> None:
         workflow = PRODUCT_ROOT / ".github" / "workflows" / "verify.yml"
         self.assertTrue(workflow.is_file(), "verify workflow must exist")
         contents = workflow.read_text()
 
         self.assertRegex(contents, r"(?m)^permissions:\n  contents: read$")
         self.assertIn("fetch-depth: 0", contents)
+        self.assertIn("i02-demo-identity:", contents)
+        self.assertIn("name: Demo identity and access boundaries", contents)
         for command in (
             "make backend-test",
             "make frontend-test",
@@ -108,16 +111,45 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertIn("frontend/playwright-report/", contents)
         self.assertIn("frontend/test-results/", contents)
 
-    def test_public_docs_separate_verified_scope_from_the_product_plan(self) -> None:
+    def test_public_docs_separate_verified_i02_scope_from_the_product_plan(
+        self,
+    ) -> None:
         readme = (PRODUCT_ROOT / "README.md").read_text()
         design_summary = (PRODUCT_ROOT / "docs" / "design-summary.md").read_text()
+        security_model_path = PRODUCT_ROOT / "docs" / "security-model.md"
+        self.assertTrue(security_model_path.is_file())
+        security_model = security_model_path.read_text()
 
         self.assertIn("## Current verified scope", readme)
+        self.assertIn("I02 — Demo identity and access boundaries", readme)
+        self.assertIn("docs/assets/demo-entry.png", readme)
+        self.assertIn("docs/assets/manager-workspace.png", readme)
         self.assertIn("## Planned product workflow", readme)
-        self.assertIn("not implemented yet", readme)
         self.assertIn("## Current verified slice", design_summary)
+        self.assertIn("I02", design_summary)
         self.assertIn("## Target product outcome (planned)", design_summary)
         self.assertIn("guardrail, not proof", design_summary)
+        for heading in (
+            "## Threat model",
+            "## Session and CSRF controls",
+            "## Tenant and role boundaries",
+            "## Abuse controls",
+            "## Database-backed idempotency",
+            "## Deployment limits",
+        ):
+            self.assertIn(heading, security_model)
+        self.assertIn("workspace-creation command", security_model)
+        self.assertIn("role-change command", security_model)
+        self.assertIn(
+            "no live PostgreSQL migration, transaction, locking, or concurrency test has run",
+            security_model,
+        )
+
+        for relative_path in (
+            "docs/assets/demo-entry.png",
+            "docs/assets/manager-workspace.png",
+        ):
+            self.assertTrue((PRODUCT_ROOT / relative_path).is_file())
 
 
 if __name__ == "__main__":

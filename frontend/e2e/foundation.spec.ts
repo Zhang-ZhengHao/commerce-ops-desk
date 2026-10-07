@@ -17,24 +17,28 @@ test.describe('I01 hosted foundation', () => {
     });
   });
 
-  test('renders the public product promise and keeps unfinished roles disabled', async ({
+  test('renders the public product promise and offers both demo roles', async ({
     page,
   }) => {
     await page.goto('/');
 
     await expect(page).toHaveTitle('CommerceOps Desk');
     await expect(
-      page.getByRole('heading', { level: 1, name: 'CommerceOps Desk' }),
+      page.getByRole('heading', {
+        level: 1,
+        name: 'Turn ecommerce exceptions into accountable work.',
+      }),
     ).toBeVisible();
     await expect(
-      page.getByText('Turn ecommerce exceptions into owned, auditable work.'),
+      page.getByRole('heading', { level: 2, name: 'Built for a safe public demo' }),
     ).toBeVisible();
     await expect(
-      page.getByRole('heading', { level: 2, name: 'Clear by design' }),
+      page.getByRole('heading', { level: 2, name: 'Planned workflow' }),
     ).toBeVisible();
+    await expect(page.getByText(/product direction.*not implemented in I02/i)).toBeVisible();
     await expect(page.getByText('Synthetic data only')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Enter as Manager' })).toBeDisabled();
-    await expect(page.getByRole('button', { name: 'Enter as Agent' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Enter as Manager' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Enter as Agent' })).toBeEnabled();
   });
 
   test('serves the SPA shell for a client-side workspace route', async ({ page }) => {
@@ -42,8 +46,30 @@ test.describe('I01 hosted foundation', () => {
 
     expect(response?.status()).toBe(200);
     await expect(
-      page.getByRole('heading', { level: 1, name: 'CommerceOps Desk' }),
+      page.getByRole('heading', {
+        level: 1,
+        name: 'Turn ecommerce exceptions into accountable work.',
+      }),
     ).toBeVisible();
+  });
+
+  test('keeps the public entry usable at the 320px support boundary', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 320, height: 800 });
+    await page.goto('/');
+
+    const managerEntry = page.getByRole('button', { name: 'Enter as Manager' });
+    await expect(managerEntry).toBeEnabled();
+    const layout = await page.evaluate(() => ({
+      clientWidth: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    }));
+    const managerBox = await managerEntry.boundingBox();
+
+    expect(layout.scrollWidth).toBeLessThanOrEqual(layout.clientWidth);
+    expect(managerBox).not.toBeNull();
+    expect((managerBox?.y ?? 800) + (managerBox?.height ?? 0)).toBeLessThan(800);
   });
 
   test('keeps unknown API routes as JSON 404 responses', async ({ page }) => {

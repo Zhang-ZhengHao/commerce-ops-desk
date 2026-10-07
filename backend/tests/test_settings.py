@@ -14,6 +14,92 @@ def test_settings_default_to_the_local_sqlite_boundary() -> None:
     assert settings.environment == "development"
     assert settings.database_backend == "sqlite"
     assert settings.database_url.get_secret_value() == ("sqlite+pysqlite:///./data/commerce_ops.db")
+    assert settings.demo_mode is True
+    assert settings.demo_source_hourly_limit == 10
+    assert settings.demo_active_workspace_limit == 500
+    assert settings.demo_workspace_ttl_hours == 4
+    assert settings.demo_role_write_limit == 32
+    assert settings.api_max_request_body_bytes == 16 * 1024
+    assert settings.trusted_proxy_cidrs == ()
+    assert settings.secure_cookies is False
+
+
+def test_production_defaults_demo_off_and_requires_an_explicit_session_secret() -> None:
+    with pytest.raises(ValidationError, match="session secret"):
+        Settings(_env_file=None, environment="production")
+
+    settings = Settings(
+        _env_file=None,
+        environment="production",
+        session_secret="production-secret-that-is-long-enough-for-hmac",
+    )
+
+    assert settings.demo_mode is False
+    assert settings.secure_cookies is True
+    assert "production-secret" not in repr(settings)
+
+
+def test_cookie_secure_defaults_are_safe_but_can_be_explicitly_overridden() -> None:
+    demo_settings = Settings(
+        _env_file=None,
+        environment="demo",
+        session_secret="demo-secret-that-is-long-enough-for-hmac-only",
+    )
+    local_http_settings = Settings(
+        _env_file=None,
+        environment="demo",
+        session_secret="demo-secret-that-is-long-enough-for-hmac-only",
+        cookie_secure=False,
+    )
+
+    assert demo_settings.secure_cookies is True
+    assert local_http_settings.secure_cookies is False
+
+
+def test_demo_limits_and_trusted_proxy_networks_are_validated() -> None:
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        session_secret="test-secret-that-is-long-enough-for-hmac-only",
+        demo_source_hourly_limit=3,
+        demo_active_workspace_limit=7,
+        demo_role_write_limit=5,
+        api_max_request_body_bytes=2 * 1024,
+        trusted_proxy_cidrs=("192.0.2.0/24", "2001:db8::/32"),
+    )
+
+    assert settings.demo_source_hourly_limit == 3
+    assert settings.demo_active_workspace_limit == 7
+    assert settings.demo_role_write_limit == 5
+    assert settings.api_max_request_body_bytes == 2 * 1024
+    assert tuple(str(network) for network in settings.trusted_proxy_networks) == (
+        "192.0.2.0/24",
+        "2001:db8::/32",
+    )
+
+    with pytest.raises(ValidationError, match="valid CIDR"):
+        Settings(
+            _env_file=None,
+            environment="test",
+            session_secret="test-secret-that-is-long-enough-for-hmac-only",
+            trusted_proxy_cidrs=("not-a-network",),
+        )
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            environment="test",
+            session_secret="test-secret-that-is-long-enough-for-hmac-only",
+            api_max_request_body_bytes=0,
+        )
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            environment="test",
+            session_secret="test-secret-that-is-long-enough-for-hmac-only",
+            demo_role_write_limit=0,
+        )
 
 
 def test_settings_read_only_namespaced_environment_variables(

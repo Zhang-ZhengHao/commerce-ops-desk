@@ -5,17 +5,16 @@ from __future__ import annotations
 from logging.config import fileConfig
 
 from alembic import context
+from app import models as _models  # noqa: F401
 from app.config import Settings
-from app.database import build_engine
+from app.database import Base, build_engine
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# I01 establishes the migration lineage. Domain metadata arrives with the
-# vertical slices that own those tables.
-target_metadata = None
+target_metadata = Base.metadata
 
 
 def database_url() -> str:

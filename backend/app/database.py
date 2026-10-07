@@ -1,12 +1,17 @@
-"""Synchronous SQLAlchemy engine construction and readiness probing."""
+"""Synchronous SQLAlchemy engine and unit-of-work construction."""
 
 from typing import Any
 
 from sqlalchemy import Engine, create_engine, event, text
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import Settings
 
 SQLITE_BUSY_TIMEOUT_MS = 5_000
+
+
+class Base(DeclarativeBase):
+    """Declarative metadata shared by migrations and runtime models."""
 
 
 def build_engine(settings: Settings) -> Engine:
@@ -35,6 +40,11 @@ def build_engine(settings: Settings) -> Engine:
                 cursor.close()
 
     return engine
+
+
+def build_session_factory(engine: Engine) -> sessionmaker[Session]:
+    """Create short-lived synchronous units of work bound to one engine."""
+    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
 def probe_database(engine: Engine) -> None:
