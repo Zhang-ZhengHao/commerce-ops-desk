@@ -191,7 +191,7 @@ class PublicHistoryScanTest(unittest.TestCase):
         self.assertNotIn(personal_email, output)
         self.assertNotIn(fake_token, output)
 
-    def test_github_pull_request_merge_ref_is_not_publishable_history(self) -> None:
+    def test_detached_head_history_is_scanned(self) -> None:
         self.seed_clean_commit()
         personal_email = "pull-request-author" + "@personal." + "example"
         self.repository.git("checkout", "--quiet", "--detach")
@@ -201,17 +201,16 @@ class PublicHistoryScanTest(unittest.TestCase):
             "--quiet",
             "--allow-empty",
             "--message",
-            "synthetic pull request merge",
+            "detached pull request head",
         )
-        synthetic_merge = self.repository.git("rev-parse", "HEAD").stdout.strip()
-        self.repository.git("update-ref", "refs/remotes/pull/2/merge", synthetic_merge)
-        self.repository.git("checkout", "--quiet", "main")
 
         result = self.run_scan()
+        output = self.output(result)
 
-        self.assertEqual(result.returncode, 0, self.output(result))
-        self.assertIn("PASS", result.stdout)
-        self.assertNotIn(personal_email, self.output(result))
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("identity.personal_email", output)
+        self.assertIn("history-meta:commit:", output)
+        self.assertNotIn(personal_email, output)
 
     def test_annotated_tag_metadata_is_scanned(self) -> None:
         self.seed_clean_commit()

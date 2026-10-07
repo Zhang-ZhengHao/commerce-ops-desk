@@ -58,6 +58,9 @@ class ProjectToolingContractTest(unittest.TestCase):
 
         self.assertRegex(contents, r"(?m)^permissions:\n  contents: read$")
         self.assertIn("fetch-depth: 0", contents)
+        self.assertIn(
+            "ref: ${{ github.event.pull_request.head.sha || github.sha }}", contents
+        )
         self.assertIn("i03-order-case-workflow:", contents)
         self.assertIn("name: Order and case workflow", contents)
         for command in (
