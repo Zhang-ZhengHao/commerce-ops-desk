@@ -1,0 +1,3 @@
+name = "CommerceOps Desk"
+start = "bash scripts/start-hosted.sh"
+health = "/health"

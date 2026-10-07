@@ -1,0 +1,71 @@
+:root {
+  color-scheme: dark;
+
+  --color-canvas: #020617;
+  --color-primary: #0f172a;
+  --color-surface: #111c30;
+  --color-surface-raised: #17233a;
+  --color-on-primary: #ffffff;
+  --color-foreground: #f8fafc;
+  --color-secondary: #cbd5e1;
+  --color-muted: #94a3b8;
+  --color-border: #334155;
+  --color-border-strong: #475569;
+  --color-accent: #0369a1;
+  --color-accent-hover: #075985;
+  --color-accent-soft: #0c4a6e;
+  --color-focus: #7dd3fc;
+  --color-status: #67e8f9;
+  --color-destructive: #f87171;
+  --color-grid-line: rgb(125 211 252 / 0.05);
+  --color-ambient-accent: rgb(3 105 161 / 0.2);
+  --color-status-ring: rgb(103 232 249 / 0.1);
+  --color-surface-glass: rgb(15 23 42 / 0.82);
+  --color-surface-muted: rgb(15 23 42 / 0.72);
+  --color-card-start: rgb(23 35 58 / 0.96);
+  --color-card-end: rgb(15 23 42 / 0.96);
+
+  --font-heading: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  --font-body: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+
+  --font-size-xs: 0.75rem;
+  --font-size-sm: 0.875rem;
+  --font-size-base: 1rem;
+  --font-size-lg: 1.125rem;
+  --font-size-xl: 1.375rem;
+  --font-size-2xl: clamp(1.75rem, 5vw, 2.75rem);
+  --font-size-display: clamp(2.75rem, 9vw, 5.75rem);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+  --space-20: 5rem;
+
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-pill: 999px;
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.16);
+  --shadow-md: 0 16px 40px rgb(0 0 0 / 0.22);
+
+  --motion-fast: 160ms;
+  --motion-standard: 220ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+
+  --layer-base: 0;
+  --layer-header: 10;
+  --layer-skip-link: 100;
+
+  font-family: var(--font-body);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
