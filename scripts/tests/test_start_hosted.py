@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -67,14 +69,18 @@ class HostedStartContractTest(unittest.TestCase):
 
     def test_random_port_serves_health_readiness_and_frontend(self) -> None:
         port = reserve_port()
-        with tempfile.TemporaryDirectory(prefix="commerce-ops-hosted-") as data_dir:
+        with tempfile.TemporaryDirectory(
+            prefix="commerce-ops-hosted-", dir="/var/tmp"
+        ) as data_dir:
+            database_path = Path(data_dir) / "hosted.sqlite3"
             environment = os.environ.copy()
             environment.update(
                 {
                     "PORT": str(port),
+                    "COMMERCE_OPS_VENV_DIR": str(Path(sys.executable).parent.parent),
                     "COMMERCE_OPS_ENVIRONMENT": "test",
                     "COMMERCE_OPS_DATABASE_URL": (
-                        f"sqlite+pysqlite:///{Path(data_dir) / 'hosted.sqlite3'}"
+                        f"sqlite+pysqlite:///{database_path}"
                     ),
                 }
             )
@@ -104,6 +110,12 @@ class HostedStartContractTest(unittest.TestCase):
                 self.assertEqual(page_status, 200)
                 self.assertEqual(page_type, "text/html")
                 self.assertIn("CommerceOps Desk", page_body)
+
+                with sqlite3.connect(database_path) as connection:
+                    revision = connection.execute(
+                        "SELECT version_num FROM alembic_version"
+                    ).fetchone()
+                self.assertEqual(revision, ("0001_foundation",))
 
                 container_address = socket.gethostbyname(socket.gethostname())
                 if not container_address.startswith("127."):

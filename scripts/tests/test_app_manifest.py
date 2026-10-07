@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import tomllib
 import unittest
 from pathlib import Path
+
+import tomllib
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 

@@ -39,6 +39,7 @@ frontend/blob-report/
 
 # Local verification artifacts
 artifacts/
+.cache/
 !.github/
 .asteam-product.log
 

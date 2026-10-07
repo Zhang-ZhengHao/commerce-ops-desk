@@ -1,12 +1,24 @@
 # CommerceOps Desk — Design Summary
 
-## Product outcome
+## Current verified slice
 
-CommerceOps Desk gives a small ecommerce operations team one place to inspect and resolve exceptions caused by payment failures, refund review, delayed fulfillment, and event-processing failures.
+I01 establishes the hosted foundation and nothing beyond it:
 
-The primary demonstration follows one complete path:
+- FastAPI configuration, SQLite/PostgreSQL driver validation, liveness, and database readiness.
+- An Alembic lineage that upgrades a fresh SQLite database before startup.
+- Same-origin delivery of a responsive React entry shell with explicit synthetic-demo boundaries.
+- Component tests plus desktop and mobile Playwright smoke coverage with browser-error guards.
+- Locked setup, hosted-start, offline runtime-recovery, and public-history scan contracts.
 
-1. A server-signed synthetic webhook enters the same ingestion route used by external integrations.
+Manager and Agent buttons are intentionally disabled. Identity, authorization, webhook, worker, case-management, and recovery behavior described below is planned, not current.
+
+## Target product outcome (planned)
+
+CommerceOps Desk is intended to give a small ecommerce operations team one place to inspect and resolve exceptions caused by payment failures, refund review, delayed fulfilment, and event-processing failures.
+
+The primary demonstration will follow one complete path:
+
+1. A server-signed synthetic webhook enters the external-integration route.
 2. The API authenticates, validates, deduplicates, and persists the event with an outbox job in one transaction.
 3. A worker applies deterministic rules and opens an exception case.
 4. A manager assigns the case to an agent.
@@ -14,18 +26,18 @@ The primary demonstration follows one complete path:
 6. The audit timeline explains every material action.
 7. A separate failure scenario demonstrates retries, dead-lettering, recovery, and creation of a new reprocessing job.
 
-## Users and authorization
+## Planned users and authorization
 
-The public demo offers temporary Manager and Agent identities without registration.
+The public demo is designed to offer temporary Manager and Agent identities without registration.
 
-- Managers can inspect organization-wide work, assign cases, run synthetic scenarios, recover demo faults, and reprocess dead jobs.
-- Agents can see and update only cases assigned to them.
-- Tenant scope and record visibility are enforced on the server. Cross-organization records appear as not found.
-- Cookie-authenticated writes require CSRF protection and an idempotency key.
+- Managers will inspect organization-wide work, assign cases, run synthetic scenarios, recover demo faults, and reprocess dead jobs.
+- Agents will see and update only cases assigned to them.
+- Tenant scope and record visibility will be enforced on the server; cross-organization records will appear as not found.
+- Cookie-authenticated writes will require CSRF protection and an idempotency key.
 
-Demo workspaces expire after four hours and contain only synthetic identities and order data.
+Demo workspaces are planned to expire after four hours and contain only synthetic identities and order data.
 
-## System boundaries
+## Target system boundaries
 
 ```text
 React + TypeScript
@@ -39,37 +51,28 @@ PostgreSQL reference deployment / SQLite single-node demo
 Database outbox worker
 ```
 
-The HTTP layer does not own business rules, the UI does not duplicate authorization rules, and the API and worker communicate through explicit database contracts.
+The intended boundary keeps business rules out of HTTP handlers, avoids duplicating authorization rules in the UI, and gives the API and worker explicit database contracts.
 
-## Reliability model
+## Planned reliability model
 
-- Accepted webhook events are immutable.
-- Event and initial outbox job creation share one transaction.
-- Worker delivery is at least once; stable database keys make business effects idempotent.
-- PostgreSQL workers claim jobs with leases and `FOR UPDATE SKIP LOCKED`.
-- The SQLite demo runs one worker with WAL, a busy timeout, and conditional claiming.
-- Failed executions create attempt records and follow an explicit backoff policy.
-- Manual reprocessing preserves the original event, job, and attempts and creates a new linked job.
+- Accepted webhook events will be immutable.
+- Event and initial outbox-job creation will share one transaction.
+- Worker delivery will be at least once; stable database keys will make business effects idempotent.
+- PostgreSQL workers will claim jobs with leases and `FOR UPDATE SKIP LOCKED`.
+- The SQLite demo will run one worker with WAL, a busy timeout, and conditional claiming.
+- Failed executions will create attempt records and follow an explicit backoff policy.
+- Manual reprocessing will preserve the original event, job, and attempts and create a new linked job.
 
-No feature is described as exactly once, highly available, or connected to a real store.
+No feature will be described as exactly once, highly available, or connected to a real store.
 
-## Security and privacy
+## Security and privacy boundaries
 
-- Raw request limits, timestamp windows, HMAC-SHA256, and constant-time comparison protect webhook intake.
-- Integration secrets are referenced rather than returned through normal API responses or logs.
-- Logs exclude cookies, signatures, customer names, payment data, and raw source addresses by default.
-- Demo rate limits cap workspace creation, simulated events, notes, and webhook intake.
-- Public-history scans block secrets, private email addresses, real customer data, and internal infrastructure references.
+Later slices plan raw-request limits, timestamp windows, HMAC-SHA256 verification, constant-time comparison, server-enforced tenant scope, CSRF protection, and rate limits.
 
-## Verification strategy
+The current public-history scanner detects recognized credential formats, high-confidence secret assignments, personal email addresses, internal workspace paths, cluster-local hostnames, and RFC1918 addresses. It is a guardrail, not proof that arbitrary customer data is absent; release review still requires synthetic fixtures and human inspection.
 
-Evidence is part of the product rather than an afterthought:
+## Verification roadmap
 
-- Backend unit, API, authorization, migration, and database integration tests.
-- Frontend component tests and generated OpenAPI type consistency.
-- Playwright coverage for the main Manager-to-Agent workflow and recovery states.
-- SQLite checks locally and PostgreSQL/Compose checks on GitHub Actions.
-- Hosted and deployed smoke tests tied to an exact commit SHA.
-- Versioned releases, screenshots, and a short walkthrough based on the released build.
+Current I01 evidence covers backend unit/API/configuration tests, an empty-SQLite migration proof, frontend component tests, same-origin hosted smoke tests, desktop/mobile browser smoke tests, strict type and lint checks, and public-history scanning.
 
-The public repository will distinguish the SQLite demo from the PostgreSQL reference deployment and will not claim production usage or customer outcomes that have not occurred.
+Later milestones will add authorization and tenant-isolation tests, webhook and worker integration tests, generated API type consistency, PostgreSQL jobs, Compose checks, the complete Manager-to-Agent flow, recovery scenarios, versioned releases, screenshots, and a released-build walkthrough. Those checks are not claimed as current CI evidence.

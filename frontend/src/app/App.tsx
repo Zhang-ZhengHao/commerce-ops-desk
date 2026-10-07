@@ -13,8 +13,8 @@ const demoBoundaries = [
   },
   {
     index: '03',
-    title: 'Expires after 4 hours',
-    detail: 'Every disposable workspace and its session data are automatically removed.',
+    title: '4-hour expiry target',
+    detail: 'Planned expiry boundary; automated cleanup is not enabled yet.',
   },
 ] as const;
 

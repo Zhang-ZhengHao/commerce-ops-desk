@@ -30,6 +30,10 @@ cd "$PRODUCT_DIR"
 
 export COMMERCE_OPS_ENVIRONMENT="${COMMERCE_OPS_ENVIRONMENT:-demo}"
 
+"$PYTHON_BIN" -m alembic \
+  -c "$PRODUCT_DIR/backend/alembic.ini" \
+  upgrade head
+
 exec "$PYTHON_BIN" -m uvicorn app.main:create_app \
   --factory \
   --app-dir "$PRODUCT_DIR/backend" \

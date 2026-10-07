@@ -20,7 +20,10 @@ describe('CommerceOps Desk entry shell', () => {
 
     expect(screen.getByText(/synthetic data only/i)).toBeInTheDocument();
     expect(screen.getByText(/single-node SQLite demo/i)).toBeInTheDocument();
-    expect(screen.getByText(/expires after 4 hours/i)).toBeInTheDocument();
+    expect(screen.getByText(/4-hour expiry target/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/planned expiry boundary; automated cleanup is not enabled yet/i),
+    ).toBeInTheDocument();
   });
 
   it('offers accessible Manager and Agent entry actions', () => {
