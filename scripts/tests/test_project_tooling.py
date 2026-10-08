@@ -371,6 +371,7 @@ class ProjectToolingContractTest(unittest.TestCase):
             "docs/assets/demo-entry-i03.png",
             "docs/assets/exception-workflow.png",
             "docs/assets/signed-webhook-workflow-v0.2.0.png",
+            "docs/assets/social-preview-v0.2.0.png",
         ):
             self.assertTrue((PRODUCT_ROOT / relative_path).is_file())
 
