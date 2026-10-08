@@ -77,6 +77,14 @@ def create_app(
         from app.api.demo import router as demo_router
 
         application.include_router(demo_router)
+    if (
+        resolved_settings.environment != "production"
+        and resolved_settings.demo_mode
+        and resolved_settings.webhook_enabled
+    ):
+        from app.api.webhook_demo import router as webhook_demo_router
+
+        application.include_router(webhook_demo_router)
 
     @application.api_route(
         "/api/{api_path:path}",
