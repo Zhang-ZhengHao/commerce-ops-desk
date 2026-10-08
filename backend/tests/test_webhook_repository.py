@@ -267,3 +267,35 @@ def test_completing_an_event_remains_owned_by_the_caller_transaction(
 
     with factory() as database:
         assert database.scalar(select(func.count()).select_from(WebhookEvent)) == 0
+
+
+def test_consumed_allowance_keeps_the_loaded_organization_identity_current(
+    app_harness: AppHarness,
+) -> None:
+    repository = import_module("app.repositories.webhook_events")
+    factory = cast(sessionmaker[Session], app_harness.app.state.session_factory)
+
+    with factory() as database:
+        organization_id, integration_id = _seed_target(database)
+        organization = repository.lock_active_demo_webhook_target(
+            database,
+            organization_id=organization_id,
+            integration_id=integration_id,
+            now=NOW,
+        )
+        assert organization is not None
+        assert organization.webhook_event_count == 0
+
+        assert repository.consume_demo_webhook_event_allowance(
+            database,
+            organization_id=organization_id,
+            maximum=1,
+        )
+        database.commit()
+
+        assert organization.webhook_event_count == 1
+
+    with factory() as database:
+        persisted = database.get(Organization, organization_id)
+        assert persisted is not None
+        assert persisted.webhook_event_count == 1

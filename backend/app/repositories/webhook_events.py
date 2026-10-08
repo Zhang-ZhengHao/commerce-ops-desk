@@ -13,7 +13,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
-from app.models import Organization, WebhookEvent
+from app.models import Organization, WebhookEvent, WebhookIntegration
 
 EVENT_IDENTITY_COLUMNS = (
     WebhookEvent.organization_id,
@@ -28,22 +28,30 @@ class WebhookEventClaim:
     inserted: bool
 
 
-def lock_active_demo_webhook_organization(
+def lock_active_demo_webhook_target(
     db: Session,
     *,
     organization_id: str,
+    integration_id: str,
     now: datetime,
 ) -> Organization | None:
-    """Lock the parent before child writes to preserve reset lock ordering."""
+    """Revalidate a bound target while locking its parent before child writes."""
 
     return db.scalar(
         select(Organization)
+        .join(
+            WebhookIntegration,
+            (WebhookIntegration.organization_id == Organization.id)
+            & (WebhookIntegration.id == integration_id),
+        )
         .where(
             Organization.id == organization_id,
             Organization.is_demo.is_(True),
             Organization.expires_at > now,
+            WebhookIntegration.provider == "synthetic",
+            WebhookIntegration.enabled.is_(True),
         )
-        .with_for_update(key_share=True)
+        .with_for_update(key_share=True, of=Organization)
     )
 
 
@@ -63,7 +71,6 @@ def consume_demo_webhook_event_allowance(
             Organization.webhook_event_count < maximum,
         )
         .values(webhook_event_count=Organization.webhook_event_count + 1)
-        .execution_options(synchronize_session=False)
     )
     return cast(CursorResult[Any], result).rowcount == 1
 
