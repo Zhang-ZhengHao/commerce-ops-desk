@@ -85,13 +85,13 @@ CI runs the live PostgreSQL 17 migration, concurrency, webhook, and production-c
 The multi-stage image builds the React bundle with Node and ships only the Python runtime. It runs as a non-root user and keeps the demo database plus generated session secret in `/app/data`.
 
 ```bash
-docker build -t commerce-ops-desk:0.1.0 .
+docker build -t commerce-ops-desk:0.2.0 .
 docker volume create commerce-ops-desk-data
 docker run --rm --name commerce-ops-desk \
   -p 8000:8000 \
   -e COMMERCE_OPS_COOKIE_SECURE=false \
   -v commerce-ops-desk-data:/app/data \
-  commerce-ops-desk:0.1.0
+  commerce-ops-desk:0.2.0
 ```
 
 The cookie override is only for direct local HTTP. Keep secure cookies enabled when TLS terminates in front of the container.

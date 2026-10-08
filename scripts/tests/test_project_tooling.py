@@ -1,14 +1,48 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import unittest
 from pathlib import Path
 
+import tomllib
+
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
+RELEASE_VERSION = "0.2.0"
 
 
 class ProjectToolingContractTest(unittest.TestCase):
+    def test_release_version_is_synchronized_across_public_surfaces(self) -> None:
+        backend_pyproject = tomllib.loads(
+            (PRODUCT_ROOT / "backend" / "pyproject.toml").read_text()
+        )
+        frontend_package = json.loads(
+            (PRODUCT_ROOT / "frontend" / "package.json").read_text()
+        )
+        frontend_lock = json.loads(
+            (PRODUCT_ROOT / "frontend" / "package-lock.json").read_text()
+        )
+        app_main = (PRODUCT_ROOT / "backend" / "app" / "main.py").read_text()
+        app_version = re.search(r'(?m)^\s*version="([^"]+)",$', app_main)
+        self.assertIsNotNone(app_version, "FastAPI version must be explicit")
+        assert app_version is not None
+
+        versions = {
+            "backend package": backend_pyproject["project"]["version"],
+            "FastAPI metadata": app_version.group(1),
+            "frontend package": frontend_package["version"],
+            "frontend lock root": frontend_lock["version"],
+            "frontend lock package": frontend_lock["packages"][""]["version"],
+        }
+        for surface, version in versions.items():
+            with self.subTest(surface=surface):
+                self.assertEqual(version, RELEASE_VERSION)
+
+        readme = (PRODUCT_ROOT / "README.md").read_text()
+        container_tags = re.findall(r"commerce-ops-desk:(\d+\.\d+\.\d+)", readme)
+        self.assertEqual(container_tags, [RELEASE_VERSION, RELEASE_VERSION])
+
     def test_makefile_exposes_the_main_verification_surface(self) -> None:
         makefile = PRODUCT_ROOT / "Makefile"
         self.assertTrue(makefile.is_file(), "Makefile must exist")

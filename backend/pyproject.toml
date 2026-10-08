@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "commerce-ops-desk-backend"
-version = "0.1.0"
+version = "0.2.0"
 description = "Tenant-scoped exception workflow API for CommerceOps Desk"
 requires-python = ">=3.12,<3.15"
 dependencies = [
