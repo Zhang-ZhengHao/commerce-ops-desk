@@ -2,7 +2,7 @@
 
 ## Current verified slice
 
-I03 delivers the first complete order-exception workflow on top of the hosted foundation and demo identity boundary:
+I03 delivers the first complete order-exception workflow on top of the hosted foundation and demo identity boundary. The I04 backend slice adds a narrow signed synthetic-event path and live PostgreSQL evidence without changing the current browser demonstration:
 
 - FastAPI serves the production React bundle and same-origin JSON API from an injected port, with liveness and database-readiness probes.
 - Visitors can create a four-hour synthetic Manager or Agent workspace, recover it after refresh, switch persisted roles, and reset only their active tenant.
@@ -12,9 +12,13 @@ I03 delivers the first complete order-exception workflow on top of the hosted fo
 - Concurrent exact retries resolve to one effect and the same response. Concurrent reuse of a key for another payload yields one success and one `409`, without partial writes or an unhandled integrity error.
 - A per-workspace conditional counter caps synthetic notes. Exact replay does not consume quota twice, and concurrent writes cannot cross the limit.
 - Database constraints enforce rule/type/severity mappings, non-null source-event identity, coherent lifecycle fields, valid resolution reasons, and unique per-case audit versions.
+- A conditionally registered machine endpoint enforces the canonical raw path, then authenticates the timestamp, integration ID, event ID, and exact body bytes with HMAC-SHA256 before strict media and JSON parsing.
+- One `payment.failed` event atomically creates or validates its synthetic order, marks payment failed, creates a new open high-severity payment case, appends a null-actor audit event, and completes its inbox references.
+- Exact event/body replays return the committed case without another effect or allowance charge. A different valid raw-body encoding or an immutable order snapshot conflict returns `409`; authentication, source, workspace, and transient-service failures have separate stable codes.
+- The existing live PostgreSQL 17 gate now includes webhook evidence alongside migrations, constraints, readiness, transaction rollback, named lock races, and the production container rather than inferring behavior from compiled SQL.
 - Loading, empty, filtered-empty, error, permission, conflict, committed-write/read-failure, reset, desktop, mobile, and 320-pixel states have automated coverage.
 
-The interface exposes only behavior backed by the current API. Signed webhook intake, the outbox worker, retries, dead-letter recovery, and provider adapters remain planned.
+No webhook-specific UI is added in this pull request: webhook-created cases use the existing I03 queue, detail, and generic audit rendering. The Manager simulator and dedicated source/provenance UI belong to the next pull request. An outbox worker, automated delivery retries, dead-letter recovery, and real provider adapters remain unimplemented.
 
 ## Product outcome
 
@@ -29,7 +33,7 @@ The current executable path is:
 5. The case version, compact command receipt, note, and audit event commit together.
 6. The detail view renders notes and audit history; audit events with equal timestamps remain ordered by case version.
 
-The later integration path will begin with a server-signed synthetic webhook and add an immutable event plus transactional outbox before it reaches the same case workflow.
+The current integration path accepts one signed synthetic event synchronously and reaches the same case workflow. A later real-provider phase would need its own adapter, secret distribution and overlapping rotation policy, and a justified asynchronous outbox/worker boundary.
 
 ## Users and authorization
 
@@ -42,14 +46,16 @@ The later integration path will begin with a server-signed synthetic webhook and
 
 ```text
 React + TypeScript
-        |
-same-origin FastAPI API and static delivery
-        |
-authorization + transactional command services
-        |
-SQLAlchemy repositories and Alembic migrations
-        |
-SQLite single-node demo / PostgreSQL offline DDL target
+        | same-origin cookie + CSRF
+FastAPI API and static delivery
+        |                         signed raw request
+authorization                 synthetic webhook ingress
+        |                         |
+        +---- transactional command/event services ----+
+                              |
+             SQLAlchemy repositories and Alembic migrations
+                              |
+       SQLite single-node demo / PostgreSQL 17 verified path
 ```
 
 The browser holds only the current CSRF token and rendered state. It does not persist session material in web storage or decide authorization. A successful case mutation returns a compact receipt; a subsequent GET obtains the authoritative representation.
@@ -62,16 +68,18 @@ Case commands use `(membership, command type, idempotency key)` as the durable r
 
 Notes use a conditional update of the owning demo organization to enforce the workspace allowance atomically. The 201st unique note returns `429` without advancing the case, counter, receipt, note, or audit history. Replaying an already committed command is checked before quota consumption.
 
-SQLite uses WAL and a busy timeout only on a host-local filesystem. The hosted launcher deliberately avoids the NFS-backed workspace for its default demo database. PostgreSQL DDL is compiled offline, but live PostgreSQL behavior is not yet claimed.
+Webhook source admission commits in its own short transaction before target lookup. Authentication resolves a minimal integration projection, then the business transaction re-locks and revalidates organization, provider, enabled state, expiry, and key version. The inbox conflict key binds tenant, integration, and external event ID; the exact raw-body digest distinguishes a replay from conflicting reuse. A database or unknown-commit failure returns retryable `503` without an internal retry.
+
+SQLite uses WAL and a busy timeout only on a host-local filesystem. The hosted launcher deliberately avoids the NFS-backed workspace for its default demo database. PostgreSQL 17 has a separate disposable-database harness so migration, lock, and concurrency claims execute on the real engine.
 
 ## Security and privacy boundaries
 
-Implemented controls include opaque cookie sessions, Origin and CSRF checks, bounded API bodies, compact validation errors, server-side membership lookup, tenant-scoped data access, persistent creation and role-write limits, bounded note growth, trusted-proxy parsing, capacity control, and stable secret-file handling.
+Implemented controls include opaque cookie sessions, Origin and CSRF checks, bounded API bodies, compact validation errors, server-side membership lookup, tenant-scoped data access, persistent creation and role-write limits, bounded note growth, trusted-proxy parsing, capacity control, stable secret-file handling, raw-byte HMAC verification, dummy authentication work for hidden targets, and keyed source-rate pseudonyms.
 
 All fixtures use fictional identifiers and neutral synthetic order data. The service is disconnected from merchant accounts and cannot issue customer-facing actions. See the [security model](security-model.md) for assumptions and deployment limits.
 
 ## Verification evidence
 
-The release gate runs backend API, concurrency, authorization, tenant-isolation, migration, reset, pagination, startup, and configuration tests; React component tests; real desktop and mobile browser journeys; strict Python and TypeScript checks; a production build; and public-history scanning.
+The release gate runs backend API, concurrency, authorization, tenant-isolation, migration, reset, pagination, startup, webhook authentication/transaction, and configuration tests; React component tests; real desktop and mobile browser journeys; strict Python and TypeScript checks; a production build; and public-history scanning.
 
-PostgreSQL SQL and Alembic migration DDL are compiled offline only. A live PostgreSQL service, signed webhook contract, outbox worker, generated API client, Compose deployment, and released-build performance evidence remain future gates and are not represented as complete.
+The parallel PostgreSQL gate runs against PostgreSQL 17 and includes the hardened production container. A browser webhook simulator, outbox worker, generated API client, Compose deployment, multi-node claims, and released-build performance evidence remain future gates and are not represented as complete.

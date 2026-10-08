@@ -12,7 +12,7 @@ help:
 	@echo "CommerceOps Desk development targets"
 	@echo "  setup                Install locked Python, Node, and browser dependencies"
 	@echo "  run                  Build and start the local app from .env or safe defaults"
-	@echo "  verify               Run the complete I03 verification gate"
+	@echo "  verify               Run the main SQLite/full-stack verification gate"
 	@echo "  backend-test         Run backend tests (override with TEST=tests/test_health.py)"
 	@echo "  frontend-test        Run frontend component tests"
 	@echo "  sqlite-migrate-test  Prove an empty SQLite database can migrate to head"
@@ -48,7 +48,7 @@ postgres-migration-test:
 	cd backend && "$(PYTHON)" -m pytest postgres_tests/test_harness.py postgres_tests/test_migrations.py
 
 postgres-integration-test:
-	cd backend && "$(PYTHON)" -m pytest postgres_tests/test_workflow.py postgres_tests/test_concurrency.py postgres_tests/test_webhook_rate_limits.py postgres_tests/test_webhook_repository.py postgres_tests/test_webhook_processing.py
+	cd backend && "$(PYTHON)" -m pytest postgres_tests/test_workflow.py postgres_tests/test_concurrency.py postgres_tests/test_webhook_rate_limits.py postgres_tests/test_webhook_repository.py postgres_tests/test_webhook_processing.py postgres_tests/test_webhook_api.py
 
 postgres-container-test:
 	cd backend && "$(PYTHON)" -m pytest -m container postgres_tests/test_container.py

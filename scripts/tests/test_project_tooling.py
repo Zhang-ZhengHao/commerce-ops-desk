@@ -9,7 +9,7 @@ PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ProjectToolingContractTest(unittest.TestCase):
-    def test_makefile_exposes_the_complete_i03_verification_surface(self) -> None:
+    def test_makefile_exposes_the_main_verification_surface(self) -> None:
         makefile = PRODUCT_ROOT / "Makefile"
         self.assertTrue(makefile.is_file(), "Makefile must exist")
 
@@ -32,9 +32,9 @@ class ProjectToolingContractTest(unittest.TestCase):
                 "build",
                 "verify",
             }.issubset(targets),
-            f"missing I03 targets: {targets}",
+            f"missing main verification targets: {targets}",
         )
-        self.assertIn("complete I03 verification gate", makefile.read_text())
+        self.assertIn("main SQLite/full-stack verification gate", makefile.read_text())
 
     def test_environment_example_is_runnable_without_containing_credentials(
         self,
@@ -128,7 +128,8 @@ class ProjectToolingContractTest(unittest.TestCase):
             "pytest postgres_tests/test_workflow.py postgres_tests/test_concurrency.py "
             "postgres_tests/test_webhook_rate_limits.py "
             "postgres_tests/test_webhook_repository.py "
-            "postgres_tests/test_webhook_processing.py",
+            "postgres_tests/test_webhook_processing.py "
+            "postgres_tests/test_webhook_api.py",
             contents,
         )
         self.assertRegex(
@@ -203,7 +204,7 @@ class ProjectToolingContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, job)
 
-    def test_public_docs_separate_verified_i03_scope_from_the_roadmap(
+    def test_public_docs_separate_verified_i04_scope_from_the_roadmap(
         self,
     ) -> None:
         readme = (PRODUCT_ROOT / "README.md").read_text()
@@ -221,14 +222,23 @@ class ProjectToolingContractTest(unittest.TestCase):
         ):
             self.assertIn(heading, readme)
         self.assertIn("I03 order/case vertical slice", readme)
+        self.assertIn("I04 backend signed-ingress slice", readme)
         self.assertIn("docs/assets/demo-entry-i03.png", readme)
         self.assertIn("docs/assets/exception-workflow.png", readme)
-        self.assertIn("Signed webhook intake, transactional outbox processing", readme)
-        self.assertIn("remain roadmap work", readme)
+        self.assertIn("Signed machine ingress", readme)
+        self.assertIn(
+            "PostgreSQL 17 migration, constraint, readiness, transaction",
+            readme,
+        )
+        self.assertIn("A browser simulator, asynchronous outbox/worker", readme)
 
         self.assertIn("## Current verified slice", design_summary)
         self.assertIn(
             "I03 delivers the first complete order-exception workflow",
+            design_summary,
+        )
+        self.assertIn(
+            "The I04 backend slice adds a narrow signed synthetic-event path",
             design_summary,
         )
         for heading in (
@@ -240,12 +250,14 @@ class ProjectToolingContractTest(unittest.TestCase):
             "## Verification evidence",
         ):
             self.assertIn(heading, design_summary)
-        self.assertIn("Signed webhook intake, the outbox worker", design_summary)
-        self.assertIn("remain planned", design_summary)
+        self.assertIn("No webhook-specific UI is added", design_summary)
+        self.assertIn("An outbox worker", design_summary)
+        self.assertIn("remain unimplemented", design_summary)
 
         for heading in (
             "## Threat model",
             "## Session and write controls",
+            "## Signed webhook boundary",
             "## Tenant and role boundaries",
             "## Transaction and idempotency boundaries",
             "## Abuse and resource controls",
@@ -258,13 +270,10 @@ class ProjectToolingContractTest(unittest.TestCase):
         )
         self.assertIn("The public demo is single-node", security_model)
         self.assertIn(
-            "PostgreSQL models and Alembic DDL compile offline",
+            "PostgreSQL 17 migrations, tenant constraints, readiness",
             security_model,
         )
-        self.assertIn(
-            "no live PostgreSQL migration, transaction, lock, or concurrency result is claimed",
-            security_model,
-        )
+        self.assertIn("does not claim exactly-once delivery", security_model)
 
         for relative_path in (
             "docs/assets/demo-entry-i03.png",

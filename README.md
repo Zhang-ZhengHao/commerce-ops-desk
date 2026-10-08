@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/Zhang-ZhengHao/commerce-ops-desk?include_prereleases)](https://github.com/Zhang-ZhengHao/commerce-ops-desk/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-38bdf8.svg)](LICENSE)
 
-A working full-stack operations desk for triaging ecommerce payment, refund, and fulfillment exceptions. Managers can assign organization-wide work; Agents can investigate and resolve only their own cases. Case writes are version-checked and retry-safe, access is tenant-scoped, and material actions are auditable.
+A working full-stack operations desk for triaging ecommerce payment, refund, and fulfillment exceptions. Managers can assign organization-wide work; Agents can investigate and resolve only their own cases. Case writes are version-checked and retry-safe, access is tenant-scoped, material actions are auditable, and a conditionally enabled signed synthetic webhook can create a payment-failure case in one atomic business transaction.
 
 All identities, orders, and outcomes are synthetic. The demo never connects to a store or performs a real payment, refund, or fulfillment action.
 
@@ -17,6 +17,8 @@ All identities, orders, and outcomes are synthetic. The demo never connects to a
 - **Concurrency behavior:** optimistic case versions return `409`; idempotency keys replay the same compact result, while concurrent key reuse with another payload returns a stable conflict instead of a server error.
 - **Accountable history:** each assignment, note, and resolution records a stable action key and case version. Audit events with equal timestamps still render in case-version order.
 - **Disposable demo controls:** sessions and CSRF tokens rotate on role changes, note growth is bounded per workspace, and Reset replaces only the active synthetic tenant.
+- **Signed machine ingress:** the ingress first enforces a canonical raw path, then HMAC-authenticates the timestamp, integration ID, event ID, and exact raw body bytes before media-type or JSON parsing. Exact delivery replays return the committed case; a different valid raw-body encoding under the same event ID returns `409`.
+- **Live PostgreSQL evidence:** a PostgreSQL 17 CI job runs fresh and repeat migrations, tenant constraints, transaction and lock races, webhook concurrency, and the hardened production container readiness path.
 
 ### 90-second walkthrough
 
@@ -34,9 +36,11 @@ flowchart LR
     UI[React + TypeScript] -->|same-origin JSON| API[FastAPI + Pydantic]
     API --> AUTH[Cookie session, CSRF, RBAC]
     API --> SVC[Transactional command services]
+    SENDER[Synthetic signed sender] -->|raw bytes + HMAC| WEBHOOK[Webhook ingress]
+    WEBHOOK --> SVC
     SVC --> DB[(SQLAlchemy + Alembic)]
     DB --> SQLITE[SQLite single-node demo]
-    DB -. offline DDL target .-> PG[PostgreSQL]
+    DB --> PG[PostgreSQL 17 verified path]
 ```
 
 The browser never supplies trusted role or tenant state. Each request resolves its opaque cookie back to the persisted session, membership, and organization. Composite tenant foreign keys, conditional updates, database constraints, and negative authorization tests reinforce that boundary below the UI.
@@ -55,13 +59,15 @@ make run
 
 Open `http://localhost:8000`. The example configuration uses a local SQLite file and non-secret development settings.
 
-Run the same release gate used by CI:
+Run the main SQLite and full-stack gate used by CI:
 
 ```bash
 make verify
 ```
 
 It covers backend and frontend tests, fresh migrations, hosted startup, desktop and mobile browser journeys, Python and TypeScript static checks, the production bundle, and a scan of the worktree plus reachable Git history for recognized secrets and internal identifiers.
+
+CI runs the live PostgreSQL 17 migration, concurrency, webhook, and production-container gate as a separate parallel job through the `postgres-*` Make targets.
 
 ### Run as a container
 
@@ -79,11 +85,13 @@ docker run --rm --name commerce-ops-desk \
 
 The cookie override is only for direct local HTTP. Keep secure cookies enabled when TLS terminates in front of the container.
 
+Settings and local development default webhook intake off. The hosted demo launcher enables it by default and creates or reuses an isolated `data/.webhook-secret`. Production keeps it off unless `COMMERCE_OPS_WEBHOOK_ENABLED=true`; when enabled, production requires an independent `COMMERCE_OPS_WEBHOOK_MASTER_SECRET` or validated `COMMERCE_OPS_WEBHOOK_MASTER_SECRET_FILE` with mode `0600`. The current endpoint accepts only the closed synthetic `payment.failed` schema; it is not a real provider adapter.
+
 ## Verified scope and limits
 
-This release contains the I01 hosted foundation, I02 demo identity boundary, and I03 order/case vertical slice. SQLite is intentionally limited to the single-node disposable demo. Hosted SQLite is placed on a host-local filesystem because WAL is unsafe on the workspace's NFS mount.
+This branch contains the I01 hosted foundation, I02 demo identity boundary, I03 order/case vertical slice, and the I04 backend signed-ingress slice. SQLite is intentionally limited to the single-node disposable demo. Hosted SQLite is placed on a host-local filesystem because WAL is unsafe on the workspace's NFS mount.
 
-PostgreSQL models and migration DDL compile offline, but no live PostgreSQL migration, locking, or concurrency result is claimed yet. Signed webhook intake, transactional outbox processing, retries, dead-letter recovery, and real commerce-provider adapters remain roadmap work; the interface does not present them as implemented.
+PostgreSQL 17 migration, constraint, readiness, transaction, and selected concurrency behavior run against a live service in CI. The signed webhook is synchronous, demo-only, and safely supports retries from an at-least-once sender rather than claiming exactly-once delivery. A browser simulator, asynchronous outbox/worker, automatic delivery retries, dead-letter recovery, overlapping-key rotation, and real commerce-provider adapters remain outside this pull request.
 
 See the [design summary](docs/design-summary.md) and [security model](docs/security-model.md) for the exact boundaries and evidence.
 

@@ -22,12 +22,16 @@ from app.auth.webhook import (
 from app.models import (
     AuditEvent,
     ExceptionCase,
+    Order,
     Organization,
     RateLimit,
     WebhookEvent,
     WebhookIntegration,
 )
 from app.services.webhook_ingress import derive_webhook_source_digest
+from app.services.webhook_processing import (
+    process_payment_failed_webhook as real_process_payment_failed_webhook,
+)
 
 WEBHOOK_MASTER_SECRET = "webhook-transaction-test-master-secret-independent"
 VALID_BODY = (
@@ -36,6 +40,10 @@ VALID_BODY = (
     b'"amount_minor":12900,"currency":"USD"}}}'
 )
 VALID_BODY_WITH_WHITESPACE = VALID_BODY.replace(b'{"type"', b'{ "type"', 1)
+VALID_BODY_WITH_CHANGED_AMOUNT = VALID_BODY.replace(
+    b'"amount_minor":12900',
+    b'"amount_minor":13900',
+)
 INVALID_BODY = b'{"type":"payment.failed","occurred_at":'
 
 AUTHENTICATION_FAILED = {
@@ -326,6 +334,64 @@ def test_demo_event_allowance_returns_a_distinct_429_and_rolls_back_the_new_even
         )
 
 
+def test_changed_order_snapshot_for_a_new_event_rolls_back_every_new_business_write(
+    app_harness_factory: Callable[..., AppHarness],
+) -> None:
+    source_ip = "198.51.100.90"
+    harness = app_harness_factory(
+        webhook_enabled=True,
+        webhook_master_secret=WEBHOOK_MASTER_SECRET,
+    )
+    organization_id, integration_id, key_version = _seed_active_target(harness)
+    timestamp = int(harness.clock().timestamp())
+    original_event_id = "evt_TXORDER001"
+    conflicting_event_id = "evt_TXORDER002"
+
+    with harness.client(source_ip=source_ip, raise_server_exceptions=False) as client:
+        created = client.post(
+            f"/api/webhooks/synthetic/{integration_id}",
+            content=VALID_BODY,
+            headers=_signed_headers(
+                integration_id=integration_id,
+                key_version=key_version,
+                timestamp=timestamp,
+                event_id=original_event_id,
+                raw_body=VALID_BODY,
+            ),
+        )
+        conflicted = client.post(
+            f"/api/webhooks/synthetic/{integration_id}",
+            content=VALID_BODY_WITH_CHANGED_AMOUNT,
+            headers=_signed_headers(
+                integration_id=integration_id,
+                key_version=key_version,
+                timestamp=timestamp,
+                event_id=conflicting_event_id,
+                raw_body=VALID_BODY_WITH_CHANGED_AMOUNT,
+            ),
+        )
+
+    assert created.status_code == 201
+    assert conflicted.status_code == 409
+    assert conflicted.json() == EVENT_CONFLICT
+    assert _persisted_source_count(harness, source_ip=source_ip) == 2
+    assert _business_counts(harness) == (1, 1, 1)
+
+    factory = cast(sessionmaker[Session], harness.app.state.session_factory)
+    with factory() as database:
+        assert database.scalars(select(WebhookEvent.external_event_id)).all() == [original_event_id]
+        order = database.scalar(select(Order))
+        assert order is not None
+        assert order.amount_minor == 12_900
+        assert order.payment_status == "failed"
+        assert (
+            database.scalar(
+                select(Organization.webhook_event_count).where(Organization.id == organization_id)
+            )
+            == 1
+        )
+
+
 def test_source_limit_returns_retry_after_and_uses_a_distinct_429_code(
     app_harness_factory: Callable[..., AppHarness],
 ) -> None:
@@ -386,6 +452,99 @@ def test_database_failure_returns_retryable_503_without_business_writes(
     assert _business_counts(harness) == (0, 0, 0)
 
 
+def test_unknown_commit_outcome_is_retryable_without_automatic_reprocessing(
+    app_harness_factory: Callable[..., AppHarness],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_ip = "198.51.100.89"
+    harness = app_harness_factory(
+        webhook_enabled=True,
+        webhook_master_secret=WEBHOOK_MASTER_SECRET,
+    )
+    organization_id, integration_id, key_version = _seed_active_target(harness)
+    event_id = "evt_TXUNKNOWN01"
+    first_timestamp = int(harness.clock().timestamp())
+    processor_calls = 0
+
+    def commit_then_report_unknown(*args: Any, **kwargs: Any) -> Any:
+        nonlocal processor_calls
+        processor_calls += 1
+        result = real_process_payment_failed_webhook(*args, **kwargs)
+        if processor_calls == 1:
+            raise OperationalError("commit outcome unknown", {}, OSError("connection lost"))
+        return result
+
+    monkeypatch.setattr(
+        webhook_api,
+        "process_payment_failed_webhook",
+        commit_then_report_unknown,
+    )
+
+    with harness.client(source_ip=source_ip, raise_server_exceptions=False) as client:
+        unavailable = client.post(
+            f"/api/webhooks/synthetic/{integration_id}",
+            content=VALID_BODY,
+            headers=_signed_headers(
+                integration_id=integration_id,
+                key_version=key_version,
+                timestamp=first_timestamp,
+                event_id=event_id,
+                raw_body=VALID_BODY,
+            ),
+        )
+
+    assert unavailable.status_code == 503
+    assert unavailable.json() == SERVICE_UNAVAILABLE
+    assert unavailable.headers["Retry-After"] == "1"
+    assert processor_calls == 1
+    assert _persisted_source_count(harness, source_ip=source_ip) == 1
+    assert _business_counts(harness) == (1, 1, 1)
+
+    factory = cast(sessionmaker[Session], harness.app.state.session_factory)
+    with factory() as database:
+        committed_case_id = database.scalar(select(ExceptionCase.id))
+        assert committed_case_id is not None
+        assert (
+            database.scalar(
+                select(Organization.webhook_event_count).where(Organization.id == organization_id)
+            )
+            == 1
+        )
+
+    harness.clock.advance(seconds=1)
+    retry_timestamp = int(harness.clock().timestamp())
+    with harness.client(source_ip=source_ip, raise_server_exceptions=False) as client:
+        replayed = client.post(
+            f"/api/webhooks/synthetic/{integration_id}",
+            content=VALID_BODY,
+            headers=_signed_headers(
+                integration_id=integration_id,
+                key_version=key_version,
+                timestamp=retry_timestamp,
+                event_id=event_id,
+                raw_body=VALID_BODY,
+            ),
+        )
+
+    assert replayed.status_code == 200
+    assert replayed.json() == {
+        "status": "processed",
+        "event_id": event_id,
+        "case_id": committed_case_id,
+        "replayed": True,
+    }
+    assert processor_calls == 2
+    assert _persisted_source_count(harness, source_ip=source_ip) == 2
+    assert _business_counts(harness) == (1, 1, 1)
+    with factory() as database:
+        assert (
+            database.scalar(
+                select(Organization.webhook_event_count).where(Organization.id == organization_id)
+            )
+            == 1
+        )
+
+
 def test_key_rotation_after_authentication_invalidates_the_old_signature_before_writes(
     app_harness_factory: Callable[..., AppHarness],
     monkeypatch: pytest.MonkeyPatch,
@@ -432,9 +591,65 @@ def test_key_rotation_after_authentication_invalidates_the_old_signature_before_
     with factory() as database:
         assert (
             database.scalar(
-                select(Organization.webhook_event_count).where(
-                    Organization.id == organization_id
-                )
+                select(Organization.webhook_event_count).where(Organization.id == organization_id)
             )
             == 0
+        )
+
+
+def test_target_disabled_after_authentication_is_rejected_before_business_writes(
+    app_harness_factory: Callable[..., AppHarness],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_ip = "198.51.100.91"
+    harness = app_harness_factory(
+        webhook_enabled=True,
+        webhook_master_secret=WEBHOOK_MASTER_SECRET,
+    )
+    organization_id, integration_id, key_version = _seed_active_target(harness)
+    timestamp = int(harness.clock().timestamp())
+    factory = cast(sessionmaker[Session], harness.app.state.session_factory)
+
+    def verify_then_disable(**kwargs: Any) -> bool:
+        accepted = verify_webhook_signature(**kwargs)
+        assert accepted is True
+        with factory.begin() as database:
+            database.execute(
+                update(WebhookIntegration)
+                .where(WebhookIntegration.id == integration_id)
+                .values(enabled=False)
+            )
+        return True
+
+    monkeypatch.setattr(webhook_api, "verify_webhook_signature", verify_then_disable)
+
+    with harness.client(source_ip=source_ip, raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/webhooks/synthetic/{integration_id}",
+            content=VALID_BODY,
+            headers=_signed_headers(
+                integration_id=integration_id,
+                key_version=key_version,
+                timestamp=timestamp,
+                event_id="evt_TXDISABLED1",
+                raw_body=VALID_BODY,
+            ),
+        )
+
+    assert response.status_code == 401
+    assert response.json() == AUTHENTICATION_FAILED
+    assert _persisted_source_count(harness, source_ip=source_ip) == 1
+    assert _business_counts(harness) == (0, 0, 0)
+    with factory() as database:
+        assert (
+            database.scalar(
+                select(Organization.webhook_event_count).where(Organization.id == organization_id)
+            )
+            == 0
+        )
+        assert (
+            database.scalar(
+                select(WebhookIntegration.enabled).where(WebhookIntegration.id == integration_id)
+            )
+            is False
         )
