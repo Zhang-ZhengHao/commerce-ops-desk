@@ -133,6 +133,19 @@ class ProjectToolingContractTest(unittest.TestCase):
             r"(?m)^postgres-test: postgres-migration-test postgres-integration-test$",
         )
 
+    def test_makefile_exposes_the_hardened_postgresql_container_gate(self) -> None:
+        makefile = (PRODUCT_ROOT / "Makefile").read_text()
+        pyproject = (PRODUCT_ROOT / "backend" / "pyproject.toml").read_text()
+
+        self.assertRegex(makefile, r"(?m)^postgres-container-test:$")
+        self.assertIn(
+            "pytest -m container postgres_tests/test_container.py",
+            makefile,
+        )
+        self.assertIn(
+            '"container: requires Docker and a live PostgreSQL service"', pyproject
+        )
+
     def test_ci_preserves_browser_failure_evidence(self) -> None:
         contents = (PRODUCT_ROOT / ".github" / "workflows" / "verify.yml").read_text()
 

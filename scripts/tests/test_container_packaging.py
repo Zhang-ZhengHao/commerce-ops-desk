@@ -29,6 +29,13 @@ class ContainerPackagingContractTest(unittest.TestCase):
         self.assertIn("HEALTHCHECK", dockerfile)
         self.assertNotRegex(dockerfile, re.compile(r"(?i)(password|secret|token)=\S+"))
 
+    def test_healthcheck_uses_the_runtime_port_and_database_readiness(self) -> None:
+        dockerfile = (PRODUCT_ROOT / "Dockerfile").read_text()
+
+        self.assertIn("os.environ['PORT']", dockerfile)
+        self.assertIn("'/ready'", dockerfile)
+        self.assertNotIn("127.0.0.1:8000/health", dockerfile)
+
     def test_container_defaults_keep_demo_state_in_the_mounted_data_directory(
         self,
     ) -> None:
@@ -57,6 +64,8 @@ class ContainerPackagingContractTest(unittest.TestCase):
             "frontend/playwright-report",
             "frontend/test-results",
             "backend/postgres_tests",
+            "backend/tests",
+            "scripts/tests",
         ):
             self.assertIn(entry, dockerignore)
 

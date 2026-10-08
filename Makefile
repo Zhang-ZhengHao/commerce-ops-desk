@@ -6,7 +6,7 @@ VENV ?= .venv
 PYTHON ?= $(abspath $(VENV))/bin/python
 TEST ?= tests
 
-.PHONY: help setup run backend-test project-test frontend-test sqlite-migrate-test postgres-migration-test postgres-integration-test postgres-test hosted-smoke e2e-smoke public-scan lint build verify
+.PHONY: help setup run backend-test project-test frontend-test sqlite-migrate-test postgres-migration-test postgres-integration-test postgres-container-test postgres-test hosted-smoke e2e-smoke public-scan lint build verify
 
 help:
 	@echo "CommerceOps Desk development targets"
@@ -18,6 +18,7 @@ help:
 	@echo "  sqlite-migrate-test  Prove an empty SQLite database can migrate to head"
 	@echo "  postgres-migration-test  Prove PostgreSQL migrations and selected constraints"
 	@echo "  postgres-integration-test  Prove PostgreSQL runtime and concurrency behavior"
+	@echo "  postgres-container-test  Prove the hardened container against PostgreSQL"
 	@echo "  postgres-test       Run every non-container PostgreSQL proof"
 	@echo "  hosted-smoke         Start the hosted entrypoint on a random port and probe it"
 	@echo "  e2e-smoke            Run Playwright entry smoke tests"
@@ -48,6 +49,9 @@ postgres-migration-test:
 
 postgres-integration-test:
 	cd backend && "$(PYTHON)" -m pytest postgres_tests/test_workflow.py postgres_tests/test_concurrency.py
+
+postgres-container-test:
+	cd backend && "$(PYTHON)" -m pytest -m container postgres_tests/test_container.py
 
 postgres-test: postgres-migration-test postgres-integration-test
 

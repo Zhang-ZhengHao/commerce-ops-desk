@@ -28,6 +28,9 @@ dev = [
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "container: requires Docker and a live PostgreSQL service",
+]
 
 [tool.ruff]
 line-length = 100
