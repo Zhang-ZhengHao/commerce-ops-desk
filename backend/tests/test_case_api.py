@@ -1,10 +1,22 @@
 """HTTP contracts for the first order/case workflow slice."""
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
-from conftest import SAME_ORIGIN
+from conftest import SAME_ORIGIN, AppHarness
 from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.auth.webhook import derive_webhook_integration_key, sign_webhook_request
+from app.models import WebhookEvent, WebhookIntegration
+
+WEBHOOK_MASTER_SECRET = "case-provenance-test-webhook-secret"
+WEBHOOK_BODY = (
+    b'{"type":"payment.failed","occurred_at":"2026-10-07T11:59:00Z",'
+    b'"data":{"order":{"id":"syn_order_PROVENANCE01","number":"DEMO-2045",'
+    b'"amount_minor":12900,"currency":"USD"}}}'
+)
 
 
 def _command_headers(csrf_token: str, key: str) -> dict[str, str]:
@@ -13,6 +25,41 @@ def _command_headers(csrf_token: str, key: str) -> dict[str, str]:
         "X-CSRF-Token": csrf_token,
         "Idempotency-Key": key,
     }
+
+
+def _deliver_webhook_case(
+    client: TestClient,
+    *,
+    harness: AppHarness,
+    event_id: str,
+) -> Any:
+    factory = cast(sessionmaker[Session], harness.app.state.session_factory)
+    with factory() as database:
+        integration_id, key_version = database.execute(
+            select(WebhookIntegration.id, WebhookIntegration.key_version)
+        ).one()
+    timestamp = int(harness.clock().timestamp())
+    integration_key = derive_webhook_integration_key(
+        WEBHOOK_MASTER_SECRET.encode("utf-8"),
+        integration_id=integration_id,
+        key_version=key_version,
+    )
+    return client.post(
+        f"/api/webhooks/synthetic/{integration_id}",
+        content=WEBHOOK_BODY,
+        headers={
+            "Content-Type": "application/json",
+            "X-Webhook-Timestamp": str(timestamp),
+            "X-Webhook-Event-Id": event_id,
+            "X-Webhook-Signature": sign_webhook_request(
+                integration_key=integration_key,
+                timestamp=timestamp,
+                integration_id=integration_id,
+                event_id=event_id,
+                raw_body=WEBHOOK_BODY,
+            ),
+        },
+    )
 
 
 def test_manager_dashboard_summarizes_the_seeded_workspace(
@@ -109,6 +156,7 @@ def test_agent_can_open_only_the_seeded_case_assigned_to_them(
     assert queue.json()["total"] == 1
     own_case = queue.json()["items"][0]
     assert own_case["order"]["order_number"] == "DEMO-1042"
+    assert own_case["source"] == {"kind": "seeded_demo"}
     assert own_case["assignee"] == {
         "membership_id": bootstrap.json()["identity"]["membership_id"],
         "display_name": "Demo Agent",
@@ -128,6 +176,54 @@ def test_agent_can_open_only_the_seeded_case_assigned_to_them(
         "notes": [],
         "audit_events": [],
     }
+
+
+def test_webhook_case_exposes_only_safe_source_in_queue_and_detail(
+    app_harness_factory: Callable[..., AppHarness],
+    bootstrap_workspace: Callable[..., Any],
+) -> None:
+    harness = app_harness_factory(
+        webhook_enabled=True,
+        webhook_master_secret=WEBHOOK_MASTER_SECRET,
+    )
+    event_id = "evt_PROVENANCE01"
+
+    with harness.client() as client:
+        bootstrap = bootstrap_workspace(client, role="manager")
+        assert bootstrap.status_code == 201
+        delivery = _deliver_webhook_case(client, harness=harness, event_id=event_id)
+        assert delivery.status_code == 201
+        case_id = delivery.json()["case_id"]
+
+        queue = client.get("/api/cases")
+        detail = client.get(f"/api/cases/{case_id}")
+
+    assert queue.status_code == 200
+    queue_case = next(item for item in queue.json()["items"] if item["id"] == case_id)
+    assert detail.status_code == 200
+    expected_source = {
+        "kind": "synthetic_webhook",
+        "provider": "synthetic",
+        "event_type": "payment.failed",
+        "external_event_id": event_id,
+        "received_at": "2026-10-07T12:00:00Z",
+    }
+    assert queue_case["source"] == expected_source
+    assert detail.json()["source"] == expected_source
+
+    factory = cast(sessionmaker[Session], harness.app.state.session_factory)
+    with factory() as database:
+        internal_event_id, integration_id, payload_digest = database.execute(
+            select(
+                WebhookEvent.id,
+                WebhookEvent.integration_id,
+                WebhookEvent.payload_digest,
+            ).where(WebhookEvent.case_id == case_id)
+        ).one()
+    serialized = detail.text
+    assert internal_event_id not in serialized
+    assert integration_id not in serialized
+    assert payload_digest not in serialized
 
 
 def test_manager_can_list_assignable_agents(

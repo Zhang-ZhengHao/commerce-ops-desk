@@ -1,7 +1,7 @@
 """Role-scoped case queue and workflow endpoints."""
 
 from datetime import datetime
-from typing import Annotated, Protocol, cast
+from typing import Annotated, Literal, Protocol, cast
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi import status as http_status
@@ -48,6 +48,27 @@ class AssigneePayload(BaseModel):
     display_name: str
 
 
+class SeededDemoSourcePayload(BaseModel):
+    kind: Literal["seeded_demo"]
+
+
+class SyntheticWebhookSourcePayload(BaseModel):
+    kind: Literal["synthetic_webhook"]
+    provider: Literal["synthetic"]
+    event_type: Literal["payment.failed"]
+    external_event_id: Annotated[
+        str,
+        StringConstraints(pattern=r"^evt_[A-Za-z0-9]{8,64}$"),
+    ]
+    received_at: datetime
+
+
+CaseSourcePayload = Annotated[
+    SeededDemoSourcePayload | SyntheticWebhookSourcePayload,
+    Field(discriminator="kind"),
+]
+
+
 class CaseSummaryPayload(BaseModel):
     id: str
     rule_key: str
@@ -59,6 +80,7 @@ class CaseSummaryPayload(BaseModel):
     version: int
     resolution_reason: str | None
     resolved_at: datetime | None
+    source: CaseSourcePayload
     order: OrderSummaryPayload
     assignee: AssigneePayload | None
 

@@ -30,6 +30,17 @@ def _case_summary(row: CaseRow) -> dict[str, Any]:
             "membership_id": row.assignee.id,
             "display_name": row.assignee_user.display_name,
         }
+    source: dict[str, Any]
+    if row.source is None:
+        source = {"kind": "seeded_demo"}
+    else:
+        source = {
+            "kind": "synthetic_webhook",
+            "provider": row.source.provider,
+            "event_type": row.source.event_type,
+            "external_event_id": row.source.external_event_id,
+            "received_at": as_utc(row.source.received_at),
+        }
     return {
         "id": row.case.id,
         "rule_key": row.case.rule_key,
@@ -41,6 +52,7 @@ def _case_summary(row: CaseRow) -> dict[str, Any]:
         "version": row.case.version,
         "resolution_reason": row.case.resolution_reason,
         "resolved_at": (as_utc(row.case.resolved_at) if row.case.resolved_at is not None else None),
+        "source": source,
         "order": {
             "id": row.order.id,
             "order_number": row.order.order_number,
