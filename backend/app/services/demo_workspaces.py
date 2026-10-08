@@ -28,6 +28,7 @@ from app.models import (
     Role,
     User,
 )
+from app.repositories.rate_limits import claim_fixed_window_slot
 from app.repositories.webhook_integrations import create_demo_webhook_integration
 from app.services.seeding import seed_demo_order_cases
 
@@ -84,45 +85,6 @@ def _fixed_hour(now: datetime) -> datetime:
 def _retry_after(now: datetime) -> int:
     window_end = _fixed_hour(now) + timedelta(hours=1)
     return max(1, math.ceil((window_end - now.astimezone(UTC)).total_seconds()))
-
-
-def _upsert_counter(
-    db: Session,
-    *,
-    source_digest: str,
-    window_start: datetime,
-    now: datetime,
-    maximum: int,
-) -> bool:
-    values = {
-        "source_digest": source_digest,
-        "window_start": window_start,
-        "count": 1,
-        "updated_at": now,
-    }
-    dialect_name = db.get_bind().dialect.name
-    if dialect_name == "sqlite":
-        sqlite_statement = sqlite_insert(RateLimit).values(**values)
-        sqlite_statement = sqlite_statement.on_conflict_do_update(
-            index_elements=[RateLimit.source_digest, RateLimit.window_start],
-            set_={"count": RateLimit.count + 1, "updated_at": now},
-            where=RateLimit.count < maximum,
-        )
-        result = db.execute(sqlite_statement)
-    elif dialect_name == "postgresql":
-        postgresql_statement = postgresql_insert(RateLimit).values(**values)
-        postgresql_statement = postgresql_statement.on_conflict_do_update(
-            index_elements=[RateLimit.source_digest, RateLimit.window_start],
-            set_={"count": RateLimit.count + 1, "updated_at": now},
-            where=RateLimit.count < maximum,
-        )
-        persisted_count = db.scalar(postgresql_statement.returning(RateLimit.count))
-        return persisted_count is not None
-    else:  # Settings currently prevents reaching an unsupported backend.
-        raise RuntimeError("unsupported rate-limit database")
-
-    cursor_result = cast(CursorResult[Any], result)
-    return bool(cursor_result.rowcount)
 
 
 def _acquire_capacity_lock(db: Session, *, now: datetime) -> None:
@@ -232,7 +194,7 @@ def create_demo_workspace(
         raise DemoCapacityExceeded
 
     source_digest = keyed_digest(settings, "rate-limit-source", source_address)
-    if not _upsert_counter(
+    if not claim_fixed_window_slot(
         db,
         source_digest=source_digest,
         window_start=_fixed_hour(now),
