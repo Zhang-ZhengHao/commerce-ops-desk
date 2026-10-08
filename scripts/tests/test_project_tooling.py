@@ -126,7 +126,9 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertRegex(contents, r"(?m)^postgres-integration-test:$")
         self.assertIn(
             "pytest postgres_tests/test_workflow.py postgres_tests/test_concurrency.py "
-            "postgres_tests/test_webhook_rate_limits.py",
+            "postgres_tests/test_webhook_rate_limits.py "
+            "postgres_tests/test_webhook_repository.py "
+            "postgres_tests/test_webhook_processing.py",
             contents,
         )
         self.assertRegex(

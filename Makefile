@@ -48,7 +48,7 @@ postgres-migration-test:
 	cd backend && "$(PYTHON)" -m pytest postgres_tests/test_harness.py postgres_tests/test_migrations.py
 
 postgres-integration-test:
-	cd backend && "$(PYTHON)" -m pytest postgres_tests/test_workflow.py postgres_tests/test_concurrency.py postgres_tests/test_webhook_rate_limits.py
+	cd backend && "$(PYTHON)" -m pytest postgres_tests/test_workflow.py postgres_tests/test_concurrency.py postgres_tests/test_webhook_rate_limits.py postgres_tests/test_webhook_repository.py postgres_tests/test_webhook_processing.py
 
 postgres-container-test:
 	cd backend && "$(PYTHON)" -m pytest -m container postgres_tests/test_container.py
