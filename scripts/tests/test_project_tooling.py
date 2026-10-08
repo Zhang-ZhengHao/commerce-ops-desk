@@ -259,6 +259,10 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertIn("I04 signed-webhook simulator slice", readme)
         self.assertIn("docs/assets/signed-webhook-workflow-v0.2.0.png", readme)
         self.assertIn("docs/assets/exception-workflow.png", readme)
+        self.assertIn(
+            "https://github.com/Zhang-ZhengHao/commerce-ops-desk/releases/tag/v0.2.0",
+            readme,
+        )
         self.assertIn("Signed machine ingress", readme)
         self.assertIn("Manager-only synthetic provider", readme)
         self.assertIn("server-signed envelope", readme)

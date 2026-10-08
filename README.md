@@ -36,6 +36,8 @@ All identities, orders, and outcomes are synthetic. The demo never connects to a
 
 ![Manager-only signed synthetic webhook simulator after a committed delivery](docs/assets/signed-webhook-workflow-v0.2.0.png)
 
+[Watch the 139-second v0.2 walkthrough](https://github.com/Zhang-ZhengHao/commerce-ops-desk/releases/tag/v0.2.0).
+
 ## Architecture
 
 ```mermaid
