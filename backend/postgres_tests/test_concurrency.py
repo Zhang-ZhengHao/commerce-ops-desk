@@ -92,10 +92,11 @@ def _wait_until_backend_is_blocked_by(
     raise AssertionError(f"PostgreSQL backend {blocked_pid} did not block on backend {blocker_pid}")
 
 
-def _creation_counts(harness: PostgresAppHarness) -> tuple[int, int, int, int]:
+def _creation_counts(harness: PostgresAppHarness) -> tuple[int, int, int, int, int]:
     with Session(harness.engine) as database:
         organization_count = database.scalar(text("SELECT count(*) FROM organizations"))
         session_count = database.scalar(text("SELECT count(*) FROM sessions"))
+        integration_count = database.scalar(text("SELECT count(*) FROM webhook_integrations"))
         receipt_count = database.scalar(text("SELECT count(*) FROM bootstrap_receipts"))
         source_limit_count = database.scalar(
             text(
@@ -110,11 +111,13 @@ def _creation_counts(harness: PostgresAppHarness) -> tuple[int, int, int, int]:
 
     assert organization_count is not None
     assert session_count is not None
+    assert integration_count is not None
     assert receipt_count is not None
     assert source_limit_count is not None
     return (
         int(organization_count),
         int(session_count),
+        int(integration_count),
         int(receipt_count),
         int(source_limit_count),
     )
@@ -166,7 +169,7 @@ def test_concurrent_exact_bootstrap_retry_creates_and_counts_once(
     assert [response.status_code for response in responses] == [201, 201]
     assert responses[0].json() == responses[1].json()
     assert responses[0].cookies[SESSION_COOKIE_NAME] == responses[1].cookies[SESSION_COOKIE_NAME]
-    assert _creation_counts(harness) == (1, 1, 1, 1)
+    assert _creation_counts(harness) == (1, 1, 1, 1, 1)
 
 
 def test_concurrent_changed_bootstrap_payload_has_one_conflict(
@@ -194,7 +197,7 @@ def test_concurrent_changed_bootstrap_payload_has_one_conflict(
     assert sorted(response.status_code for response in responses) == [201, 409]
     conflict = next(response for response in responses if response.status_code == 409)
     assert conflict.json()["detail"] == "Idempotency key is already bound to another payload"
-    assert _creation_counts(harness) == (1, 1, 1, 1)
+    assert _creation_counts(harness) == (1, 1, 1, 1, 1)
 
 
 def test_concurrent_exact_case_note_replays_one_effect(
@@ -505,6 +508,8 @@ def test_concurrent_reset_from_one_old_session_creates_one_replacement(
                 """
                 SELECT
                     (SELECT count(*) FROM organizations WHERE id = :old_workspace_id),
+                    (SELECT count(*) FROM webhook_integrations
+                     WHERE organization_id = :old_workspace_id),
                     (SELECT count(*) FROM users
                      WHERE organization_id = :old_workspace_id),
                     (SELECT count(*) FROM memberships
@@ -537,10 +542,16 @@ def test_concurrent_reset_from_one_old_session_creates_one_replacement(
             ),
             {"capacity_digest": GLOBAL_CAPACITY_LOCK_DIGEST},
         )
+        integration_organization_ids = list(
+            database.scalars(
+                text("SELECT organization_id FROM webhook_integrations ORDER BY organization_id")
+            )
+        )
 
     assert organization_ids == [winner_workspace_id]
-    assert tuple(old_workspace_rows) == (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    assert tuple(old_workspace_rows) == (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     assert source_limit_count == 2
+    assert integration_organization_ids == [winner_workspace_id]
 
 
 @pytest.mark.parametrize("operation", ["assignment", "resolution"])

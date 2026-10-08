@@ -28,6 +28,7 @@ from app.models import (
     Role,
     User,
 )
+from app.repositories.webhook_integrations import create_demo_webhook_integration
 from app.services.seeding import seed_demo_order_cases
 
 GLOBAL_CAPACITY_LOCK_DIGEST = hashlib.sha256(b"commerce-ops:demo-capacity-lock:v1").hexdigest()
@@ -251,6 +252,11 @@ def create_demo_workspace(
     )
     db.add(organization)
     db.flush()
+    create_demo_webhook_integration(
+        db,
+        organization=organization,
+        now=now,
+    )
     manager_user, manager_membership = _create_identity(
         db,
         organization_id=organization_id,

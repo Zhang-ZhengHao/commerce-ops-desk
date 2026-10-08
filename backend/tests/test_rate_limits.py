@@ -260,8 +260,14 @@ def test_expired_workspace_cleanup_is_an_explicit_unscheduled_service(
             .exec_driver_sql("SELECT COUNT(*) FROM command_receipts")
             .scalar_one()
         )
+        remaining_integrations = (
+            database.connection()
+            .exec_driver_sql("SELECT COUNT(*) FROM webhook_integrations")
+            .scalar_one()
+        )
 
     assert deleted == 1
     assert remaining_organizations == 0
     assert remaining_sessions == 0
     assert remaining_receipts == 0
+    assert remaining_integrations == 0

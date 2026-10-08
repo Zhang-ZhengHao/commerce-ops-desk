@@ -39,6 +39,14 @@ def test_reset_replaces_the_workspace_and_credentials_but_preserves_the_role(
         assert bootstrap.status_code == 201
         old_payload = bootstrap.json()
         old_session = bootstrap.cookies["commerce_ops_session"]
+        with sqlite3.connect(harness.database_path) as connection:
+            old_integration = connection.execute(
+                """
+                SELECT id FROM webhook_integrations
+                WHERE organization_id = ?
+                """,
+                (old_payload["workspace"]["id"],),
+            ).fetchone()
 
         reset = client.post(
             "/api/demo/reset",
@@ -71,9 +79,24 @@ def test_reset_replaces_the_workspace_and_credentials_but_preserves_the_role(
             "SELECT COUNT(*) FROM orders WHERE organization_id = ?",
             (new_payload["workspace"]["id"],),
         ).fetchone()
+        integrations = connection.execute(
+            """
+            SELECT id, organization_id FROM webhook_integrations
+            ORDER BY organization_id
+            """
+        ).fetchall()
+        webhook_event_count = connection.execute(
+            "SELECT webhook_event_count FROM organizations WHERE id = ?",
+            (new_payload["workspace"]["id"],),
+        ).fetchone()
 
     assert organization_ids == [(new_payload["workspace"]["id"],)]
     assert order_count == (4,)
+    assert old_integration is not None
+    assert len(integrations) == 1
+    assert integrations == [(integrations[0][0], new_payload["workspace"]["id"])]
+    assert integrations[0][0] != old_integration[0]
+    assert webhook_event_count == (0,)
 
 
 def test_reset_leaves_another_tenant_completely_unchanged(
@@ -241,6 +264,22 @@ def test_reset_rolls_back_the_deleted_workspace_when_creation_crashes(
         original_payload = bootstrap.json()
         original_session = bootstrap.cookies["commerce_ops_session"]
 
+    with sqlite3.connect(harness.database_path) as connection:
+        original_integration = connection.execute(
+            """
+            SELECT id FROM webhook_integrations
+            WHERE organization_id = ?
+            """,
+            (original_payload["workspace"]["id"],),
+        ).fetchone()
+        connection.execute(
+            """
+            UPDATE organizations SET webhook_event_count = 7
+            WHERE id = ?
+            """,
+            (original_payload["workspace"]["id"],),
+        )
+
     def fail_after_workspace_rows_are_staged() -> str:
         raise RuntimeError("synthetic reset creation failed")
 
@@ -260,9 +299,16 @@ def test_reset_rolls_back_the_deleted_workspace_when_creation_crashes(
         assert restored.json() == original_payload
 
     with sqlite3.connect(harness.database_path) as connection:
-        organizations = connection.execute("SELECT id FROM organizations ORDER BY id").fetchall()
+        organizations = connection.execute(
+            "SELECT id, webhook_event_count FROM organizations ORDER BY id"
+        ).fetchall()
+        integrations = connection.execute(
+            "SELECT id, organization_id FROM webhook_integrations ORDER BY id"
+        ).fetchall()
 
-    assert organizations == [(original_payload["workspace"]["id"],)]
+    assert original_integration is not None
+    assert organizations == [(original_payload["workspace"]["id"], 7)]
+    assert integrations == [(original_integration[0], original_payload["workspace"]["id"])]
 
 
 def test_concurrent_reset_with_one_old_session_creates_one_replacement(
@@ -318,6 +364,10 @@ def test_concurrent_reset_with_one_old_session_creates_one_replacement(
             "SELECT count FROM rate_limits WHERE source_digest != ?",
             (GLOBAL_CAPACITY_LOCK_DIGEST,),
         ).fetchall()
+        integrations = connection.execute(
+            "SELECT organization_id FROM webhook_integrations"
+        ).fetchall()
 
     assert organizations == [(winner.json()["workspace"]["id"],)]
     assert source_counts == [(2,)]
+    assert integrations == [(winner.json()["workspace"]["id"],)]
