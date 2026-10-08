@@ -85,6 +85,7 @@ def process_payment_failed_webhook(
     *,
     organization_id: str,
     integration_id: str,
+    integration_key_version: int,
     external_event_id: str,
     payload_digest: str,
     payload: SyntheticWebhookEventPayload,
@@ -103,6 +104,7 @@ def process_payment_failed_webhook(
             db,
             organization_id=organization_id,
             integration_id=integration_id,
+            integration_key_version=integration_key_version,
             now=normalized_received_at,
         )
         if organization is None:

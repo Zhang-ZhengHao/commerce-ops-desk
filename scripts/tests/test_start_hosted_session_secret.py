@@ -75,6 +75,9 @@ if [[ "${{1:-}}" == "-m" && "${{2:-}}" == "uvicorn" ]]; then
   : "${{COMMERCE_OPS_TEST_CAPTURE_FILE:?capture file is required}}"
   printf '%s' "${{COMMERCE_OPS_SESSION_SECRET:-}}" \
     > "$COMMERCE_OPS_TEST_CAPTURE_FILE"
+  if [[ -n "${{COMMERCE_OPS_TEST_UVICORN_ARGS_CAPTURE:-}}" ]]; then
+    printf '%s\\0' "$@" > "$COMMERCE_OPS_TEST_UVICORN_ARGS_CAPTURE"
+  fi
   exit 0
 fi
 
@@ -148,6 +151,24 @@ class HostedSessionSecretContractTest(unittest.TestCase):
         output = self.output(result)
         for secret_value in secret_values:
             self.assertNotIn(secret_value, output)
+
+    def test_hosted_uvicorn_explicitly_disables_access_logging(self) -> None:
+        arguments_capture = self.hosted.root / "captured-uvicorn-arguments"
+
+        result, _ = self.hosted.run(
+            overrides={
+                "COMMERCE_OPS_TEST_UVICORN_ARGS_CAPTURE": str(arguments_capture),
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, self.output(result))
+        arguments = [
+            value.decode("utf-8")
+            for value in arguments_capture.read_bytes().split(b"\0")
+            if value
+        ]
+        self.assertEqual(arguments[:3], ["-m", "uvicorn", "app.main:create_app"])
+        self.assertIn("--no-access-log", arguments)
 
     def test_explicit_secret_takes_priority_without_reading_or_changing_a_file(
         self,

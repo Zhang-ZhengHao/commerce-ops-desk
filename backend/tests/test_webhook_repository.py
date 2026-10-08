@@ -281,6 +281,7 @@ def test_consumed_allowance_keeps_the_loaded_organization_identity_current(
             database,
             organization_id=organization_id,
             integration_id=integration_id,
+            integration_key_version=1,
             now=NOW,
         )
         assert organization is not None

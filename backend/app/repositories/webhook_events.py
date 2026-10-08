@@ -33,6 +33,7 @@ def lock_active_demo_webhook_target(
     *,
     organization_id: str,
     integration_id: str,
+    integration_key_version: int,
     now: datetime,
 ) -> Organization | None:
     """Revalidate a bound target while locking its parent before child writes."""
@@ -50,6 +51,7 @@ def lock_active_demo_webhook_target(
             Organization.expires_at > now,
             WebhookIntegration.provider == "synthetic",
             WebhookIntegration.enabled.is_(True),
+            WebhookIntegration.key_version == integration_key_version,
         )
         .with_for_update(key_share=True, of=Organization)
     )

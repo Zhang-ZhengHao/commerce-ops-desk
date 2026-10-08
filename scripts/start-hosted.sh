@@ -424,6 +424,7 @@ fi
 
 exec "$PYTHON_BIN" -m uvicorn app.main:create_app \
   --factory \
+  --no-access-log \
   --no-proxy-headers \
   --app-dir "$PRODUCT_DIR/backend" \
   --host 0.0.0.0 \

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from typing import Any
+from unittest.mock import Mock
 
+import pytest
 from conftest import SAME_ORIGIN, AppHarness
+
+from app.api import webhooks as webhook_api
 
 BODY_TOO_LARGE = {
     "detail": {
@@ -95,6 +99,59 @@ def test_forged_small_content_length_cannot_bypass_stream_limit(
     assert response.status_code == 413
     assert response.json() == BODY_TOO_LARGE
     assert marker not in response.text
+
+
+def test_streamed_oversized_webhook_is_rejected_before_ingress_work(
+    app_harness_factory: Callable[..., AppHarness],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 16 * 1024
+    harness = app_harness_factory(
+        api_max_request_body_bytes=limit,
+        webhook_enabled=True,
+        webhook_master_secret="request-guard-test-webhook-secret-32-bytes",
+    )
+    source_limiter = Mock()
+    target_lookup = Mock(return_value=None)
+    signature_verifier = Mock(return_value=False)
+    monkeypatch.setattr(
+        webhook_api,
+        "enforce_webhook_source_limit",
+        source_limiter,
+    )
+    monkeypatch.setattr(
+        webhook_api,
+        "find_active_demo_webhook_target",
+        target_lookup,
+    )
+    monkeypatch.setattr(
+        webhook_api,
+        "verify_webhook_signature",
+        signature_verifier,
+    )
+
+    def request_chunks() -> Iterator[bytes]:
+        yield b"{" + (b"x" * (limit - 1))
+        yield b"x"
+
+    with harness.client() as client:
+        response = client.post(
+            "/api/webhooks/synthetic/00000000-0000-4000-8000-000000000001",
+            content=request_chunks(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Timestamp": "1791374400",
+                "X-Webhook-Event-Id": "evt_GUARDTEST1",
+                "X-Webhook-Signature": f"v1={'0' * 64}",
+            },
+        )
+
+    assert response.request.headers.get("content-length") is None
+    assert response.status_code == 413
+    assert response.json() == BODY_TOO_LARGE
+    source_limiter.assert_not_called()
+    target_lookup.assert_not_called()
+    signature_verifier.assert_not_called()
 
 
 def test_request_validation_response_is_stable_and_does_not_reflect_input(

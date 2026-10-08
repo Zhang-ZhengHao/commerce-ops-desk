@@ -69,6 +69,10 @@ def create_app(
     application.include_router(dashboard_router)
     application.include_router(cases_router)
     application.include_router(audit_router)
+    if resolved_settings.webhook_enabled:
+        from app.api.webhooks import router as webhooks_router
+
+        application.include_router(webhooks_router)
     if resolved_settings.demo_mode:
         from app.api.demo import router as demo_router
 
