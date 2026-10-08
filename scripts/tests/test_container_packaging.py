@@ -56,6 +56,7 @@ class ContainerPackagingContractTest(unittest.TestCase):
             "frontend/dist",
             "frontend/playwright-report",
             "frontend/test-results",
+            "backend/postgres_tests",
         ):
             self.assertIn(entry, dockerignore)
 

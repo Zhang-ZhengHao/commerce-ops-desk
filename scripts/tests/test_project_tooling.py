@@ -108,6 +108,16 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertRegex(contents, r"(?m)^hosted-smoke: build$")
         self.assertRegex(contents, r"(?m)^project-test: build$")
 
+    def test_makefile_exposes_the_live_postgresql_migration_gate(self) -> None:
+        contents = (PRODUCT_ROOT / "Makefile").read_text()
+
+        self.assertRegex(contents, r"(?m)^postgres-migration-test:$")
+        self.assertIn(
+            "pytest postgres_tests/test_harness.py postgres_tests/test_migrations.py",
+            contents,
+        )
+        self.assertIn("mypy app alembic tests postgres_tests", contents)
+
     def test_ci_preserves_browser_failure_evidence(self) -> None:
         contents = (PRODUCT_ROOT / ".github" / "workflows" / "verify.yml").read_text()
 

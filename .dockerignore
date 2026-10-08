@@ -15,6 +15,7 @@ backend/.pytest_cache
 backend/.ruff_cache
 backend/__pycache__
 backend/wheelhouse
+backend/postgres_tests
 backend/tests
 data
 docs

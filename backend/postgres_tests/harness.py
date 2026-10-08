@@ -5,7 +5,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 from uuid import uuid4
 
 import psycopg
@@ -86,7 +86,18 @@ def _parse_admin_url(admin_url: str) -> URL:
         raise PostgresHarnessConfigurationError(
             "PostgreSQL test administrator URL must name an administrative database"
         )
+    if any(_is_credential_query_key(key) for key in parsed.query):
+        raise PostgresHarnessConfigurationError(
+            "PostgreSQL test administrator URL must not place credentials in query parameters"
+        )
     return parsed
+
+
+def _is_credential_query_key(key: str) -> bool:
+    normalized = "".join(character for character in key.casefold() if character.isalnum())
+    return any(
+        marker in normalized for marker in ("password", "passfile", "secret", "token", "credential")
+    )
 
 
 def _psycopg_dsn(url: URL) -> str:
@@ -100,6 +111,9 @@ def redact_database_credentials(output: str, database_url: str | URL) -> str:
     except (ArgumentError, TypeError, ValueError):
         return "[REDACTED DATABASE DIAGNOSTIC]"
 
+    if any(_is_credential_query_key(key) for key in parsed.query):
+        return "[REDACTED DATABASE DIAGNOSTIC]"
+
     redacted = output
     unsafe_url = parsed.render_as_string(hide_password=False)
     safe_url = parsed.render_as_string(hide_password=True)
@@ -109,7 +123,11 @@ def redact_database_credentials(output: str, database_url: str | URL) -> str:
 
     password = parsed.password
     if password:
-        for candidate in (password, quote(password, safe="")):
+        for candidate in (
+            password,
+            quote(password, safe=""),
+            quote_plus(password, safe=""),
+        ):
             redacted = redacted.replace(candidate, "[REDACTED]")
     return redacted
 

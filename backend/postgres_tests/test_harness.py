@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
-from urllib.parse import quote
+from typing import cast
+from urllib.parse import quote, quote_plus
 
 import psycopg
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import SQLAlchemyError
 
 from postgres_tests.harness import (
     POSTGRES_ADMIN_URL_ENV,
@@ -61,8 +61,38 @@ def test_cleanup_runs_when_test_body_raises(postgres_admin_url: str) -> None:
     assert database_name
     assert not _database_exists(postgres_admin_url, database_name)
     assert checked_out_connection is not None
-    with pytest.raises(SQLAlchemyError):
-        checked_out_connection.close()
+    checked_out_connection.invalidate()
+    checked_out_connection.close()
+    assert checked_out_connection.closed
+
+
+def test_cleanup_attempts_every_registered_engine_before_reporting_dispose_failure(
+    postgres_admin_url: str,
+) -> None:
+    disposal_order: list[str] = []
+    database_name = ""
+
+    class RecordingEngine:
+        def __init__(self, label: str, *, fail: bool = False) -> None:
+            self.label = label
+            self.fail = fail
+
+        def dispose(self) -> None:
+            disposal_order.append(self.label)
+            if self.fail:
+                raise RuntimeError("sentinel disposal failure")
+
+    with (
+        pytest.raises(PostgresHarnessError, match="dispose"),
+        temporary_postgres_database(postgres_admin_url) as database,
+    ):
+        database_name = database.name
+        database.register_engine(cast(Engine, RecordingEngine("first")))
+        database.register_engine(cast(Engine, RecordingEngine("second", fail=True)))
+
+    assert disposal_order == ["second", "first"]
+    assert database_name
+    assert not _database_exists(postgres_admin_url, database_name)
 
 
 @pytest.mark.parametrize(
@@ -103,6 +133,26 @@ def test_admin_url_whitespace_is_rejected_without_echoing_input() -> None:
     assert password not in str(captured.value)
 
 
+@pytest.mark.parametrize(
+    "query_key",
+    ("password", "sslpassword", "passfile", "access_token"),
+)
+def test_admin_url_rejects_query_string_credentials_without_echoing_them(
+    query_key: str,
+) -> None:
+    credential = "query-credential-must-not-leak"
+    admin_url = f"postgresql+psycopg://commerce_ops_ci@127.0.0.1/postgres?{query_key}={credential}"
+
+    with pytest.raises(PostgresHarnessConfigurationError) as captured:
+        load_postgres_admin_url({POSTGRES_ADMIN_URL_ENV: admin_url})
+
+    assert credential not in str(captured.value)
+    assert credential not in redact_database_credentials(
+        f"{query_key}={credential}",
+        make_url(admin_url),
+    )
+
+
 def test_connection_failures_do_not_expose_database_password(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -126,16 +176,21 @@ def test_connection_failures_do_not_expose_database_password(
 
 
 def test_database_credentials_are_redacted_from_subprocess_output() -> None:
-    password = "marker:with/@characters"
+    password = "marker with:slash/@characters"
     encoded_password = quote(password, safe="")
+    plus_encoded_password = quote_plus(password, safe="")
     database_url = (
         f"postgresql+psycopg://commerce_ops_ci:{encoded_password}@127.0.0.1:5432/postgres"
     )
-    leaked_output = f"raw={password}\nencoded={encoded_password}\nurl={database_url}"
+    leaked_output = (
+        f"raw={password}\nencoded={encoded_password}\n"
+        f"plus={plus_encoded_password}\nurl={database_url}"
+    )
 
     redacted = redact_database_credentials(leaked_output, database_url)
 
     assert password not in redacted
     assert encoded_password not in redacted
+    assert plus_encoded_password not in redacted
     assert database_url not in redacted
     assert "[REDACTED]" in redacted

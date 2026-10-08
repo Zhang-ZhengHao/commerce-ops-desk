@@ -6,7 +6,7 @@ VENV ?= .venv
 PYTHON ?= $(abspath $(VENV))/bin/python
 TEST ?= tests
 
-.PHONY: help setup run backend-test project-test frontend-test sqlite-migrate-test hosted-smoke e2e-smoke public-scan lint build verify
+.PHONY: help setup run backend-test project-test frontend-test sqlite-migrate-test postgres-migration-test hosted-smoke e2e-smoke public-scan lint build verify
 
 help:
 	@echo "CommerceOps Desk development targets"
@@ -16,6 +16,7 @@ help:
 	@echo "  backend-test         Run backend tests (override with TEST=tests/test_health.py)"
 	@echo "  frontend-test        Run frontend component tests"
 	@echo "  sqlite-migrate-test  Prove an empty SQLite database can migrate to head"
+	@echo "  postgres-migration-test  Prove PostgreSQL migrations and selected constraints"
 	@echo "  hosted-smoke         Start the hosted entrypoint on a random port and probe it"
 	@echo "  e2e-smoke            Run Playwright entry smoke tests"
 	@echo "  public-scan          Scan the worktree and reachable Git history"
@@ -40,6 +41,9 @@ frontend-test:
 sqlite-migrate-test:
 	cd backend && "$(PYTHON)" -m pytest tests/test_migrations.py
 
+postgres-migration-test:
+	cd backend && "$(PYTHON)" -m pytest postgres_tests/test_harness.py postgres_tests/test_migrations.py
+
 hosted-smoke: build
 	COMMERCE_OPS_VENV_DIR="$(abspath $(VENV))" PYTHON="$(PYTHON)" bash scripts/hosted-smoke.sh
 
@@ -52,7 +56,7 @@ public-scan:
 lint:
 	"$(PYTHON)" -m ruff check backend scripts
 	"$(PYTHON)" -m ruff format --check backend scripts
-	cd backend && "$(PYTHON)" -m mypy app alembic tests
+	cd backend && "$(PYTHON)" -m mypy app alembic tests postgres_tests
 	npm --prefix frontend run typecheck
 
 build:
