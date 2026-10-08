@@ -61,7 +61,8 @@ def claim_bootstrap_receipt(
                 BootstrapReceipt.idempotency_key,
             ]
         )
-        result = db.execute(postgresql_statement)
+        inserted_source = db.scalar(postgresql_statement.returning(BootstrapReceipt.source_digest))
+        return inserted_source is not None
     else:
         raise RuntimeError("unsupported bootstrap idempotency database")
 

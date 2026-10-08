@@ -115,7 +115,8 @@ def _upsert_counter(
             set_={"count": RateLimit.count + 1, "updated_at": now},
             where=RateLimit.count < maximum,
         )
-        result = db.execute(postgresql_statement)
+        persisted_count = db.scalar(postgresql_statement.returning(RateLimit.count))
+        return persisted_count is not None
     else:  # Settings currently prevents reaching an unsupported backend.
         raise RuntimeError("unsupported rate-limit database")
 

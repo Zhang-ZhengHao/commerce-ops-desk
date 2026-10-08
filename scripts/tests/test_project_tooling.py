@@ -118,6 +118,21 @@ class ProjectToolingContractTest(unittest.TestCase):
         )
         self.assertIn("mypy app alembic tests postgres_tests", contents)
 
+    def test_makefile_exposes_the_live_postgresql_runtime_and_combined_gates(
+        self,
+    ) -> None:
+        contents = (PRODUCT_ROOT / "Makefile").read_text()
+
+        self.assertRegex(contents, r"(?m)^postgres-integration-test:$")
+        self.assertIn(
+            "pytest postgres_tests/test_workflow.py postgres_tests/test_concurrency.py",
+            contents,
+        )
+        self.assertRegex(
+            contents,
+            r"(?m)^postgres-test: postgres-migration-test postgres-integration-test$",
+        )
+
     def test_ci_preserves_browser_failure_evidence(self) -> None:
         contents = (PRODUCT_ROOT / ".github" / "workflows" / "verify.yml").read_text()
 

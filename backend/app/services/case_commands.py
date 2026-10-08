@@ -32,6 +32,21 @@ from app.services.idempotent_commands import (
 ASSIGNMENT_COMMAND = "case.assignment"
 NOTE_COMMAND = "case.note"
 RESOLUTION_COMMAND = "case.resolution"
+REPLAY_CONTENTION_CONSTRAINTS = frozenset(
+    {
+        "uq_audit_events_organization_action_key",
+        "uq_command_receipts_membership_command_key",
+    }
+)
+SQLITE_REPLAY_CONTENTION_MESSAGES = frozenset(
+    {
+        ("UNIQUE constraint failed: audit_events.organization_id, audit_events.action_key"),
+        (
+            "UNIQUE constraint failed: command_receipts.membership_id, "
+            "command_receipts.command_type, command_receipts.idempotency_key"
+        ),
+    }
+)
 
 
 class CaseNotFoundError(Exception):
@@ -140,6 +155,15 @@ def _replay_after_integrity_contention(
     """Resolve a command-key race after the losing transaction rolls back."""
 
     db.rollback()
+    diagnostic = getattr(error.orig, "diag", None)
+    constraint_name = getattr(diagnostic, "constraint_name", None)
+    is_named_contention = (
+        isinstance(constraint_name, str) and constraint_name in REPLAY_CONTENTION_CONSTRAINTS
+    )
+    is_sqlite_contention = str(error.orig) in SQLITE_REPLAY_CONTENTION_MESSAGES
+    if not is_named_contention and not is_sqlite_contention:
+        raise error
+
     replayed = _replay(
         db,
         context=context,
@@ -200,6 +224,18 @@ def _consume_demo_note_quota(
         raise DemoCaseNoteLimitExceeded
 
 
+def _lock_organization_for_case_write(db: Session, *, context: AuthContext) -> None:
+    """Keep case commands on the same parent-to-child lock order as workspace deletion."""
+
+    organization_id = db.scalar(
+        select(Organization.id)
+        .where(Organization.id == context.organization.id)
+        .with_for_update(read=True, key_share=True)
+    )
+    if organization_id is None:
+        raise CaseNotFoundError
+
+
 def assign_case(
     db: Session,
     *,
@@ -222,6 +258,8 @@ def assign_case(
     )
     if replayed is not None:
         return replayed
+
+    _lock_organization_for_case_write(db, context=context)
 
     target_agent = db.scalar(
         select(Membership).where(
@@ -466,6 +504,8 @@ def resolve_case(
     )
     if replayed is not None:
         return replayed
+
+    _lock_organization_for_case_write(db, context=context)
 
     case = db.scalar(
         select(ExceptionCase).where(
