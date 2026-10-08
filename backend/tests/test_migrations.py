@@ -92,6 +92,33 @@ def run_downgrade(
     )
 
 
+def run_postgresql_offline_upgrade() -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "COMMERCE_OPS_DATABASE_URL": ("postgresql+psycopg://offline@db.invalid/commerce_ops"),
+            "COMMERCE_OPS_ENVIRONMENT": "test",
+        }
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "alembic",
+            "-c",
+            str(ALEMBIC_CONFIG),
+            "upgrade",
+            "head",
+            "--sql",
+        ],
+        cwd=BACKEND_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def read_applied_revision(database_path: Path) -> str:
     with sqlite3.connect(database_path) as connection:
         row = connection.execute("SELECT version_num FROM alembic_version").fetchone()
@@ -182,6 +209,16 @@ def test_upgrade_head_migrates_a_fresh_sqlite_database(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert database_path.is_file()
     assert read_applied_revision(database_path) == HEAD_REVISION
+
+
+def test_postgresql_offline_sql_preserves_fresh_install_and_backfill_safety() -> None:
+    result = run_postgresql_offline_upgrade()
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 0, output
+    assert "0005_webhook_inbox requires an online migration" in output
+    assert "WHERE is_demo IS TRUE" in output
+    assert "UPDATE alembic_version SET version_num='0005_webhook_inbox'" in output
 
 
 def test_upgrade_head_is_repeatable_for_an_up_to_date_database(tmp_path: Path) -> None:

@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import sqlalchemy as sa
 
-from alembic import op
+from alembic import context, op
 
 revision: str = "0005_webhook_inbox"
 down_revision: str | Sequence[str] | None = "0004_order_case"
@@ -28,6 +28,18 @@ PAYLOAD_DIGEST_CHECK = (
     "'a', ''), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')"
     ") = 0"
 )
+POSTGRESQL_OFFLINE_BACKFILL_GUARD = """
+DO $commerce_ops$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM organizations WHERE is_demo IS TRUE
+    ) THEN
+        RAISE EXCEPTION
+            '0005_webhook_inbox requires an online migration when demo organizations already exist';
+    END IF;
+END
+$commerce_ops$
+"""
 
 
 def upgrade() -> None:
@@ -163,6 +175,10 @@ def upgrade() -> None:
         sa.column("updated_at", sa.DateTime(timezone=True)),
     )
     connection = op.get_bind()
+    if context.is_offline_mode():
+        op.execute(sa.text(POSTGRESQL_OFFLINE_BACKFILL_GUARD))
+        return
+
     demo_organization_ids = connection.scalars(
         sa.select(organizations.c.id).where(organizations.c.is_demo.is_(True))
     ).all()
