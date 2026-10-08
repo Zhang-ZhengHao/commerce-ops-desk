@@ -249,7 +249,7 @@ class ProjectToolingContractTest(unittest.TestCase):
 
         for heading in (
             "## What you can verify",
-            "### 90-second walkthrough",
+            "### Walkthrough",
             "## Architecture",
             "## Run locally",
             "## Verified scope and limits",
@@ -257,7 +257,7 @@ class ProjectToolingContractTest(unittest.TestCase):
             self.assertIn(heading, readme)
         self.assertIn("I03 order/case vertical slice", readme)
         self.assertIn("I04 signed-webhook simulator slice", readme)
-        self.assertIn("docs/assets/demo-entry-i03.png", readme)
+        self.assertIn("docs/assets/signed-webhook-workflow-v0.2.0.png", readme)
         self.assertIn("docs/assets/exception-workflow.png", readme)
         self.assertIn("Signed machine ingress", readme)
         self.assertIn("Manager-only synthetic provider", readme)
@@ -278,7 +278,7 @@ class ProjectToolingContractTest(unittest.TestCase):
             readme,
         )
         self.assertNotIn("A browser simulator, asynchronous outbox/worker", readme)
-        walkthrough = readme.split("### 90-second walkthrough", maxsplit=1)[1].split(
+        walkthrough = readme.split("### Walkthrough", maxsplit=1)[1].split(
             "\n## ", maxsplit=1
         )[0]
         walkthrough_markers = (

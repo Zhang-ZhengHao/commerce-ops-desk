@@ -23,7 +23,7 @@ All identities, orders, and outcomes are synthetic. The demo never connects to a
 - **Unknown-outcome recovery:** the UI never automatically resends after an ambiguous delivery. If delivery committed but the refresh failed, Recovery repeats only the GET reads and opens the already-created case.
 - **Live PostgreSQL evidence:** a PostgreSQL 17 CI job runs fresh and repeat migrations, tenant constraints, transaction and lock races, webhook concurrency, and the hardened production container readiness path.
 
-### 90-second walkthrough
+### Walkthrough
 
 1. Enter as **Manager** and find the synthetic provider panel.
 2. Deliver a `fresh` payment failure and open the case created through the real signed ingress.
@@ -34,7 +34,7 @@ All identities, orders, and outcomes are synthetic. The demo never connects to a
 7. Switch to **Agent** and reopen the now-visible assigned case.
 8. Agent adds a note, resolves the case, and inspects its safe provenance and ordered audit history.
 
-![CommerceOps Desk public demo entry](docs/assets/demo-entry-i03.png)
+![Manager-only signed synthetic webhook simulator after a committed delivery](docs/assets/signed-webhook-workflow-v0.2.0.png)
 
 ## Architecture
 
@@ -100,7 +100,7 @@ Settings and local development default webhook intake off. The hosted demo launc
 
 ## Verified scope and limits
 
-This branch contains the I01 hosted foundation, I02 demo identity boundary, I03 order/case vertical slice, and the I04 signed-webhook simulator slice. SQLite is intentionally limited to the single-node disposable demo. Hosted SQLite is placed on a host-local filesystem because WAL is unsafe on the workspace's NFS mount.
+Version 0.2.0 combines the I01 hosted foundation, I02 demo identity boundary, I03 order/case vertical slice, and the I04 signed-webhook simulator slice. SQLite is intentionally limited to the single-node disposable demo. Hosted SQLite is placed on a host-local filesystem because WAL is unsafe on the workspace's NFS mount.
 
 PostgreSQL 17 migration, constraint, readiness, transaction, and selected concurrency behavior run against a live service in CI. The signed webhook uses an HMAC-authenticated inbox and one business transaction; it is synchronous, synthetic, and safely supports retries from an at-least-once sender rather than claiming exactly-once delivery.
 
