@@ -10,14 +10,14 @@ All notable changes to CommerceOps Desk are documented here. The project follows
 
 - Manager-only synthetic provider controls for fresh delivery, byte-identical replay, one-byte post-signing tamper, and a signature outside the 300-second acceptance window.
 - HMAC-authenticated `payment.failed` ingress with a durable inbox, exact replay handling, and one synchronous transaction for the inbox, synthetic order and payment state, case, provenance, and audit effect.
-- Safe event provenance in the queue and case detail, limited to the provider, event type, constrained external event ID, and receipt time.
-- Browser recovery that repeats only authoritative GET reads after a committed delivery whose follow-up refresh had an unknown outcome.
+- Safe event provenance in the queue and case detail, limited to the source kind, provider, event type, constrained external event ID, and receipt time.
+- Browser recovery that repeats only authoritative GET reads after a committed delivery whose follow-up refresh failed.
 - Live PostgreSQL 17 verification for migrations, tenant constraints, transaction and lock races, webhook concurrency, and the hardened production-container readiness path.
 
 ### Changed
 
 - The Manager-to-Agent browser journey now continues from signed webhook delivery through assignment, owned-case investigation, an internal note, resolution, and ordered audit history.
-- Seeded cases and cases created through the synthetic webhook are visually distinguished without exposing integration IDs or signing material.
+- Seeded cases and cases created through the synthetic webhook are visually distinguished; rendered case provenance omits integration IDs, payload digests, signatures, headers, and raw bodies.
 
 ### Security
 
