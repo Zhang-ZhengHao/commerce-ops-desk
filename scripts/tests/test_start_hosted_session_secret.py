@@ -57,7 +57,9 @@ set -euo pipefail
 
 if [[ "${{1:-}}" == "-c" ]]; then
   sleep "${{COMMERCE_OPS_TEST_ENTROPY_DELAY:-0}}"
-  if [[ -n "${{COMMERCE_OPS_TEST_SWAP_SECRET_FILE:-}}" && -n "${{4:-}}" ]]; then
+  if [[ -n "${{COMMERCE_OPS_TEST_SWAP_SECRET_FILE:-}}" \
+    && -n "${{COMMERCE_OPS_SESSION_SECRET_FILE:-}}" \
+    && "${{3:-}}" == "$COMMERCE_OPS_SESSION_SECRET_FILE" ]]; then
     {real_python} "$@"
     mv -- "$COMMERCE_OPS_TEST_SWAP_SECRET_FILE" "$COMMERCE_OPS_SESSION_SECRET_FILE"
     exit 0

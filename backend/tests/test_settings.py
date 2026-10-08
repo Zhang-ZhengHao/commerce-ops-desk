@@ -20,6 +20,10 @@ def test_settings_default_to_the_local_sqlite_boundary() -> None:
     assert settings.demo_workspace_ttl_hours == 4
     assert settings.demo_role_write_limit == 32
     assert settings.demo_case_note_limit == 200
+    assert settings.webhook_enabled is False
+    assert settings.webhook_master_secret is None
+    assert settings.webhook_source_minute_limit == 120
+    assert settings.demo_webhook_event_limit == 20
     assert settings.api_max_request_body_bytes == 16 * 1024
     assert settings.trusted_proxy_cidrs == ()
     assert settings.secure_cookies is False
@@ -111,6 +115,51 @@ def test_demo_limits_and_trusted_proxy_networks_are_validated() -> None:
             session_secret="test-secret-that-is-long-enough-for-hmac-only",
             demo_case_note_limit=0,
         )
+
+
+def test_enabled_webhook_requires_an_independent_secret_of_at_least_32_bytes() -> None:
+    with pytest.raises(ValidationError, match="webhook master secret"):
+        Settings(_env_file=None, webhook_enabled=True)
+
+    short_multibyte_secret = "密" * 10
+    assert len(short_multibyte_secret) == 10
+    assert len(short_multibyte_secret.encode("utf-8")) == 30
+    with pytest.raises(ValidationError, match="webhook master secret") as short_error:
+        Settings(
+            _env_file=None,
+            webhook_enabled=True,
+            webhook_master_secret=short_multibyte_secret,
+        )
+    assert short_multibyte_secret not in str(short_error.value)
+
+    webhook_secret = "webhook-secret-that-is-independent-and-long-enough"
+    settings = Settings(
+        _env_file=None,
+        webhook_enabled=True,
+        webhook_master_secret=webhook_secret,
+    )
+
+    assert settings.webhook_master_secret is not None
+    assert settings.webhook_master_secret.get_secret_value() == webhook_secret
+    assert webhook_secret not in repr(settings)
+
+    reused_secret = "one-secret-must-not-authenticate-browser-and-webhook"
+    with pytest.raises(ValidationError, match="must be independent") as error:
+        Settings(
+            _env_file=None,
+            session_secret=reused_secret,
+            webhook_enabled=True,
+            webhook_master_secret=reused_secret,
+        )
+    assert reused_secret not in str(error.value)
+
+
+def test_webhook_limits_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, webhook_source_minute_limit=0)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, demo_webhook_event_limit=0)
 
 
 def test_settings_read_only_namespaced_environment_variables(

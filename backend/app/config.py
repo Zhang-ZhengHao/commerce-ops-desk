@@ -29,12 +29,16 @@ class Settings(BaseSettings):
     database_url: SecretStr = SecretStr("sqlite+pysqlite:///./data/commerce_ops.db")
     demo_mode: bool | None = None
     session_secret: SecretStr | None = None
+    webhook_enabled: bool = False
+    webhook_master_secret: SecretStr | None = None
     cookie_secure: bool | None = None
     demo_source_hourly_limit: int = Field(default=10, gt=0)
     demo_active_workspace_limit: int = Field(default=500, gt=0)
     demo_workspace_ttl_hours: int = Field(default=4, gt=0, le=24)
     demo_role_write_limit: int = Field(default=32, gt=0)
     demo_case_note_limit: int = Field(default=200, gt=0)
+    webhook_source_minute_limit: int = Field(default=120, gt=0)
+    demo_webhook_event_limit: int = Field(default=20, gt=0)
     api_max_request_body_bytes: int = Field(default=16 * 1024, gt=0)
     trusted_proxy_cidrs: tuple[str, ...] = ()
 
@@ -66,6 +70,13 @@ class Settings(BaseSettings):
             raise ValueError("session secret must contain at least 32 bytes")
         return value
 
+    @field_validator("webhook_master_secret")
+    @classmethod
+    def validate_webhook_master_secret(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value().encode("utf-8")) < 32:
+            raise ValueError("webhook master secret must contain at least 32 bytes")
+        return value
+
     @field_validator("trusted_proxy_cidrs")
     @classmethod
     def validate_trusted_proxy_cidrs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -85,6 +96,20 @@ class Settings(BaseSettings):
             if self.environment == "production":
                 raise ValueError("production requires an explicit session secret")
             object.__setattr__(self, "session_secret", SecretStr(secrets.token_urlsafe(48)))
+
+        if self.webhook_enabled and self.webhook_master_secret is None:
+            raise ValueError("enabled webhook requires a webhook master secret")
+
+        session_secret = self.session_secret
+        if (
+            self.webhook_master_secret is not None
+            and session_secret is not None
+            and secrets.compare_digest(
+                session_secret.get_secret_value().encode("utf-8"),
+                self.webhook_master_secret.get_secret_value().encode("utf-8"),
+            )
+        ):
+            raise ValueError("webhook master secret must be independent")
 
         return self
 
