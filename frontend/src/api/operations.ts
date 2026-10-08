@@ -31,6 +31,20 @@ export interface CaseActor {
   display_name: string;
 }
 
+export interface SeededDemoCaseSource {
+  kind: 'seeded_demo';
+}
+
+export interface SyntheticWebhookCaseSource {
+  kind: 'synthetic_webhook';
+  provider: 'synthetic';
+  event_type: 'payment.failed';
+  external_event_id: string;
+  received_at: string;
+}
+
+export type CaseSource = SeededDemoCaseSource | SyntheticWebhookCaseSource;
+
 export interface CaseSummary {
   id: string;
   rule_key: string;
@@ -42,6 +56,7 @@ export interface CaseSummary {
   version: number;
   resolution_reason: string | null;
   resolved_at: string | null;
+  source: CaseSource;
   order: CaseOrder;
   assignee: CaseActor | null;
 }

@@ -3,7 +3,6 @@
   z-index: var(--layer-base);
   display: flex;
   min-height: 100dvh;
-  overflow-x: clip;
   flex-direction: column;
   isolation: isolate;
   background: var(--color-canvas);
@@ -382,7 +381,16 @@ h3 {
 
 .workspace {
   display: grid;
+  min-width: 0;
   gap: var(--space-10);
+}
+
+.workspace > *,
+.operations-layout > *,
+.summary-grid > *,
+.order-details > *,
+.case-provenance-details > * {
+  min-width: 0;
 }
 
 .workspace-heading {
@@ -716,7 +724,8 @@ h3 {
 
 .queue-count,
 .status-badge,
-.severity-badge {
+.severity-badge,
+.case-source-badge {
   display: inline-flex;
   width: fit-content;
   min-height: 1.75rem;
@@ -728,6 +737,17 @@ h3 {
   font-size: var(--font-size-xs);
   font-weight: 700;
   white-space: nowrap;
+}
+
+.case-source-badge {
+  justify-self: start;
+  border-color: color-mix(in srgb, var(--color-status) 32%, var(--color-border));
+  background: color-mix(in srgb, var(--color-status-ring) 72%, transparent);
+  color: var(--color-secondary);
+}
+
+.case-source-synthetic_webhook {
+  color: var(--color-status);
 }
 
 .severity-high {
@@ -925,15 +945,61 @@ textarea:disabled {
 }
 
 .order-card,
+.case-provenance,
 .case-actions,
 .timeline-section {
   min-width: 0;
   padding: var(--space-5);
 }
 
+.case-provenance,
 .case-actions,
 .timeline-section {
   border-top: 1px solid var(--color-border);
+}
+
+.case-provenance {
+  background: color-mix(in srgb, var(--color-surface-muted) 44%, transparent);
+}
+
+.case-provenance-heading {
+  align-items: flex-start;
+}
+
+.case-provenance-boundary {
+  margin: var(--space-4) 0 0;
+  color: var(--color-muted);
+  font-size: var(--font-size-sm);
+}
+
+.case-provenance-details {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-4);
+  margin: var(--space-5) 0 0;
+}
+
+.case-provenance-details div {
+  min-width: 0;
+}
+
+.case-provenance-details dt {
+  color: var(--color-muted);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.case-provenance-details dd {
+  min-width: 0;
+  margin: var(--space-1) 0 0;
+  color: var(--color-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.case-source-id {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
 }
 
 .order-details {
@@ -1087,7 +1153,8 @@ textarea:disabled {
   }
 
   .queue-filters,
-  .action-row {
+  .action-row,
+  .case-provenance-details {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -1171,6 +1238,7 @@ textarea:disabled {
   .case-row,
   .case-detail-header,
   .order-card,
+  .case-provenance,
   .case-actions,
   .timeline-section {
     padding-inline: var(--space-4);

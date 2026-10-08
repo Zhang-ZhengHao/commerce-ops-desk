@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
   addCaseNote,
@@ -16,6 +16,12 @@ import {
   type Dashboard,
 } from '../../api/operations';
 import { createCommandKey, type DemoRole, type DemoSession } from '../../api/session';
+import type { WebhookDeliveryResult } from '../../api/webhooks';
+import {
+  CaseProvenance,
+  CaseSourceBadge,
+} from '../cases/CaseProvenance';
+import { SyntheticProviderPanel } from '../webhooks/SyntheticProviderPanel';
 
 export type RoleOperation =
   | { kind: 'idle' }
@@ -182,13 +188,16 @@ export function DemoWorkspace({
   const [noteBody, setNoteBody] = useState('');
   const [resolutionReason, setResolutionReason] = useState('');
   const [filters, setFilters] = useState<QueueFilters>({ status: '', severity: '' });
+  const filtersRef = useRef<QueueFilters>({ status: '', severity: '' });
   const [queueState, setQueueState] = useState<QueueState>({ kind: 'idle' });
 
   const loadOperations = useCallback(async () => {
     setOperations({ kind: 'loading' });
     setDetail({ kind: 'idle' });
     setCommand({ kind: 'idle' });
-    setFilters({ status: '', severity: '' });
+    const initialFilters = { status: '', severity: '' };
+    filtersRef.current = initialFilters;
+    setFilters(initialFilters);
     setQueueState({ kind: 'idle' });
     try {
       const [dashboard, cases, agents] = await Promise.all([
@@ -224,6 +233,7 @@ export function DemoWorkspace({
   }, []);
 
   const loadFilteredCases = useCallback(async (nextFilters: QueueFilters) => {
+    filtersRef.current = nextFilters;
     setFilters(nextFilters);
     setQueueState({ kind: 'loading' });
     setDetail({ kind: 'idle' });
@@ -286,6 +296,32 @@ export function DemoWorkspace({
       // A later filter change or full retry will recover the surrounding snapshot.
     }
   }, [filters]);
+
+  const refreshCommittedWebhook = useCallback(async (
+    result: WebhookDeliveryResult,
+  ) => {
+    const activeFilters = filtersRef.current;
+    const [dashboard, cases, loadedDetail] = await Promise.all([
+      getDashboard(),
+      getCases({
+        status: activeFilters.status || undefined,
+        severity: activeFilters.severity || undefined,
+      }),
+      getCase(result.case_id),
+    ]);
+
+    setOperations((current) =>
+      current.kind === 'ready'
+        ? { ...current, dashboard, cases }
+        : current,
+    );
+    setDetail({ kind: 'ready', detail: loadedDetail });
+    setAssignmentId(loadedDetail.assignee?.membership_id ?? '');
+    setResolutionReason(loadedDetail.resolution_reasons[0] ?? '');
+    setNoteBody('');
+    setCommand({ kind: 'idle' });
+    setQueueState({ kind: 'idle' });
+  }, []);
 
   const runCommand = useCallback(
     async (
@@ -414,6 +450,15 @@ export function DemoWorkspace({
             </dl>
           </section>
 
+          {currentRole === 'manager' && (
+            <SyntheticProviderPanel
+              key={`${session.workspace.id}:${session.identity.membership_id}`}
+              csrfToken={session.csrf_token}
+              disabled={sessionMutationBusy}
+              onCommitted={refreshCommittedWebhook}
+            />
+          )}
+
           <div className="operations-layout">
             <section className="exception-queue" aria-labelledby="exception-queue-title">
               <div className="operations-section-heading queue-heading">
@@ -520,6 +565,7 @@ export function DemoWorkspace({
                           </span>
                         </span>
                         <span className="case-rule">{formatLabel(item.rule_key)}</span>
+                        <CaseSourceBadge source={item.source} />
                         <span className="case-row-meta">
                           <span>{formatLabel(item.status)}</span>
                           <span>Due {formatDateTime(item.due_at)}</span>
@@ -583,6 +629,8 @@ export function DemoWorkspace({
                       <div><dt>Due</dt><dd>{formatDateTime(detail.detail.due_at)}</dd></div>
                     </dl>
                   </section>
+
+                  <CaseProvenance source={detail.detail.source} />
 
                   <section className="case-actions" aria-labelledby="case-actions-title">
                     <div className="detail-section-heading">

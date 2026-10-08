@@ -41,6 +41,54 @@ const resetManagerSession = {
   csrf_token: 'reset-manager-csrf-token',
 } as const;
 
+const freshWebhookEnvelope = {
+  path: '/api/webhooks/synthetic/891a8728-df4b-4f54-b7f8-4afea330835c',
+  body: '{"type":"payment.failed","occurred_at":"2026-10-07T12:00:00Z","data":{"order":{"id":"syn_order_APPTEST01","number":"DEMO-2048","amount_minor":12900,"currency":"USD"}}}',
+  timestamp: '1791374400',
+  event_id: 'evt_APPTEST01',
+  signature: `v1=${'c'.repeat(64)}`,
+} as const;
+
+const freshWebhookDelivery = {
+  status: 'processed',
+  event_id: freshWebhookEnvelope.event_id,
+  case_id: 'c6cd4685-7848-4f9f-b4ed-8b0f3d5cb358',
+  replayed: false,
+} as const;
+
+const freshWebhookCase = {
+  id: freshWebhookDelivery.case_id,
+  rule_key: 'payment_failed',
+  case_type: 'payment',
+  severity: 'high',
+  status: 'open',
+  due_at: '2026-10-07T13:00:00Z',
+  updated_at: '2026-10-07T12:00:00Z',
+  version: 1,
+  resolution_reason: null,
+  resolved_at: null,
+  source: {
+    kind: 'synthetic_webhook',
+    provider: 'synthetic',
+    event_type: 'payment.failed',
+    external_event_id: freshWebhookEnvelope.event_id,
+    received_at: '2026-10-07T12:00:00Z',
+  },
+  order: {
+    id: 'syn_order_APPTEST01',
+    order_number: 'DEMO-2048',
+    amount_minor: 12900,
+    currency: 'USD',
+    payment_status: 'failed',
+    fulfillment_status: 'unfulfilled',
+  },
+  assignee: null,
+  created_at: '2026-10-07T12:00:00Z',
+  resolution_reasons: ['payment_recovered', 'customer_contacted', 'order_cancelled'],
+  notes: [],
+  audit_events: [],
+} as const;
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -217,6 +265,44 @@ describe('CommerceOps Desk demo identity', () => {
     expect(window.sessionStorage).toHaveLength(0);
   });
 
+  it('drops the fresh webhook cache after switching Manager to Agent and back', async () => {
+    const user = userEvent.setup();
+    const fetchMock = installFetch(
+      jsonResponse(managerSession),
+      jsonResponse(freshWebhookEnvelope),
+      jsonResponse(freshWebhookDelivery, 201),
+      jsonResponse(freshWebhookCase),
+      jsonResponse(agentSession),
+      jsonResponse(managerSession),
+    );
+
+    render(<App />);
+
+    const replay = await screen.findByRole('button', { name: /replay same event/i });
+    expect(replay).toBeDisabled();
+    expect(screen.getByRole('button', { name: /tamper after signing/i })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: /deliver new failure/i }));
+
+    await waitFor(() => expect(replay).toBeEnabled());
+    expect(screen.getByRole('button', { name: /tamper after signing/i })).toBeEnabled();
+
+    await user.click(screen.getByRole('button', { name: /switch to agent/i }));
+
+    expect(await screen.findByRole('heading', { name: 'Agent workspace' })).toBeVisible();
+    expect(
+      screen.queryByRole('region', { name: /synthetic provider/i }),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /switch to manager/i }));
+
+    expect(await screen.findByRole('heading', { name: 'Manager workspace' })).toBeVisible();
+    expect(screen.getByRole('button', { name: /replay same event/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /tamper after signing/i })).toBeDisabled();
+    expect(callsTo(fetchMock, '/api/demo/webhooks/envelope')).toHaveLength(1);
+    expect(callsTo(fetchMock, freshWebhookEnvelope.path)).toHaveLength(1);
+  });
+
   it('does not let a delayed Manager snapshot overwrite the Agent workspace', async () => {
     const user = userEvent.setup();
     const managerDashboard = deferred<Response>();
@@ -239,6 +325,7 @@ describe('CommerceOps Desk demo identity', () => {
         version: 1,
         resolution_reason: null,
         resolved_at: null,
+        source: { kind: 'seeded_demo' },
         order: {
           id: `${id}-order`,
           order_number: orderNumber,
@@ -339,6 +426,33 @@ describe('CommerceOps Desk demo identity', () => {
     expect(headers.get('Idempotency-Key')).toBeNull();
   });
 
+  it('drops the fresh webhook cache after reset creates a new workspace', async () => {
+    const user = userEvent.setup();
+    const fetchMock = installFetch(
+      jsonResponse(managerSession),
+      jsonResponse(freshWebhookEnvelope),
+      jsonResponse(freshWebhookDelivery, 201),
+      jsonResponse(freshWebhookCase),
+      jsonResponse(resetManagerSession, 201),
+    );
+
+    render(<App />);
+
+    const replay = await screen.findByRole('button', { name: /replay same event/i });
+    await user.click(screen.getByRole('button', { name: /deliver new failure/i }));
+    await waitFor(() => expect(replay).toBeEnabled());
+    expect(screen.getByRole('button', { name: /tamper after signing/i })).toBeEnabled();
+
+    await user.click(screen.getByRole('button', { name: /reset demo data/i }));
+    await user.click(screen.getByRole('button', { name: /^reset workspace$/i }));
+
+    expect(await screen.findByText('Demo workspace 7D83')).toBeVisible();
+    expect(screen.getByRole('button', { name: /replay same event/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /tamper after signing/i })).toBeDisabled();
+    expect(callsTo(fetchMock, '/api/demo/webhooks/envelope')).toHaveLength(1);
+    expect(callsTo(fetchMock, freshWebhookEnvelope.path)).toHaveLength(1);
+  });
+
   it('checks the session after a failed reset and requires confirmation before another POST', async () => {
     const user = userEvent.setup();
     const fetchMock = installFetch(
@@ -365,6 +479,42 @@ describe('CommerceOps Desk demo identity', () => {
 
     expect(screen.getByRole('heading', { name: /reset this workspace/i })).toBeVisible();
     expect(callsTo(fetchMock, '/api/demo/reset')).toHaveLength(1);
+  });
+
+  it('keeps the fresh webhook cache when reset is canceled or the old workspace remains active', async () => {
+    const user = userEvent.setup();
+    const fetchMock = installFetch(
+      jsonResponse(managerSession),
+      jsonResponse(freshWebhookEnvelope),
+      jsonResponse(freshWebhookDelivery, 201),
+      jsonResponse(freshWebhookCase),
+      jsonResponse({ detail: 'Reset is temporarily unavailable.' }, 503),
+      jsonResponse(managerSession),
+    );
+
+    render(<App />);
+
+    const replay = await screen.findByRole('button', { name: /replay same event/i });
+    await user.click(screen.getByRole('button', { name: /deliver new failure/i }));
+    await waitFor(() => expect(replay).toBeEnabled());
+
+    await user.click(screen.getByRole('button', { name: /reset demo data/i }));
+    expect(replay).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: /^cancel$/i }));
+
+    expect(screen.getByRole('button', { name: /replay same event/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /tamper after signing/i })).toBeEnabled();
+
+    await user.click(screen.getByRole('button', { name: /reset demo data/i }));
+    await user.click(screen.getByRole('button', { name: /^reset workspace$/i }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/current workspace is still active/i);
+    expect(screen.getByText('Demo workspace 835C')).toBeVisible();
+    expect(screen.getByRole('button', { name: /replay same event/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /tamper after signing/i })).toBeEnabled();
+    expect(callsTo(fetchMock, '/api/demo/webhooks/envelope')).toHaveLength(1);
+    expect(callsTo(fetchMock, freshWebhookEnvelope.path)).toHaveLength(1);
   });
 
   it('accepts a reset committed before its response was lost', async () => {
