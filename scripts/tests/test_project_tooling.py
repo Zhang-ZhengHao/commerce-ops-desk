@@ -222,15 +222,57 @@ class ProjectToolingContractTest(unittest.TestCase):
         ):
             self.assertIn(heading, readme)
         self.assertIn("I03 order/case vertical slice", readme)
-        self.assertIn("I04 backend signed-ingress slice", readme)
+        self.assertIn("I04 signed-webhook simulator slice", readme)
         self.assertIn("docs/assets/demo-entry-i03.png", readme)
         self.assertIn("docs/assets/exception-workflow.png", readme)
         self.assertIn("Signed machine ingress", readme)
+        self.assertIn("Manager-only synthetic provider", readme)
+        self.assertIn("server-signed envelope", readme)
+        for scenario in ("fresh", "replay", "tamper", "stale"):
+            self.assertIn(f"`{scenario}`", readme)
+        self.assertIn("safe provenance", readme)
+        self.assertIn('delivery uses `credentials: "omit"`', readme)
+        self.assertIn("Recovery repeats only the GET reads", readme)
+        self.assertIn("The signing route is absent in production", readme)
+        self.assertIn(
+            "https://github.com/Zhang-ZhengHao/commerce-ops-desk/issues/new?"
+            "template=engineering-feedback.yml",
+            readme,
+        )
         self.assertIn(
             "PostgreSQL 17 migration, constraint, readiness, transaction",
             readme,
         )
-        self.assertIn("A browser simulator, asynchronous outbox/worker", readme)
+        self.assertNotIn("A browser simulator, asynchronous outbox/worker", readme)
+        walkthrough = readme.split("### 90-second walkthrough", maxsplit=1)[1].split(
+            "\n## ", maxsplit=1
+        )[0]
+        walkthrough_markers = (
+            "synthetic provider panel",
+            "`fresh`",
+            "`replay`",
+            "`tamper`",
+            "`stale`",
+            "Manager assigns",
+            "Agent adds a note",
+            "resolves the case",
+        )
+        walkthrough_offsets = [
+            walkthrough.index(marker) for marker in walkthrough_markers
+        ]
+        self.assertEqual(walkthrough_offsets, sorted(walkthrough_offsets))
+
+        for unsupported_claim in (
+            "Stripe or Shopify adapter",
+            "outbox/worker",
+            "automatic delivery retry",
+            "dead-letter queue (DLQ)",
+            "exactly-once",
+            "high availability",
+            "production-ready",
+            "performance claim",
+        ):
+            self.assertIn(unsupported_claim, readme)
 
         self.assertIn("## Current verified slice", design_summary)
         self.assertIn(
@@ -238,7 +280,7 @@ class ProjectToolingContractTest(unittest.TestCase):
             design_summary,
         )
         self.assertIn(
-            "The I04 backend slice adds a narrow signed synthetic-event path",
+            "The I04 slice adds a Manager-only synthetic provider simulator",
             design_summary,
         )
         for heading in (
@@ -250,7 +292,12 @@ class ProjectToolingContractTest(unittest.TestCase):
             "## Verification evidence",
         ):
             self.assertIn(heading, design_summary)
-        self.assertIn("No webhook-specific UI is added", design_summary)
+        self.assertIn(
+            "The complete signed envelope stays only in panel memory", design_summary
+        )
+        self.assertIn("committed delivery", design_summary)
+        self.assertIn("GET-only recovery", design_summary)
+        self.assertNotIn("No webhook-specific UI is added", design_summary)
         self.assertIn("An outbox worker", design_summary)
         self.assertIn("remain unimplemented", design_summary)
 
@@ -274,12 +321,64 @@ class ProjectToolingContractTest(unittest.TestCase):
             security_model,
         )
         self.assertIn("does not claim exactly-once delivery", security_model)
+        self.assertIn("The Manager-only signing route", security_model)
+        self.assertIn("is not registered in production", security_model)
+        self.assertIn(
+            "never enters storage, URLs, logs, or error objects", security_model
+        )
+        self.assertIn("omits cookies and all browser credentials", security_model)
+        self.assertIn("Safe case provenance", security_model)
 
         for relative_path in (
             "docs/assets/demo-entry-i03.png",
             "docs/assets/exception-workflow.png",
         ):
             self.assertTrue((PRODUCT_ROOT / relative_path).is_file())
+
+    def test_engineering_feedback_issue_form_has_actionable_fields(self) -> None:
+        form_path = (
+            PRODUCT_ROOT / ".github" / "ISSUE_TEMPLATE" / "engineering-feedback.yml"
+        )
+        self.assertTrue(form_path.is_file(), "engineering feedback form must exist")
+        form = form_path.read_text()
+
+        for top_level_key in ("name", "description", "title", "labels", "body"):
+            self.assertRegex(form, rf"(?m)^{top_level_key}:")
+
+        required_fields = {
+            "reproduction": "Reproduction steps",
+            "environment": "Environment",
+            "expected": "Expected behavior",
+            "actual": "Actual behavior",
+        }
+        for field_id, label in required_fields.items():
+            field = re.search(
+                rf"(?ms)^  - type: [^\n]+\n    id: {field_id}\n.*?(?=^  - type:|\Z)",
+                form,
+            )
+            self.assertIsNotNone(field, f"missing {field_id} field")
+            assert field is not None
+            self.assertIn(f"label: {label}", field.group())
+            self.assertRegex(field.group(), r"(?m)^      required: true$")
+
+        implementation_interest = re.search(
+            r"(?ms)^  - type: [^\n]+\n    id: implementation_interest\n.*?"
+            r"(?=^  - type:|\Z)",
+            form,
+        )
+        self.assertIsNotNone(
+            implementation_interest,
+            "missing optional implementation interest field",
+        )
+        assert implementation_interest is not None
+        self.assertIn(
+            "label: Implementation interest (optional)",
+            implementation_interest.group(),
+        )
+        self.assertRegex(
+            implementation_interest.group(),
+            r"(?m)^      required: false$",
+        )
 
 
 if __name__ == "__main__":

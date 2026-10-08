@@ -1,0 +1,55 @@
+name: Engineering feedback
+description: Reproduce a behavior, report an engineering concern, or propose a scoped improvement.
+title: "[Engineering feedback] "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for examining CommerceOps Desk. Please use synthetic data only and remove secrets, signatures, cookies, access codes, and personal information before submitting.
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: List the smallest sequence that reproduces the behavior, including the scenario or role you selected.
+      placeholder: |
+        1. Start a Manager workspace.
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the commit or release, deployment mode, browser or client, and database path when known.
+      placeholder: "Commit/release, hosted or local, browser/client, SQLite or PostgreSQL"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Explain the result or boundary you expected and why.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Explain what happened instead, including status and stable error code when available.
+    validations:
+      required: true
+
+  - type: textarea
+    id: implementation_interest
+    attributes:
+      label: Implementation interest (optional)
+      description: If you want to work on a fix or adaptation, describe the scope you would like to take on.
+    validations:
+      required: false

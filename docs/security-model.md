@@ -1,6 +1,6 @@
 # CommerceOps Desk Security Model
 
-This document describes controls implemented through the I04 signed-ingress backend slice and the limits of the public demo. It is an engineering boundary, not a compliance claim or a substitute for an independent production review.
+This document describes controls implemented through the I04 signed-webhook simulator slice and the limits of the public demo. It is an engineering boundary, not a compliance claim or a substitute for an independent production review.
 
 ## Threat model
 
@@ -19,6 +19,9 @@ Control of the service account, host filesystem, deployment secret store, or dat
 
 ## Signed webhook boundary
 
+- The Manager-only signing route is registered only outside production when both demo mode and webhook intake are enabled; it is not registered in production. It requires the existing authenticated Manager session, exact same-origin check, and CSRF token before its closed `fresh` or `stale` body is validated.
+- The server chooses the target path, tenant integration, event and order identifiers, timestamp, and exact JSON body. `fresh` uses the current time; `stale` is exactly 301 seconds old. The response is marked `Cache-Control: no-store` and never returns a master or derived key.
+- In the browser, the complete returned envelope stays in panel-local memory and never enters storage, URLs, logs, or error objects. The UI renders only the allowlisted external event ID; the target path, timestamp, signature, and raw body are not rendered. Delivery to the public webhook route omits cookies and all browser credentials. Exact replay reuses the cached envelope, tamper changes a copy after signing, and stale testing cannot overwrite the fresh replay cache.
 - Webhook intake is registered only when enabled with a dedicated master secret of at least 32 UTF-8 bytes. Local settings and production default it off; the hosted demo launcher enables it and creates or reuses an isolated mode-`0600` secret file. It never reuses the browser session secret.
 - The route identifier must be a canonical lowercase UUID in the exact raw ASCII path. Security headers must each occur exactly once and use closed timestamp, event-ID, and signature grammars.
 - A per-integration key is derived from the master secret, canonical integration ID, and positive key version. HMAC-SHA256 covers the version marker, timestamp, integration ID, event ID, and exact raw body bytes. Verification happens before media-type or JSON inspection, and comparison is constant-time.
@@ -28,6 +31,8 @@ Control of the service account, host filesystem, deployment secret store, or dat
 - The service stores a SHA-256 digest of the exact body, constrained event metadata, and safe result references. It never stores the body, signature, derived key, master secret, request headers, source address, session token, or arbitrary customer text.
 - Inbox claim, demo allowance, order snapshot, payment state, case, system audit, and result references commit once in one business transaction. Exact body replays return the stored case without consuming allowance; reuse of an event ID with a different valid raw-body encoding or an immutable order mismatch returns `409`.
 - A `503` may mean the commit result was not observed. The service does not retry internally; the sender safely retries the same event ID and body with fresh authentication material. The receiver safely supports retries from an at-least-once sender; it does not claim exactly-once delivery.
+- The browser treats a delivery success followed by a read failure as a committed delivery. Its recovery action repeats only dashboard, queue, and case-detail GET requests; it never resends that webhook. A network error or `503` remains an unknown outcome and is not automatically retried.
+- Safe case provenance is tenant-scoped and exposes only source kind plus, for synthetic events, provider, event type, constrained external event ID, and receipt time. It never exposes an integration ID, payload digest, signature, headers, raw body, or internal inbox identifier.
 
 ## Tenant and role boundaries
 
@@ -73,4 +78,4 @@ All included identities and order records are fictional. No customer email, addr
 
 The public demo is single-node. SQLite WAL is used only on a host-local path; tests explicitly avoid the NFS-mounted workspace after reproducing lock stalls there. The default hosted database is disposable across container replacement unless the operator provides an explicit durable database URL.
 
-PostgreSQL 17 migrations, tenant constraints, readiness, selected lock/concurrency behavior, webhook transactions, and the production container path are exercised against a live disposable database in CI. This does not establish multi-node throughput or availability. Edge bandwidth protection, distributed rate limiting, overlapping-key rotation, asynchronous event delivery, encrypted backups, production observability, disaster recovery, and formal compliance remain outside this revision.
+PostgreSQL 17 migrations, tenant constraints, readiness, selected lock/concurrency behavior, webhook transactions, and the production container path are exercised against a live disposable database in CI. This does not establish multi-node throughput or availability. Edge bandwidth protection, distributed rate limiting, overlapping-key rotation, a real Stripe or Shopify adapter, an outbox/worker, automatic delivery retries, a dead-letter queue, exactly-once delivery, encrypted backups, production observability, disaster recovery, high availability, production readiness, performance claims, and formal compliance remain outside this revision.
