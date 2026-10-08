@@ -90,3 +90,65 @@ jobs:
             frontend/test-results/
           if-no-files-found: ignore
           retention-days: 7
+
+  postgres-integration:
+    name: PostgreSQL 17 and production container
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      COMMERCE_OPS_CONTAINER_IMAGE: commerce-ops-desk:postgres-ci
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+        env:
+          POSTGRES_USER: commerce_ops_ci
+          POSTGRES_PASSWORD: ci_only_postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U commerce_ops_ci -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-start-period 10s
+          --health-retries 20
+    steps:
+      - name: Check out tested revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.lock
+            backend/requirements-dev.lock
+
+      - name: Reuse runner pip cache
+        run: echo "PIP_CACHE_DIR=$(python -m pip cache dir)" >> "$GITHUB_ENV"
+
+      - name: Install locked Python dependencies
+        env:
+          COMMERCE_OPS_SETUP_FRONTEND: "0"
+          COMMERCE_OPS_SETUP_BROWSER: "0"
+        run: make setup
+
+      - name: Prove PostgreSQL migrations and runtime behavior
+        env:
+          COMMERCE_OPS_POSTGRES_TEST_ADMIN_URL: "postgresql+psycopg://commerce_ops_ci:ci_only_postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/postgres"
+        run: make postgres-test
+
+      - name: Build production image
+        run: docker build --file Dockerfile --tag "$COMMERCE_OPS_CONTAINER_IMAGE" .
+
+      - name: Prove hardened production container
+        env:
+          COMMERCE_OPS_POSTGRES_TEST_ADMIN_URL: "postgresql+psycopg://commerce_ops_ci:ci_only_postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/postgres"
+        run: make postgres-container-test

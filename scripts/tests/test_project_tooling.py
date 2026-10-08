@@ -154,6 +154,52 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertIn("frontend/playwright-report/", contents)
         self.assertIn("frontend/test-results/", contents)
 
+    def test_ci_runs_the_live_postgresql_and_production_container_gates(self) -> None:
+        contents = (PRODUCT_ROOT / ".github" / "workflows" / "verify.yml").read_text()
+        job_marker = "  postgres-integration:\n"
+
+        self.assertIn(job_marker, contents)
+        job = contents.split(job_marker, maxsplit=1)[1]
+        self.assertIn("name: PostgreSQL 17 and production container", job)
+        self.assertIn("timeout-minutes: 30", job)
+        self.assertIn("permissions:\n      contents: read", job)
+        self.assertIn(
+            "image: postgres:17-alpine@sha256:"
+            "b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+            job,
+        )
+        self.assertIn("ports:\n          - 5432/tcp", job)
+        self.assertIn("pg_isready -U commerce_ops_ci -d postgres", job)
+        self.assertIn("--health-start-period 10s", job)
+        self.assertIn("persist-credentials: false", job)
+        self.assertIn('COMMERCE_OPS_SETUP_FRONTEND: "0"', job)
+        self.assertIn('COMMERCE_OPS_SETUP_BROWSER: "0"', job)
+        self.assertIn(
+            "COMMERCE_OPS_CONTAINER_IMAGE: commerce-ops-desk:postgres-ci",
+            job,
+        )
+
+        dynamic_admin_url = (
+            "postgresql+psycopg://commerce_ops_ci:ci_only_postgres@127.0.0.1:"
+            "${{ job.services.postgres.ports[5432] }}/postgres"
+        )
+        self.assertEqual(job.count(dynamic_admin_url), 2)
+        commands = (
+            "run: make postgres-test",
+            'run: docker build --file Dockerfile --tag "$COMMERCE_OPS_CONTAINER_IMAGE" .',
+            "run: make postgres-container-test",
+        )
+        command_offsets = [job.index(command) for command in commands]
+        self.assertEqual(command_offsets, sorted(command_offsets))
+
+        for forbidden in (
+            "secrets.",
+            "actions/upload-artifact",
+            "docker login",
+            "docker push",
+        ):
+            self.assertNotIn(forbidden, job)
+
     def test_public_docs_separate_verified_i03_scope_from_the_roadmap(
         self,
     ) -> None:
