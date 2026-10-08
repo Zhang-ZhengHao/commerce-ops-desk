@@ -11,6 +11,8 @@ from app.models.organization import Organization
 from app.models.rate_limit import RateLimit
 from app.models.session import DemoSession
 from app.models.user import User
+from app.models.webhook_event import WebhookEvent
+from app.models.webhook_integration import WebhookIntegration
 
 __all__ = [
     "AuditEvent",
@@ -25,4 +27,6 @@ __all__ = [
     "RateLimit",
     "Role",
     "User",
+    "WebhookEvent",
+    "WebhookIntegration",
 ]

@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 
@@ -17,7 +18,8 @@ FOUNDATION_REVISION = "0001_foundation"
 DEMO_IDENTITY_REVISION = "0002_demo_identity"
 BOOTSTRAP_IDEMPOTENCY_REVISION = "0003_bootstrap_idempotency"
 ORDER_CASE_REVISION = "0004_order_case"
-HEAD_REVISION = ORDER_CASE_REVISION
+WEBHOOK_INBOX_REVISION = "0005_webhook_inbox"
+HEAD_REVISION = WEBHOOK_INBOX_REVISION
 DEMO_IDENTITY_TABLES = {
     "organizations",
     "users",
@@ -116,6 +118,28 @@ def read_foreign_keys(database_path: Path, table: str) -> set[tuple[str, str, st
     return {(str(row[3]), str(row[2]), str(row[4])) for row in rows}
 
 
+def read_foreign_key_shapes(
+    database_path: Path,
+    table: str,
+) -> set[tuple[tuple[str, ...], str, tuple[str, ...], str]]:
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(f'PRAGMA foreign_key_list("{table}")').fetchall()
+
+    grouped: dict[int, list[tuple[Any, ...]]] = {}
+    for row in rows:
+        grouped.setdefault(int(row[0]), []).append(row)
+
+    return {
+        (
+            tuple(str(row[3]) for row in sorted(group, key=lambda row: int(row[1]))),
+            str(group[0][2]),
+            tuple(str(row[4]) for row in sorted(group, key=lambda row: int(row[1]))),
+            str(group[0][6]).upper(),
+        )
+        for group in grouped.values()
+    }
+
+
 def read_unique_indexes(database_path: Path, table: str) -> set[tuple[str, ...]]:
     with sqlite3.connect(database_path) as connection:
         index_rows = connection.execute(f'PRAGMA index_list("{table}")').fetchall()
@@ -127,6 +151,17 @@ def read_unique_indexes(database_path: Path, table: str) -> set[tuple[str, ...]]
             column_rows = connection.execute(f'PRAGMA index_info("{index_name}")').fetchall()
             unique_indexes.add(tuple(str(row[2]) for row in column_rows))
     return unique_indexes
+
+
+def read_index_shapes(database_path: Path, table: str) -> set[tuple[str, ...]]:
+    with sqlite3.connect(database_path) as connection:
+        index_rows = connection.execute(f'PRAGMA index_list("{table}")').fetchall()
+        indexes: set[tuple[str, ...]] = set()
+        for index_row in index_rows:
+            index_name = str(index_row[1]).replace('"', '""')
+            column_rows = connection.execute(f'PRAGMA index_info("{index_name}")').fetchall()
+            indexes.add(tuple(str(row[2]) for row in column_rows))
+    return indexes
 
 
 def read_create_table_sql(database_path: Path, table: str) -> str:
@@ -325,7 +360,7 @@ def test_order_case_migration_adds_tenant_scoped_workflow_tables(tmp_path: Path)
     }.isdisjoint(read_table_names(database_path))
     assert "case_note_count" not in read_columns(database_path, "organizations")
 
-    head_result = run_upgrade(database_path)
+    head_result = run_upgrade(database_path, target=ORDER_CASE_REVISION)
 
     assert head_result.returncode == 0, head_result.stdout + head_result.stderr
     assert read_applied_revision(database_path) == ORDER_CASE_REVISION
@@ -372,7 +407,7 @@ def test_order_case_migration_adds_tenant_scoped_workflow_tables(tmp_path: Path)
 
 def test_order_case_migration_downgrades_to_the_previous_schema(tmp_path: Path) -> None:
     database_path = tmp_path / "order-case-downgrade.sqlite3"
-    head_result = run_upgrade(database_path)
+    head_result = run_upgrade(database_path, target=ORDER_CASE_REVISION)
     assert head_result.returncode == 0, head_result.stdout + head_result.stderr
 
     downgrade_result = run_downgrade(database_path, target=BOOTSTRAP_IDEMPOTENCY_REVISION)
@@ -386,6 +421,223 @@ def test_order_case_migration_downgrades_to_the_previous_schema(tmp_path: Path) 
         "audit_events",
     }.isdisjoint(read_table_names(database_path))
     assert "case_note_count" not in read_columns(database_path, "organizations")
+
+
+def _insert_migration_organization(
+    connection: sqlite3.Connection,
+    *,
+    organization_id: str,
+    is_demo: bool,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO organizations (
+            id, name, is_demo, case_note_count, created_at, expires_at
+        ) VALUES (?, ?, ?, 0, '2026-10-08 12:00:00', '2026-10-08 16:00:00')
+        """,
+        (organization_id, f"Workspace {organization_id}", is_demo),
+    )
+
+
+def test_webhook_inbox_upgrade_backfills_one_integration_per_demo_organization(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "webhook-backfill.sqlite3"
+    previous_result = run_upgrade(database_path, target=ORDER_CASE_REVISION)
+    assert previous_result.returncode == 0, previous_result.stdout + previous_result.stderr
+
+    with sqlite3.connect(database_path) as connection:
+        _insert_migration_organization(
+            connection,
+            organization_id="demo-a",
+            is_demo=True,
+        )
+        _insert_migration_organization(
+            connection,
+            organization_id="demo-b",
+            is_demo=True,
+        )
+        _insert_migration_organization(
+            connection,
+            organization_id="non-demo",
+            is_demo=False,
+        )
+
+    upgrade_result = run_upgrade(database_path)
+    repeat_result = run_upgrade(database_path)
+
+    assert upgrade_result.returncode == 0, upgrade_result.stdout + upgrade_result.stderr
+    assert repeat_result.returncode == 0, repeat_result.stdout + repeat_result.stderr
+    assert read_applied_revision(database_path) == WEBHOOK_INBOX_REVISION
+    with sqlite3.connect(database_path) as connection:
+        integrations = connection.execute(
+            """
+            SELECT id, organization_id, provider, key_version, enabled
+            FROM webhook_integrations
+            ORDER BY organization_id
+            """
+        ).fetchall()
+        counters = connection.execute(
+            """
+            SELECT id, webhook_event_count
+            FROM organizations
+            ORDER BY id
+            """
+        ).fetchall()
+        event_count = connection.execute("SELECT count(*) FROM webhook_events").fetchone()
+
+    assert [(row[1], row[2], row[3], row[4]) for row in integrations] == [
+        ("demo-a", "synthetic", 1, 1),
+        ("demo-b", "synthetic", 1, 1),
+    ]
+    parsed_integration_ids = [UUID(str(row[0])) for row in integrations]
+    assert all(
+        str(parsed) == row[0]
+        for parsed, row in zip(parsed_integration_ids, integrations, strict=True)
+    )
+    assert all(parsed.version == 4 for parsed in parsed_integration_ids)
+    assert counters == [("demo-a", 0), ("demo-b", 0), ("non-demo", 0)]
+    assert event_count == (0,)
+
+
+def test_webhook_inbox_schema_is_tenant_scoped_and_secret_free(tmp_path: Path) -> None:
+    database_path = tmp_path / "webhook-schema.sqlite3"
+    result = run_upgrade(database_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    integration_columns = read_columns(database_path, "webhook_integrations")
+    event_columns = read_columns(database_path, "webhook_events")
+    assert set(integration_columns) == {
+        "id",
+        "organization_id",
+        "provider",
+        "key_version",
+        "enabled",
+        "created_at",
+        "updated_at",
+    }
+    assert set(event_columns) == {
+        "id",
+        "organization_id",
+        "integration_id",
+        "external_event_id",
+        "event_type",
+        "payload_digest",
+        "occurred_at",
+        "order_id",
+        "case_id",
+        "received_at",
+        "processed_at",
+    }
+    assert ("organization_id", "id") in read_unique_indexes(
+        database_path,
+        "webhook_integrations",
+    )
+    assert ("organization_id", "provider") in read_unique_indexes(
+        database_path,
+        "webhook_integrations",
+    )
+    assert (
+        "organization_id",
+        "integration_id",
+        "external_event_id",
+    ) in read_unique_indexes(database_path, "webhook_events")
+    assert (
+        ("organization_id", "integration_id"),
+        "webhook_integrations",
+        ("organization_id", "id"),
+        "CASCADE",
+    ) in read_foreign_key_shapes(database_path, "webhook_events")
+    assert (
+        ("organization_id", "order_id"),
+        "orders",
+        ("organization_id", "id"),
+        "NO ACTION",
+    ) in read_foreign_key_shapes(database_path, "webhook_events")
+    assert (
+        ("organization_id", "case_id"),
+        "exception_cases",
+        ("organization_id", "id"),
+        "NO ACTION",
+    ) in read_foreign_key_shapes(database_path, "webhook_events")
+    assert ("id", "enabled") in read_index_shapes(
+        database_path,
+        "webhook_integrations",
+    )
+    assert ("organization_id", "received_at") in read_index_shapes(
+        database_path,
+        "webhook_events",
+    )
+    event_sql = read_create_table_sql(database_path, "webhook_events")
+    assert "payment.failed" in event_sql
+    assert "payload_digest" in event_sql
+    assert "processed_at" in event_sql
+    assert read_columns(database_path, "organizations")["webhook_event_count"] == 1
+
+
+def test_webhook_inbox_revision_round_trips_without_losing_pre_i04_records(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "webhook-round-trip.sqlite3"
+    previous_result = run_upgrade(database_path, target=ORDER_CASE_REVISION)
+    assert previous_result.returncode == 0, previous_result.stdout + previous_result.stderr
+
+    with sqlite3.connect(database_path) as connection:
+        _insert_migration_organization(
+            connection,
+            organization_id="round-trip-demo",
+            is_demo=True,
+        )
+        connection.execute(
+            """
+            INSERT INTO orders (
+                id, organization_id, external_order_id, order_number,
+                amount_minor, currency, payment_status, fulfillment_status,
+                created_at, updated_at
+            ) VALUES (
+                'round-trip-order', 'round-trip-demo', 'synthetic-round-trip',
+                'DEMO-9001', 2500, 'USD', 'failed', 'unfulfilled',
+                '2026-10-08 12:00:00', '2026-10-08 12:00:00'
+            )
+            """
+        )
+
+    upgrade_result = run_upgrade(database_path)
+    assert upgrade_result.returncode == 0, upgrade_result.stdout + upgrade_result.stderr
+    with sqlite3.connect(database_path) as connection:
+        first_integration_id = connection.execute(
+            """
+            SELECT id FROM webhook_integrations
+            WHERE organization_id = 'round-trip-demo'
+            """
+        ).fetchone()
+    assert first_integration_id is not None
+
+    downgrade_result = run_downgrade(database_path, target=ORDER_CASE_REVISION)
+    assert downgrade_result.returncode == 0, downgrade_result.stdout + downgrade_result.stderr
+    assert read_applied_revision(database_path) == ORDER_CASE_REVISION
+    assert {"webhook_integrations", "webhook_events"}.isdisjoint(read_table_names(database_path))
+    assert "webhook_event_count" not in read_columns(database_path, "organizations")
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM organizations WHERE id = 'round-trip-demo'"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT count(*) FROM orders WHERE id = 'round-trip-order'"
+        ).fetchone() == (1,)
+
+    reupgrade_result = run_upgrade(database_path)
+    assert reupgrade_result.returncode == 0, reupgrade_result.stdout + reupgrade_result.stderr
+    with sqlite3.connect(database_path) as connection:
+        second_integration_id = connection.execute(
+            """
+            SELECT id FROM webhook_integrations
+            WHERE organization_id = 'round-trip-demo'
+            """
+        ).fetchone()
+        assert connection.execute("SELECT count(*) FROM webhook_events").fetchone() == (0,)
+    assert second_integration_id is not None
+    assert second_integration_id != first_integration_id
 
 
 def _seed_case_constraint_parents(connection: sqlite3.Connection) -> None:
@@ -471,6 +723,187 @@ def _insert_constraint_case(
         """,
         values,
     )
+
+
+def _insert_webhook_event(
+    connection: sqlite3.Connection,
+    *,
+    event_id: str,
+    **overrides: Any,
+) -> None:
+    values: dict[str, Any] = {
+        "id": event_id,
+        "organization_id": "organization-1",
+        "integration_id": "11111111-1111-4111-8111-111111111111",
+        "external_event_id": f"evt_{event_id.replace('-', '')[:12]}",
+        "event_type": "payment.failed",
+        "payload_digest": "a" * 64,
+        "occurred_at": "2026-10-08 12:00:00",
+        "order_id": "order-1",
+        "case_id": "case-1",
+        "received_at": "2026-10-08 12:00:01",
+        "processed_at": "2026-10-08 12:00:02",
+    }
+    values.update(overrides)
+    connection.execute(
+        """
+        INSERT INTO webhook_events (
+            id, organization_id, integration_id, external_event_id,
+            event_type, payload_digest, occurred_at, order_id, case_id,
+            received_at, processed_at
+        ) VALUES (
+            :id, :organization_id, :integration_id, :external_event_id,
+            :event_type, :payload_digest, :occurred_at, :order_id, :case_id,
+            :received_at, :processed_at
+        )
+        """,
+        values,
+    )
+
+
+def test_webhook_event_constraints_reject_partial_or_cross_tenant_records(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "webhook-event-constraints.sqlite3"
+    result = run_upgrade(database_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        _seed_case_constraint_parents(connection)
+        _insert_constraint_case(connection, case_id="case-1")
+        _insert_migration_organization(
+            connection,
+            organization_id="organization-2",
+            is_demo=True,
+        )
+        connection.execute(
+            """
+            INSERT INTO orders (
+                id, organization_id, external_order_id, order_number,
+                amount_minor, currency, payment_status, fulfillment_status,
+                created_at, updated_at
+            ) VALUES (
+                'order-2', 'organization-2', 'external-order-2', 'DEMO-2002',
+                2000, 'USD', 'failed', 'unfulfilled',
+                '2026-10-08 12:00:00', '2026-10-08 12:00:00'
+            )
+            """
+        )
+        _insert_constraint_case(
+            connection,
+            case_id="case-2",
+            organization_id="organization-2",
+            order_id="order-2",
+        )
+        connection.executemany(
+            """
+            INSERT INTO webhook_integrations (
+                id, organization_id, provider, key_version, enabled,
+                created_at, updated_at
+            ) VALUES (?, ?, 'synthetic', 1, 1, ?, ?)
+            """,
+            [
+                (
+                    "11111111-1111-4111-8111-111111111111",
+                    "organization-1",
+                    "2026-10-08 12:00:00",
+                    "2026-10-08 12:00:00",
+                ),
+                (
+                    "22222222-2222-4222-8222-222222222222",
+                    "organization-2",
+                    "2026-10-08 12:00:00",
+                    "2026-10-08 12:00:00",
+                ),
+            ],
+        )
+
+        _insert_webhook_event(
+            connection,
+            event_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            external_event_id="evt_DUPLICATE01",
+        )
+
+        for suffix, invalid_digest in (
+            ("short", "a" * 63),
+            ("uppercase", "A" * 64),
+            ("nonhex", "g" * 64),
+            ("punctuation", "-" * 64),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_webhook_event(
+                    connection,
+                    event_id=f"digest-{suffix}",
+                    external_event_id=f"evt_DIGEST{suffix.upper()}",
+                    payload_digest=invalid_digest,
+                )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_webhook_event(
+                connection,
+                event_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                external_event_id="evt_PARTIAL01",
+                order_id="order-1",
+                case_id=None,
+                processed_at=None,
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_webhook_event(
+                connection,
+                event_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                external_event_id="evt_CROSSTENANT1",
+                integration_id="22222222-2222-4222-8222-222222222222",
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_webhook_event(
+                connection,
+                event_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                external_event_id="evt_CROSSORDER1",
+                order_id="order-2",
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_webhook_event(
+                connection,
+                event_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                external_event_id="evt_CROSSCASE01",
+                case_id="case-2",
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_webhook_event(
+                connection,
+                event_id="ffffffff-ffff-4fff-8fff-ffffffffffff",
+                external_event_id="evt_WRONGTYPE01",
+                event_type="payment.succeeded",
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_webhook_event(
+                connection,
+                event_id="99999999-9999-4999-8999-999999999999",
+                external_event_id="evt_DUPLICATE01",
+            )
+
+        _insert_webhook_event(
+            connection,
+            event_id="88888888-8888-4888-8888-888888888888",
+            organization_id="organization-2",
+            integration_id="22222222-2222-4222-8222-222222222222",
+            external_event_id="evt_DUPLICATE01",
+            order_id=None,
+            case_id=None,
+            processed_at=None,
+        )
+        connection.execute("DELETE FROM organizations WHERE id = 'organization-1'")
+
+        assert connection.execute(
+            "SELECT count(*) FROM webhook_integrations WHERE organization_id = 'organization-1'"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT count(*) FROM webhook_events WHERE organization_id = 'organization-1'"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT count(*) FROM webhook_events WHERE organization_id = 'organization-2'"
+        ).fetchone() == (1,)
 
 
 def test_case_schema_requires_a_source_event_for_idempotency(tmp_path: Path) -> None:

@@ -162,7 +162,7 @@ class HostedStartContractTest(unittest.TestCase):
                     revision = connection.execute(
                         "SELECT version_num FROM alembic_version"
                     ).fetchone()
-                self.assertEqual(revision, ("0004_order_case",))
+                self.assertEqual(revision, ("0005_webhook_inbox",))
 
                 container_address = socket.gethostbyname(socket.gethostname())
                 if not container_address.startswith("127."):
