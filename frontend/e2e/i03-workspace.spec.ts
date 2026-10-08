@@ -45,6 +45,7 @@ const summary = {
   version: 3,
   resolution_reason: null,
   resolved_at: null,
+  source: { kind: 'seeded_demo' },
   order: {
     id: 'order-1042',
     order_number: 'DEMO-1042',

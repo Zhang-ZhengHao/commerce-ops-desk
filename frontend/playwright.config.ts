@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { accessSync, constants, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -103,13 +104,22 @@ function hostedEnvironment(): Record<string, string> {
       (entry): entry is [string, string] => entry[1] !== undefined,
     ),
   );
+  const sessionSecretBytes = randomBytes(48);
+  let webhookSecretBytes = randomBytes(48);
+  while (sessionSecretBytes.equals(webhookSecretBytes)) {
+    webhookSecretBytes = randomBytes(48);
+  }
 
   return {
     ...inheritedEnvironment,
     COMMERCE_OPS_DATABASE_URL: `sqlite+pysqlite:///${databasePath}`,
+    COMMERCE_OPS_DEMO_MODE: 'true',
     COMMERCE_OPS_ENVIRONMENT: 'test',
+    COMMERCE_OPS_SESSION_SECRET: sessionSecretBytes.toString('base64url'),
     COMMERCE_OPS_VENV_DIR:
       process.env.COMMERCE_OPS_VENV_DIR ?? path.join(productDirectory, '.venv'),
+    COMMERCE_OPS_WEBHOOK_ENABLED: 'true',
+    COMMERCE_OPS_WEBHOOK_MASTER_SECRET: webhookSecretBytes.toString('base64url'),
     PORT: String(hostedPort),
   };
 }
