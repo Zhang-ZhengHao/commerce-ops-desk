@@ -26,6 +26,7 @@ def test_settings_default_to_the_local_sqlite_boundary() -> None:
     assert settings.demo_webhook_event_limit == 20
     assert settings.api_max_request_body_bytes == 16 * 1024
     assert settings.trusted_proxy_cidrs == ()
+    assert settings.allowed_hosts == ()
     assert settings.secure_cookies is False
 
 
@@ -37,6 +38,7 @@ def test_production_defaults_demo_off_and_requires_an_explicit_session_secret() 
         _env_file=None,
         environment="production",
         session_secret="production-secret-that-is-long-enough-for-hmac",
+        allowed_hosts=("127.0.0.1",),
     )
 
     assert settings.demo_mode is False
@@ -49,12 +51,14 @@ def test_cookie_secure_defaults_are_safe_but_can_be_explicitly_overridden() -> N
         _env_file=None,
         environment="demo",
         session_secret="demo-secret-that-is-long-enough-for-hmac-only",
+        allowed_hosts=("127.0.0.1",),
     )
     local_http_settings = Settings(
         _env_file=None,
         environment="demo",
         session_secret="demo-secret-that-is-long-enough-for-hmac-only",
         cookie_secure=False,
+        allowed_hosts=("127.0.0.1",),
     )
 
     assert demo_settings.secure_cookies is True
@@ -229,3 +233,80 @@ def test_postgresql_engine_uses_the_psycopg_driver_without_connecting() -> None:
         assert "demo_password" not in str(engine.url)
     finally:
         engine.dispose()
+
+
+def test_allowed_hosts_are_exact_normalized_hostnames() -> None:
+    settings = Settings(
+        _env_file=None,
+        environment="demo",
+        session_secret="demo-secret-that-is-long-enough-for-hmac-only",
+        allowed_hosts=(
+            "Commerce-Ops-Desk.SRRSH.AIG.REST",
+            "localhost",
+            "127.0.0.1",
+            "api.example.com",
+            "localhost",
+        ),
+    )
+
+    assert settings.allowed_hosts == (
+        "commerce-ops-desk.srrsh.aig.rest",
+        "localhost",
+        "127.0.0.1",
+        "api.example.com",
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_host",
+    [
+        "",
+        "*",
+        "*.example.com",
+        "https://example.com",
+        "example.com/path",
+        "example.com:443",
+        ".example.com",
+        "example..com",
+        "-example.com",
+        "example-.com",
+        f"{'a' * 64}.example.com",
+        f"{'a' * 250}.com",
+        " example.com",
+        "example.com?query=yes",
+        "example.com#fragment",
+    ],
+)
+def test_allowed_hosts_reject_ambiguous_or_wildcard_values(invalid_host: str) -> None:
+    with pytest.raises(ValidationError, match="allowed host"):
+        Settings(
+            _env_file=None,
+            environment="test",
+            allowed_hosts=(invalid_host,),
+        )
+
+
+@pytest.mark.parametrize("environment", ["demo", "production"])
+def test_hardened_environments_require_allowed_hosts(environment: str) -> None:
+    with pytest.raises(ValidationError, match="allowed host"):
+        Settings(
+            _env_file=None,
+            environment=environment,
+            session_secret="hardened-secret-that-is-long-enough-for-hmac",
+        )
+
+
+def test_allowed_hosts_read_from_the_namespaced_json_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "COMMERCE_OPS_ALLOWED_HOSTS",
+        '["commerce-ops-desk.srrsh.aig.rest", "127.0.0.1"]',
+    )
+
+    settings = Settings(_env_file=None, environment="test")
+
+    assert settings.allowed_hosts == (
+        "commerce-ops-desk.srrsh.aig.rest",
+        "127.0.0.1",
+    )

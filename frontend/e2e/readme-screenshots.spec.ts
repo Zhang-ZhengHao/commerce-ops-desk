@@ -14,7 +14,7 @@ test.describe('README screenshots', () => {
     'Run npm run capture:demo-entry to update the checked-in asset.',
   );
 
-  test('captures the public demo entry as one full-page image', async ({ page }) => {
+  test('captures the synthetic demo entry as one full-page image', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto('/');
 

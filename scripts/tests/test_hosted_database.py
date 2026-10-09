@@ -12,6 +12,9 @@ from pathlib import Path
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 START_SCRIPT = PRODUCT_ROOT / "scripts" / "start-hosted.sh"
 PLAYWRIGHT_CONFIG = PRODUCT_ROOT / "frontend" / "playwright.config.ts"
+PLAYWRIGHT_DATABASE_LIFECYCLE = (
+    PRODUCT_ROOT / "frontend" / "e2e" / "database-lifecycle.ts"
+)
 TEST_SESSION_SECRET = "hosted-database-test-secret-with-at-least-32-bytes"
 DEFAULT_DATABASE_DIRECTORY = Path("/var/tmp/commerce-ops-desk")
 DEFAULT_DATABASE_URL = "sqlite+pysqlite:////var/tmp/commerce-ops-desk/commerce_ops.db"
@@ -164,22 +167,31 @@ class HostedDatabaseContractTest(unittest.TestCase):
     def test_playwright_prefers_linux_shared_memory_with_an_explicit_override(
         self,
     ) -> None:
-        contents = PLAYWRIGHT_CONFIG.read_text(encoding="utf-8")
+        config = PLAYWRIGHT_CONFIG.read_text(encoding="utf-8")
+        lifecycle = PLAYWRIGHT_DATABASE_LIFECYCLE.read_text(encoding="utf-8")
 
-        self.assertRegex(contents, r"from 'node:os'")
-        self.assertRegex(contents, r"\btmpdir\(\)")
-        self.assertIn("COMMERCE_OPS_E2E_DATABASE_DIR", contents)
-        self.assertIn("'/dev/shm'", contents)
-        self.assertRegex(contents, r"process\.platform\s*===\s*'linux'")
-        self.assertRegex(contents, r"\b(?:accessSync|statSync)\(")
+        self.assertRegex(config, r"from 'node:os'")
+        self.assertRegex(config, r"\btmpdir\(\)")
+        self.assertIn("COMMERCE_OPS_E2E_DATABASE_DIR", config)
+        self.assertIn("'/dev/shm'", config)
+        self.assertRegex(config, r"process\.platform\s*===\s*'linux'")
+        self.assertRegex(config, r"\b(?:accessSync|statSync)\(")
         self.assertRegex(
-            contents,
-            r"(?s)const databasePath = path\.join\(\s*e2eDatabaseDirectory\(\)",
+            config,
+            r"(?s)prepareE2EDatabase\(\{\s*directory: e2eDatabaseDirectory\(\)",
         )
         self.assertNotRegex(
-            contents,
+            config,
             r"(?s)const databasePath = path\.join\(\s*productDirectory,\s*'data'",
         )
+        self.assertIn("mkdtempSync", lifecycle)
+        self.assertIn("realpathSync", lifecycle)
+        self.assertIn("lstatSync", lifecycle)
+        self.assertIn("COMMERCE_OPS_E2E_DATABASE_DIRECTORY_DEVICE", lifecycle)
+        self.assertIn("COMMERCE_OPS_E2E_DATABASE_DIRECTORY_INODE", lifecycle)
+        self.assertIn("COMMERCE_OPS_E2E_DATABASE_DIRECTORY_OWNER_UID", lifecycle)
+        self.assertIn("0o700", lifecycle)
+        self.assertIn("0o600", lifecycle)
 
 
 if __name__ == "__main__":

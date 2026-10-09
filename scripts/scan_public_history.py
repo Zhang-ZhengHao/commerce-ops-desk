@@ -66,6 +66,12 @@ RFC1918_NETWORKS = tuple(
         "192." + "168.0.0/16",
     )
 )
+SENSITIVE_RUNTIME_BASENAMES = frozenset(
+    {
+        ".session-secret",
+        ".webhook-secret",
+    }
+)
 
 
 def run_git(
@@ -175,6 +181,12 @@ def findings_for_content(source: str, content: bytes) -> set[Finding]:
     return {Finding(source=source, rule=rule) for rule in matching_rules(content)}
 
 
+def findings_for_path(source: str, relative_path: str) -> set[Finding]:
+    if relative_path.rsplit("/", 1)[-1] in SENSITIVE_RUNTIME_BASENAMES:
+        return {Finding(source=source, rule="secret.generated_runtime_file")}
+    return set()
+
+
 def worktree_findings(repository: Path) -> set[Finding]:
     findings: set[Finding] = set()
     output = run_git(
@@ -199,7 +211,9 @@ def worktree_findings(repository: Path) -> set[Finding]:
                 continue
         except OSError as error:
             raise ScanError("A worktree file could not be inspected") from error
-        findings.update(findings_for_content(f"worktree:{relative_path}", content))
+        source = f"worktree:{relative_path}"
+        findings.update(findings_for_path(source, relative_path))
+        findings.update(findings_for_content(source, content))
     return findings
 
 
@@ -237,11 +251,9 @@ def index_findings(repository: Path) -> set[Finding]:
             continue
         seen.add(key)
         source_prefix = "index" if stage == "0" else f"index-stage-{stage}"
-        findings.update(
-            findings_for_content(
-                f"{source_prefix}:{relative_path}", read_blob(repository, object_id)
-            )
-        )
+        source = f"{source_prefix}:{relative_path}"
+        findings.update(findings_for_path(source, relative_path))
+        findings.update(findings_for_content(source, read_blob(repository, object_id)))
     return findings
 
 
@@ -279,8 +291,25 @@ def reachable_object_types(repository: Path) -> Iterable[tuple[str, str]]:
     return entries
 
 
+def reachable_history_paths(repository: Path) -> Iterable[str]:
+    output = run_git(
+        repository,
+        "log",
+        "--all",
+        "--format=",
+        "--name-only",
+        "-z",
+        "--no-renames",
+    )
+    return (os.fsdecode(raw_path) for raw_path in output.split(b"\x00") if raw_path)
+
+
 def history_findings(repository: Path) -> set[Finding]:
     findings: set[Finding] = set()
+    for relative_path in reachable_history_paths(repository):
+        findings.update(
+            findings_for_path(f"history-path:{relative_path}", relative_path)
+        )
     paths = object_paths(repository)
     for object_id, object_type in reachable_object_types(repository):
         if object_type == "blob":

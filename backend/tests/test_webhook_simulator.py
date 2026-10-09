@@ -127,7 +127,11 @@ def _delivery_headers(envelope: dict[str, object]) -> dict[str, str]:
     [
         {"demo_mode": False},
         {"webhook_enabled": False, "webhook_master_secret": None},
-        {"environment": "production", "demo_mode": True},
+        {
+            "environment": "production",
+            "demo_mode": True,
+            "allowed_hosts": ("commerceops.test",),
+        },
     ],
 )
 def test_simulator_route_is_absent_when_disabled_or_in_production_even_if_misconfigured(
@@ -142,10 +146,9 @@ def test_simulator_route_is_absent_when_disabled_or_in_production_even_if_miscon
             headers={"Origin": SAME_ORIGIN},
             json={"scenario": "fresh"},
         )
-        schema = client.get("/openapi.json").json()
 
     assert response.status_code == 404
-    assert SIMULATOR_PATH not in schema["paths"]
+    assert SIMULATOR_PATH not in {getattr(route, "path", None) for route in harness.app.routes}
 
 
 def test_auth_role_origin_csrf_and_body_validation_have_a_fixed_order(

@@ -1,6 +1,6 @@
 # CommerceOps Desk Security Model
 
-This document describes controls implemented through the I04 signed-webhook simulator slice and the limits of the public demo. It is an engineering boundary, not a compliance claim or a substitute for an independent production review.
+This document describes controls implemented through the I04 signed-webhook simulator slice and the limits of the hosted synthetic demo. It is an engineering boundary, not a compliance claim or a substitute for an independent production review.
 
 ## Threat model
 
@@ -76,6 +76,26 @@ These controls reduce accidental and low-cost abuse. They do not replace upstrea
 
 All included identities and order records are fictional. No customer email, address, payment instrument, merchant credential, or live provider token is required or stored.
 
-The public demo is single-node. SQLite WAL is used only on a host-local path; tests explicitly avoid the NFS-mounted workspace after reproducing lock stalls there. The default hosted database is disposable across container replacement unless the operator provides an explicit durable database URL.
+The hosted synthetic demo is single-node. SQLite WAL is used only on a host-local path; tests explicitly avoid the NFS-mounted workspace after reproducing lock stalls there. The direct launcher keeps its default database in disposable local runtime storage. The workstation deployment instead bind-mounts the database and generated secret files so they survive container replacement; backups and high availability remain outside this demo's scope.
+
+The workstation Caddy helper maintains a root-owned, canonical, linear route
+head and permits rollback only from the current head's immutable schema-3
+transaction. Target health and full upstream identity are checked before a
+route can be exposed; route installation, marker verification, and a second
+identity verification finish before the head advances. The site file and head
+file are still separate replacements: a process killed between them can leave
+the site ahead of the head. A lock-protected reconcile command accepts only the
+exact direct-child transaction, fully revalidates either recognized route, and
+then advances or preserves the head as appropriate. Before the head advances,
+a failed orphan-route verification can restore the trusted backup only after
+the parent, site, backup target, and restored route are all revalidated. The
+human deployment operator is part of the trusted computing base because
+privileged helper code comes from that operator's checkout; a malicious
+operator and a privileged writer that ignores the shared lock remain outside
+this boundary. This is
+deployment integrity evidence, not a claim of cross-file atomicity, disaster
+recovery, or protection from root.
+
+Application shutdown gives the maintenance scheduler five seconds by default to finish and then cancels the scheduler coroutine so the FastAPI lifespan can close. Python cannot forcibly terminate a synchronous database call that has already been dispatched through `asyncio.to_thread`; that call may finish after the lifespan timeout, and its Session remains responsible for closing its checked-out connection. Engine disposal releases the application's idle pool without claiming that the worker thread was killed. The timeout is configurable through `COMMERCE_OPS_MAINTENANCE_SHUTDOWN_TIMEOUT_SECONDS` and must be finite and positive.
 
 PostgreSQL 17 migrations, tenant constraints, readiness, selected lock/concurrency behavior, webhook transactions, and the production container path are exercised against a live disposable database in CI. This does not establish multi-node throughput or availability. Edge bandwidth protection, distributed rate limiting, overlapping-key rotation, a real Stripe or Shopify adapter, an outbox/worker, automatic delivery retries, a dead-letter queue, exactly-once delivery, encrypted backups, production observability, disaster recovery, high availability, production readiness, performance claims, and formal compliance remain outside this revision.

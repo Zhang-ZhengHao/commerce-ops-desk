@@ -1,0 +1,29 @@
+http://commerce-ops-desk.srrsh.aig.rest {
+	@api_docs path /docs /docs/* /redoc /redoc/* /openapi.json
+	respond @api_docs 404
+
+	request_body {
+		max_size 16KiB
+	}
+
+	header {
+		-Server
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		X-CommerceOps-Route-Revision "{{ROUTE_REVISION}}"
+	}
+
+	reverse_proxy 127.0.0.1:{{UPSTREAM_PORT}} {
+		header_down -X-CommerceOps-Route-Revision
+		header_up Host {http.request.host}
+		header_up X-Forwarded-Host {http.request.host}
+		header_up X-Forwarded-Proto https
+		header_up X-Forwarded-For {http.request.remote.host}
+	}
+}

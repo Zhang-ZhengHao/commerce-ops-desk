@@ -87,22 +87,27 @@ CI runs the live PostgreSQL 17 migration, concurrency, webhook, and production-c
 The multi-stage image builds the React bundle with Node and ships only the Python runtime. It runs as a non-root user and keeps the demo database plus generated session secret in `/app/data`.
 
 ```bash
-docker build -t commerce-ops-desk:0.2.0 .
+SOURCE_SHA="$(git rev-parse HEAD)"
+docker build --build-arg "SOURCE_SHA=$SOURCE_SHA" -t commerce-ops-desk:0.2.1 .
 docker volume create commerce-ops-desk-data
 docker run --rm --name commerce-ops-desk \
-  -p 8000:8000 \
+  -p 127.0.0.1:8000:8000 \
   -e COMMERCE_OPS_COOKIE_SECURE=false \
   -v commerce-ops-desk-data:/app/data \
-  commerce-ops-desk:0.2.0
+  commerce-ops-desk:0.2.1
 ```
 
 The cookie override is only for direct local HTTP. Keep secure cookies enabled when TLS terminates in front of the container.
+
+### Review the deployment contract
+
+The repository includes a scoped [workstation deployment runbook](deploy/workstation/RUNBOOK.md) with immutable-image verification, an isolated candidate, exact Caddy route checks, a root-owned linear rollback ledger, current-head-only replay protection, and explicit fatal-stop reconciliation. These versioned assets are reviewable engineering evidence; they are not a claim that a particular public deployment or production SLA has been verified.
 
 Settings and local development default webhook intake off. The hosted demo launcher enables it by default and creates or reuses an isolated `data/.webhook-secret`. Production keeps it off unless `COMMERCE_OPS_WEBHOOK_ENABLED=true`; when enabled, production requires an independent `COMMERCE_OPS_WEBHOOK_MASTER_SECRET` or validated `COMMERCE_OPS_WEBHOOK_MASTER_SECRET_FILE` with mode `0600`. The current endpoint accepts only the closed synthetic `payment.failed` schema; it is not a real provider adapter.
 
 ## Verified scope and limits
 
-Version 0.2.0 combines the I01 hosted foundation, I02 demo identity boundary, I03 order/case vertical slice, and the I04 signed-webhook simulator slice. SQLite is intentionally limited to the single-node disposable demo. Hosted SQLite is placed on a host-local filesystem because WAL is unsafe on the workspace's NFS mount.
+The current 0.2.1 candidate hardens the hosted portfolio boundary around the I01 foundation, I02 demo identity boundary, I03 order/case vertical slice, and I04 signed-webhook simulator slice. SQLite is intentionally limited to the single-node disposable demo. Hosted SQLite is placed on a host-local filesystem because WAL is unsafe on the workspace's NFS mount.
 
 PostgreSQL 17 migration, constraint, readiness, transaction, and selected concurrency behavior run against a live service in CI. The signed webhook uses an HMAC-authenticated inbox and one business transaction; it is synchronous, synthetic, and safely supports retries from an at-least-once sender rather than claiming exactly-once delivery.
 

@@ -21,7 +21,8 @@ const demoBoundaries = [
   },
   {
     title: 'Single-node SQLite demo',
-    detail: 'A deliberately scoped sandbox; the PostgreSQL path is compiled offline only.',
+    detail:
+      'PostgreSQL 17 is exercised against a live service in CI; this hosted demo intentionally uses single-node SQLite.',
   },
   {
     title: '4-hour expiry',
@@ -151,7 +152,7 @@ export function DemoEntry({
 
       <section className="boundaries" aria-labelledby="boundaries-title">
         <div className="section-heading">
-          <h2 id="boundaries-title">Built for a safe public demo</h2>
+          <h2 id="boundaries-title">Boundaries of this synthetic demo</h2>
           <p>
             The sandbox is intentionally separate from live commerce systems.
           </p>

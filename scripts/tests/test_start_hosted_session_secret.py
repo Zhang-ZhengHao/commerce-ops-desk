@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
+import socket
 import stat
 import subprocess
 import sys
@@ -75,6 +77,10 @@ if [[ "${{1:-}}" == "-m" && "${{2:-}}" == "uvicorn" ]]; then
   : "${{COMMERCE_OPS_TEST_CAPTURE_FILE:?capture file is required}}"
   printf '%s' "${{COMMERCE_OPS_SESSION_SECRET:-}}" \
     > "$COMMERCE_OPS_TEST_CAPTURE_FILE"
+  if [[ -n "${{COMMERCE_OPS_TEST_ALLOWED_HOSTS_CAPTURE:-}}" ]]; then
+    printf '%s' "${{COMMERCE_OPS_ALLOWED_HOSTS:-}}" \
+      > "$COMMERCE_OPS_TEST_ALLOWED_HOSTS_CAPTURE"
+  fi
   if [[ -n "${{COMMERCE_OPS_TEST_UVICORN_ARGS_CAPTURE:-}}" ]]; then
     printf '%s\\0' "$@" > "$COMMERCE_OPS_TEST_UVICORN_ARGS_CAPTURE"
   fi
@@ -169,6 +175,33 @@ class HostedSessionSecretContractTest(unittest.TestCase):
         ]
         self.assertEqual(arguments[:3], ["-m", "uvicorn", "app.main:create_app"])
         self.assertIn("--no-access-log", arguments)
+        self.assertIn("--no-proxy-headers", arguments)
+        self.assertNotIn("--proxy-headers", arguments)
+
+    def test_demo_launcher_defaults_allowed_hosts_to_exact_local_addresses(
+        self,
+    ) -> None:
+        allowed_hosts_capture = self.hosted.root / "captured-allowed-hosts"
+
+        result, _ = self.hosted.run(
+            overrides={
+                "COMMERCE_OPS_TEST_ALLOWED_HOSTS_CAPTURE": str(allowed_hosts_capture),
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, self.output(result))
+        allowed_hosts = set(
+            json.loads(allowed_hosts_capture.read_text(encoding="utf-8"))
+        )
+        self.assertIn("127.0.0.1", allowed_hosts)
+        self.assertIn("localhost", allowed_hosts)
+
+        local_hostname = socket.gethostname().lower()
+        self.assertIn(local_hostname, allowed_hosts)
+
+        local_address = socket.gethostbyname(local_hostname)
+        if not local_address.startswith("127."):
+            self.assertIn(local_address, allowed_hosts)
 
     def test_explicit_secret_takes_priority_without_reading_or_changing_a_file(
         self,

@@ -37,7 +37,10 @@ def test_demo_routes_are_not_registered_when_demo_mode_is_disabled(
 def test_public_demo_environment_marks_the_session_cookie_secure(
     app_harness_factory: Callable[..., AppHarness],
 ) -> None:
-    harness = app_harness_factory(environment="demo")
+    harness = app_harness_factory(
+        environment="demo",
+        allowed_hosts=("commerceops.test",),
+    )
 
     with harness.client() as demo_client:
         response = demo_client.post(

@@ -4,6 +4,18 @@ All notable changes to CommerceOps Desk are documented here. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- Bounded hourly cleanup for expired synthetic workspaces and obsolete rate-limit windows, with safe failure metadata and a protected capacity sentinel.
+- Exact Host allowlisting, hardened-environment documentation shutdown, and versioned workstation Compose/Caddy deployment contracts.
+- A root-owned linear Caddy transaction head with current-head-only rollback and explicit fatal-stop reconciliation.
+- A visible synthetic portfolio notice with direct source and case-study links.
+
+### Changed
+
+- Runtime deployment evidence now requires an immutable source SHA, 1 CPU, 512 MiB memory, 128 PIDs, and bounded local Docker logs.
+- Maintenance scan indexes now include deterministic tie-break columns for SQLite and PostgreSQL.
+
 ## [0.2.0] - 2026-10-08
 
 ### Added

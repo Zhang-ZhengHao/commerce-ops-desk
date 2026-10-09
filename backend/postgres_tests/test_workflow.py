@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from threading import Barrier
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import text
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.services.demo_workspaces import GLOBAL_CAPACITY_LOCK_DIGEST
+from app.services.maintenance import run_maintenance_cycle
 
 if TYPE_CHECKING:
     from postgres_tests.conftest import PostgresAppHarness
@@ -248,3 +251,97 @@ def test_postgresql_capacity_lock_allows_only_one_concurrent_workspace(
 
     assert organization_count == 1
     assert capacity_rows == [(0,)]
+
+
+def test_postgresql_maintenance_cleans_expired_rows_but_preserves_boundaries(
+    postgres_app_harness: PostgresAppHarness,
+) -> None:
+    now = postgres_app_harness.clock()
+    cutoff = now - timedelta(hours=24)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    session_factory = cast(
+        sessionmaker[Session],
+        postgres_app_harness.app.state.session_factory,
+    )
+
+    with postgres_app_harness.engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO organizations (
+                    id, name, is_demo, case_note_count, webhook_event_count,
+                    created_at, expires_at
+                ) VALUES (
+                    :id, :name, :is_demo, 0, 0, :created_at, :expires_at
+                )
+                """
+            ),
+            [
+                {
+                    "id": "maintenance-expired-demo",
+                    "name": "Expired demo",
+                    "is_demo": True,
+                    "created_at": now - timedelta(days=1),
+                    "expires_at": now - timedelta(seconds=1),
+                },
+                {
+                    "id": "maintenance-active-demo",
+                    "name": "Active demo",
+                    "is_demo": True,
+                    "created_at": now,
+                    "expires_at": now + timedelta(hours=1),
+                },
+                {
+                    "id": "maintenance-expired-customer",
+                    "name": "Expired customer",
+                    "is_demo": False,
+                    "created_at": now - timedelta(days=1),
+                    "expires_at": now - timedelta(seconds=1),
+                },
+            ],
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO rate_limits (
+                    source_digest, window_start, count, updated_at
+                ) VALUES (
+                    :source_digest, :window_start, :count, :updated_at
+                )
+                """
+            ),
+            [
+                {
+                    "source_digest": "a" * 64,
+                    "window_start": cutoff - timedelta(microseconds=1),
+                    "count": 1,
+                    "updated_at": now,
+                },
+                {
+                    "source_digest": "b" * 64,
+                    "window_start": cutoff,
+                    "count": 1,
+                    "updated_at": now,
+                },
+                {
+                    "source_digest": GLOBAL_CAPACITY_LOCK_DIGEST,
+                    "window_start": epoch,
+                    "count": 0,
+                    "updated_at": now,
+                },
+            ],
+        )
+
+    result = run_maintenance_cycle(session_factory, now=now)
+
+    with postgres_app_harness.engine.connect() as connection:
+        organization_ids = set(connection.scalars(text("SELECT id FROM organizations")))
+        rate_limit_digests = set(connection.scalars(text("SELECT source_digest FROM rate_limits")))
+
+    assert result.expired_workspaces_deleted == 1
+    assert result.obsolete_rate_limits_deleted == 1
+    assert organization_ids == {
+        "maintenance-active-demo",
+        "maintenance-expired-customer",
+    }
+    assert rate_limit_digests == {"b" * 64, GLOBAL_CAPACITY_LOCK_DIGEST}

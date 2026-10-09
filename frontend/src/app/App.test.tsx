@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -144,6 +144,27 @@ afterEach(() => {
 });
 
 describe('CommerceOps Desk demo identity', () => {
+  it('labels the synthetic portfolio boundary and links to public evidence', async () => {
+    installFetch(jsonResponse({ detail: 'Not authenticated' }, 401));
+
+    render(<App />);
+    await screen.findByRole('button', { name: /enter as manager/i });
+
+    const footer = screen.getByRole('contentinfo');
+    expect(footer).toHaveTextContent(/synthetic portfolio demo/i);
+    expect(footer).toHaveTextContent(/all data and outcomes are fictional/i);
+    expect(within(footer).getByRole('link', { name: /source code/i })).toHaveAttribute(
+      'href',
+      'https://github.com/Zhang-ZhengHao/commerce-ops-desk',
+    );
+    expect(
+      within(footer).getByRole('link', { name: /engineering case study/i }),
+    ).toHaveAttribute(
+      'href',
+      'https://github.com/Zhang-ZhengHao/commerce-ops-desk/blob/main/docs/design-summary.md',
+    );
+  });
+
   it('checks for a session before offering enabled Manager and Agent entry actions', async () => {
     const fetchMock = installFetch(jsonResponse({ detail: 'Not authenticated' }, 401));
 
@@ -159,8 +180,13 @@ describe('CommerceOps Desk demo identity', () => {
       }),
     ).toBeVisible();
     expect(
-      screen.getByRole('heading', { name: /built for a safe public demo/i }),
+      screen.getByRole('heading', { name: /boundaries of this synthetic demo/i }),
     ).toBeVisible();
+    expect(
+      screen.getByText(/postgresql 17 is exercised against a live service in ci/i),
+    ).toBeVisible();
+    expect(screen.queryByText(/safe public demo/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/compiled offline only/i)).not.toBeInTheDocument();
     expect(
       screen.getByRole('heading', { name: /operational workflow/i }),
     ).toBeVisible();

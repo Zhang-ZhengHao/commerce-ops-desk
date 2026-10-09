@@ -19,7 +19,8 @@ DEMO_IDENTITY_REVISION = "0002_demo_identity"
 BOOTSTRAP_IDEMPOTENCY_REVISION = "0003_bootstrap_idempotency"
 ORDER_CASE_REVISION = "0004_order_case"
 WEBHOOK_INBOX_REVISION = "0005_webhook_inbox"
-HEAD_REVISION = WEBHOOK_INBOX_REVISION
+MAINTENANCE_INDEXES_REVISION = "0006_maintenance_indexes"
+HEAD_REVISION = MAINTENANCE_INDEXES_REVISION
 DEMO_IDENTITY_TABLES = {
     "organizations",
     "users",
@@ -219,6 +220,56 @@ def test_postgresql_offline_sql_preserves_fresh_install_and_backfill_safety() ->
     assert "0005_webhook_inbox requires an online migration" in output
     assert "WHERE is_demo IS TRUE" in output
     assert "UPDATE alembic_version SET version_num='0005_webhook_inbox'" in output
+    assert "ix_organizations_demo_expiry" in output
+    assert "ix_rate_limits_window_source" in output
+    assert "UPDATE alembic_version SET version_num='0006_maintenance_indexes'" in output
+
+
+def test_maintenance_indexes_revision_round_trips_on_sqlite(tmp_path: Path) -> None:
+    database_path = tmp_path / "maintenance-indexes.sqlite3"
+
+    previous = run_upgrade(database_path, target=WEBHOOK_INBOX_REVISION)
+    assert previous.returncode == 0, previous.stdout + previous.stderr
+    assert ("is_demo", "expires_at") in read_index_shapes(
+        database_path,
+        "organizations",
+    )
+    assert ("window_start", "source_digest") not in read_index_shapes(
+        database_path,
+        "rate_limits",
+    )
+
+    upgrade = run_upgrade(database_path, target=MAINTENANCE_INDEXES_REVISION)
+    assert upgrade.returncode == 0, upgrade.stdout + upgrade.stderr
+    assert read_applied_revision(database_path) == MAINTENANCE_INDEXES_REVISION
+    assert ("is_demo", "expires_at", "id") in read_index_shapes(
+        database_path,
+        "organizations",
+    )
+    assert ("is_demo", "expires_at") not in read_index_shapes(
+        database_path,
+        "organizations",
+    )
+    assert ("window_start", "source_digest") in read_index_shapes(
+        database_path,
+        "rate_limits",
+    )
+
+    downgrade = run_downgrade(database_path, target=WEBHOOK_INBOX_REVISION)
+    assert downgrade.returncode == 0, downgrade.stdout + downgrade.stderr
+    assert read_applied_revision(database_path) == WEBHOOK_INBOX_REVISION
+    assert ("is_demo", "expires_at") in read_index_shapes(
+        database_path,
+        "organizations",
+    )
+    assert ("is_demo", "expires_at", "id") not in read_index_shapes(
+        database_path,
+        "organizations",
+    )
+    assert ("window_start", "source_digest") not in read_index_shapes(
+        database_path,
+        "rate_limits",
+    )
 
 
 def test_upgrade_head_is_repeatable_for_an_up_to_date_database(tmp_path: Path) -> None:
@@ -505,7 +556,7 @@ def test_webhook_inbox_upgrade_backfills_one_integration_per_demo_organization(
 
     assert upgrade_result.returncode == 0, upgrade_result.stdout + upgrade_result.stderr
     assert repeat_result.returncode == 0, repeat_result.stdout + repeat_result.stderr
-    assert read_applied_revision(database_path) == WEBHOOK_INBOX_REVISION
+    assert read_applied_revision(database_path) == HEAD_REVISION
     with sqlite3.connect(database_path) as connection:
         integrations = connection.execute(
             """

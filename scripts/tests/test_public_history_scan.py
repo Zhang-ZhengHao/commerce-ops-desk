@@ -51,6 +51,19 @@ class TemporaryGitRepository:
         self.git("add", "--all")
         self.git("commit", "--quiet", "--message", message)
 
+    def is_ignored(self, relative_path: str) -> bool:
+        result = subprocess.run(
+            ["git", "check-ignore", "--quiet", "--", relative_path],
+            cwd=self.path,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode not in {0, 1}:
+            raise RuntimeError("git check-ignore could not inspect the fixture path")
+        return result.returncode == 0
+
 
 class PublicHistoryScanTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -76,6 +89,87 @@ class PublicHistoryScanTest(unittest.TestCase):
     def seed_clean_commit(self) -> None:
         self.repository.write_text("README.md", "# Public scan fixture\n")
         self.repository.commit_all("seed clean repository")
+
+    def test_project_gitignore_scopes_generated_runtime_state(self) -> None:
+        project_ignore = (PRODUCT_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.repository.write_text(".gitignore", project_ignore)
+
+        ignored_paths = (
+            "data/local.sqlite",
+            "data-live/runtime.payload",
+            "data-candidate-deadbeef/runtime.payload",
+            "deploy-state/candidate.json",
+            ".session-secret",
+            "nested/.session-secret",
+            ".webhook-secret",
+            "nested/runtime/.webhook-secret",
+        )
+        for relative_path in ignored_paths:
+            with self.subTest(relative_path=relative_path):
+                self.assertTrue(self.repository.is_ignored(relative_path))
+
+        root_only_paths = (
+            "nested/data-live/runtime.payload",
+            "nested/data-candidate-deadbeef/runtime.payload",
+            "nested/deploy-state/candidate.json",
+        )
+        for relative_path in root_only_paths:
+            with self.subTest(relative_path=relative_path):
+                self.assertFalse(self.repository.is_ignored(relative_path))
+
+    def test_sensitive_runtime_basename_in_worktree_fails_without_content_match(
+        self,
+    ) -> None:
+        self.seed_clean_commit()
+        marker = "opaque-worktree-marker"
+        self.repository.write_text("runtime/.session-secret", marker + "\n")
+
+        result = self.run_scan()
+        output = self.output(result)
+
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("secret.generated_runtime_file", output)
+        self.assertIn("worktree:runtime/.session-secret", output)
+        self.assertNotIn(marker, output)
+
+    def test_force_added_runtime_secret_is_scanned_from_index(self) -> None:
+        self.repository.write_text(".gitignore", ".session-secret\n.webhook-secret\n")
+        self.repository.commit_all("ignore generated runtime secrets")
+        opaque_value = "n7Qv4mZ8pR2xT6kW9cH3sL5dF1bJ0gUy"
+        staged_path = self.repository.write_text(
+            "runtime/.webhook-secret", opaque_value + "\n"
+        )
+        self.repository.git("add", "--force", "runtime/.webhook-secret")
+        staged_path.write_text("safe-worktree-copy\n", encoding="utf-8")
+
+        result = self.run_scan()
+        output = self.output(result)
+
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("secret.generated_runtime_file", output)
+        self.assertIn("index:runtime/.webhook-secret", output)
+        self.assertNotIn(opaque_value, output)
+
+    def test_removed_runtime_secret_is_scanned_from_reachable_history(self) -> None:
+        self.repository.write_text(".gitignore", ".session-secret\n")
+        opaque_value = "x8Km2Qp7Vn4Ry6Tf9Jc3Wh5Ls1Zd0BgU"
+        self.repository.write_text("retained-safe-copy.txt", opaque_value + "\n")
+        self.repository.commit_all("ignore generated runtime secret")
+        secret_path = self.repository.write_text(
+            "runtime/.session-secret", opaque_value + "\n"
+        )
+        self.repository.git("add", "--force", "runtime/.session-secret")
+        self.repository.git("commit", "--quiet", "--message", "add runtime fixture")
+        secret_path.unlink()
+        self.repository.commit_all("remove runtime fixture")
+
+        result = self.run_scan()
+        output = self.output(result)
+
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("secret.generated_runtime_file", output)
+        self.assertIn("history-path:runtime/.session-secret", output)
+        self.assertNotIn(opaque_value, output)
 
     def test_clean_repository_passes_and_skips_ignored_and_binary_files(self) -> None:
         fake_token = "gh" + "p_" + ("A1" * 20)

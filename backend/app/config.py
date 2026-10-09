@@ -1,7 +1,8 @@
 """Runtime configuration with explicit database and public-demo boundaries."""
 
+import re
 import secrets
-from ipaddress import IPv4Network, IPv6Network, ip_network
+from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -11,6 +12,7 @@ from sqlalchemy.exc import ArgumentError
 
 Environment = Literal["development", "test", "demo", "production"]
 IPNetwork = IPv4Network | IPv6Network
+HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 
 class Settings(BaseSettings):
@@ -40,7 +42,13 @@ class Settings(BaseSettings):
     webhook_source_minute_limit: int = Field(default=120, gt=0)
     demo_webhook_event_limit: int = Field(default=20, gt=0)
     api_max_request_body_bytes: int = Field(default=16 * 1024, gt=0)
+    maintenance_shutdown_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
     trusted_proxy_cidrs: tuple[str, ...] = ()
+    allowed_hosts: tuple[str, ...] = ()
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -87,6 +95,33 @@ class Settings(BaseSettings):
             raise ValueError("trusted proxy entries must be valid CIDR networks") from None
         return value
 
+    @field_validator("allowed_hosts")
+    @classmethod
+    def validate_allowed_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized_hosts: list[str] = []
+        for raw_host in value:
+            if raw_host != raw_host.strip() or not raw_host:
+                raise ValueError("allowed host must be an exact hostname or IPv4 address")
+
+            host = raw_host.lower()
+            try:
+                address = ip_address(host)
+            except ValueError:
+                labels = host.split(".")
+                if len(host) > 253 or any(HOST_LABEL.fullmatch(label) is None for label in labels):
+                    raise ValueError(
+                        "allowed host must be an exact hostname or IPv4 address"
+                    ) from None
+            else:
+                if address.version != 4:
+                    raise ValueError("allowed host must be an exact hostname or IPv4 address")
+                host = address.compressed
+
+            if host not in normalized_hosts:
+                normalized_hosts.append(host)
+
+        return tuple(normalized_hosts)
+
     @model_validator(mode="after")
     def resolve_security_defaults(self) -> "Settings":
         if self.demo_mode is None:
@@ -99,6 +134,9 @@ class Settings(BaseSettings):
 
         if self.webhook_enabled and self.webhook_master_secret is None:
             raise ValueError("enabled webhook requires a webhook master secret")
+
+        if self.environment in {"demo", "production"} and not self.allowed_hosts:
+            raise ValueError("demo and production require at least one allowed host")
 
         session_secret = self.session_secret
         if (

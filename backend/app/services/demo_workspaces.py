@@ -15,7 +15,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.auth.session import TokenFactory, create_session, keyed_digest
 from app.config import Settings
@@ -67,11 +67,24 @@ class DatabaseExpiredWorkspaceCleaner:
     """Cleanup implementation; scheduling deliberately belongs to I08."""
 
     def cleanup(self, db: Session, *, now: datetime) -> int:
+        candidate = aliased(Organization)
+        expired_ids = (
+            select(candidate.id)
+            .where(
+                candidate.is_demo.is_(True),
+                candidate.expires_at <= now,
+            )
+            .order_by(candidate.expires_at, candidate.id)
+            .limit(100)
+        )
         result = db.execute(
-            delete(Organization).where(
+            delete(Organization)
+            .where(
                 Organization.is_demo.is_(True),
                 Organization.expires_at <= now,
+                Organization.id.in_(expired_ids),
             )
+            .execution_options(synchronize_session=False)
         )
         cursor_result = cast(CursorResult[Any], result)
         return int(cursor_result.rowcount or 0)

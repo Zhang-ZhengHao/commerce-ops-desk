@@ -24,13 +24,14 @@ from postgres_tests.harness import (
 )
 
 CONTAINER_IMAGE_ENV = "COMMERCE_OPS_CONTAINER_IMAGE"
+SOURCE_SHA_ENV = "COMMERCE_OPS_SOURCE_SHA"
 CONTAINER_DATABASE_HOST = "host.docker.internal"
 CONTAINER_PORT = 18_137
 CONTAINER_TIMEOUT_SECONDS = 120.0
 COMMAND_TIMEOUT_SECONDS = 15.0
 DOCKER_RUN_TIMEOUT_SECONDS = 30.0
 HEALTH_POLL_SECONDS = 0.5
-EXPECTED_REVISION = "0005_webhook_inbox"
+EXPECTED_REVISION = "0006_maintenance_indexes"
 DATA_TMPFS_TARGET = "/app/data"
 DATA_TMPFS_OPTIONS = (
     "rw",
@@ -41,6 +42,18 @@ DATA_TMPFS_OPTIONS = (
     "gid=10001",
     "mode=0700",
 )
+RUNTIME_TMPFS_TARGET = "/tmp"
+RUNTIME_TMPFS_OPTIONS = (
+    "rw",
+    "noexec",
+    "nosuid",
+    "nodev",
+    "uid=10001",
+    "gid=10001",
+    "mode=1777",
+    "size=64m",
+)
+ALLOWED_HOSTS_VALUE = '["127.0.0.1","localhost"]'
 SENSITIVE_ENVIRONMENT_NAMES = (
     "COMMERCE_OPS_DATABASE_URL",
     "COMMERCE_OPS_SESSION_SECRET",
@@ -48,6 +61,7 @@ SENSITIVE_ENVIRONMENT_NAMES = (
 RUNTIME_ENVIRONMENT_NAMES = (
     *SENSITIVE_ENVIRONMENT_NAMES,
     "COMMERCE_OPS_ENVIRONMENT",
+    "COMMERCE_OPS_ALLOWED_HOSTS",
     "PORT",
 )
 ABSENT_IMAGE_PATHS = (
@@ -227,6 +241,7 @@ def _assert_container_configuration(
     container_name: str,
     container_id: str,
     image: str,
+    source_sha: str,
     database_url: str,
     session_secret: str,
 ) -> int:
@@ -241,6 +256,11 @@ def _assert_container_configuration(
         "Container image is configured to run as root",
     )
     _require(config.get("Image") == image, "Docker ran an unexpected image")
+    labels = _as_mapping(config.get("Labels"), label="Docker image labels")
+    _require(
+        labels.get("org.opencontainers.image.revision") == source_sha,
+        "Container image revision does not match the tested source SHA",
+    )
 
     environment_entries = _as_list(config.get("Env"), label="Container environment")
     container_environment = {
@@ -261,6 +281,10 @@ def _assert_container_configuration(
         "Container is not running with the production environment boundary",
     )
     _require(
+        container_environment.get("COMMERCE_OPS_ALLOWED_HOSTS") == ALLOWED_HOSTS_VALUE,
+        "Container does not enforce the expected local Host boundary",
+    )
+    _require(
         container_environment.get("PORT") == str(CONTAINER_PORT),
         "Container did not receive the selected internal port",
     )
@@ -268,6 +292,23 @@ def _assert_container_configuration(
     host_config = _as_mapping(inspection.get("HostConfig"), label="Docker HostConfig")
     _require(host_config.get("Privileged") is False, "Container is privileged")
     _require(host_config.get("ReadonlyRootfs") is True, "Root filesystem is writable")
+    _require(host_config.get("NanoCpus") == 1_000_000_000, "Container CPU limit changed")
+    _require(host_config.get("Memory") == 512 * 1024 * 1024, "Container memory limit changed")
+    _require(host_config.get("PidsLimit") == 128, "Container PID limit changed")
+    restart_policy = _as_mapping(
+        host_config.get("RestartPolicy"),
+        label="Docker restart policy",
+    )
+    _require(
+        restart_policy.get("Name") == "unless-stopped",
+        "Container restart policy changed",
+    )
+    log_config = _as_mapping(host_config.get("LogConfig"), label="Docker log config")
+    _require(log_config.get("Type") == "local", "Container log driver is not local")
+    _require(
+        log_config.get("Config") == {"max-size": "10m", "max-file": "3"},
+        "Container log rotation options changed",
+    )
 
     cap_drop = host_config.get("CapDrop")
     _require(
@@ -282,7 +323,10 @@ def _assert_container_configuration(
     _require(host_config.get("Binds") in (None, []), "Container has a bind mount")
 
     tmpfs = _as_mapping(host_config.get("Tmpfs"), label="Docker tmpfs configuration")
-    _require(set(tmpfs) == {DATA_TMPFS_TARGET}, "Container must have exactly one tmpfs")
+    _require(
+        set(tmpfs) == {DATA_TMPFS_TARGET, RUNTIME_TMPFS_TARGET},
+        "Container tmpfs targets changed",
+    )
     tmpfs_options = tmpfs.get(DATA_TMPFS_TARGET)
     if not isinstance(tmpfs_options, str):
         raise ContainerProofError("Container data tmpfs options are unavailable")
@@ -290,15 +334,31 @@ def _assert_container_configuration(
         set(tmpfs_options.split(",")) == set(DATA_TMPFS_OPTIONS),
         "Container data tmpfs is not hardened as required",
     )
+    runtime_tmpfs_options = tmpfs.get(RUNTIME_TMPFS_TARGET)
+    if not isinstance(runtime_tmpfs_options, str):
+        raise ContainerProofError("Container runtime tmpfs options are unavailable")
+    _require(
+        set(runtime_tmpfs_options.split(",")) == set(RUNTIME_TMPFS_OPTIONS),
+        "Container runtime tmpfs is not hardened as required",
+    )
 
     mounts = _as_list(inspection.get("Mounts"), label="Docker mounts")
-    _require(len(mounts) <= 1, "Unexpected container mount")
-    if mounts:
-        mount = _as_mapping(mounts[0], label="Docker mount")
-        _require(
-            mount.get("Type") == "tmpfs" and mount.get("Destination") == DATA_TMPFS_TARGET,
-            "The only reported container mount must be the data tmpfs",
+    _require(len(mounts) <= 2, "Unexpected container mount")
+    mount_shapes = {
+        (
+            _as_mapping(mount, label="Docker mount").get("Type"),
+            _as_mapping(mount, label="Docker mount").get("Destination"),
         )
+        for mount in mounts
+    }
+    _require(
+        mount_shapes
+        <= {
+            ("tmpfs", DATA_TMPFS_TARGET),
+            ("tmpfs", RUNTIME_TMPFS_TARGET),
+        },
+        "Container reported an unexpected mount",
+    )
 
     port_key = f"{CONTAINER_PORT}/tcp"
     port_bindings = _as_mapping(
@@ -477,6 +537,13 @@ def test_hardened_container_migrates_and_serves_postgresql(
         pytest.fail(f"{CONTAINER_IMAGE_ENV} must name the image under test", pytrace=False)
     if image != image.strip():
         pytest.fail(f"{CONTAINER_IMAGE_ENV} must not contain surrounding whitespace", pytrace=False)
+    source_sha = os.environ.get(SOURCE_SHA_ENV)
+    if (
+        source_sha is None
+        or len(source_sha) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in source_sha)
+    ):
+        pytest.fail(f"{SOURCE_SHA_ENV} must be a full lowercase source SHA", pytrace=False)
 
     docker = shutil.which("docker")
     if docker is None:
@@ -515,6 +582,7 @@ def test_hardened_container_migrates_and_serves_postgresql(
             "COMMERCE_OPS_DATABASE_URL": rendered_database_url,
             "COMMERCE_OPS_SESSION_SECRET": session_secret,
             "COMMERCE_OPS_ENVIRONMENT": "production",
+            "COMMERCE_OPS_ALLOWED_HOSTS": ALLOWED_HOSTS_VALUE,
             "PORT": str(CONTAINER_PORT),
         }
     )
@@ -524,9 +592,25 @@ def test_hardened_container_migrates_and_serves_postgresql(
         "--detach",
         "--name",
         container_name,
+        "--restart",
+        "unless-stopped",
+        "--cpus",
+        "1.0",
+        "--memory",
+        "512m",
+        "--pids-limit",
+        "128",
+        "--log-driver",
+        "local",
+        "--log-opt",
+        "max-size=10m",
+        "--log-opt",
+        "max-file=3",
         "--read-only",
         "--tmpfs",
         f"{DATA_TMPFS_TARGET}:{','.join(DATA_TMPFS_OPTIONS)}",
+        "--tmpfs",
+        f"{RUNTIME_TMPFS_TARGET}:{','.join(RUNTIME_TMPFS_OPTIONS)}",
         "--cap-drop",
         "ALL",
         "--security-opt",
@@ -586,6 +670,7 @@ def test_hardened_container_migrates_and_serves_postgresql(
             container_name=container_name,
             container_id=container_id,
             image=image,
+            source_sha=source_sha,
             database_url=rendered_database_url,
             session_secret=session_secret,
         )

@@ -29,6 +29,15 @@ class ContainerPackagingContractTest(unittest.TestCase):
         self.assertIn("HEALTHCHECK", dockerfile)
         self.assertNotRegex(dockerfile, re.compile(r"(?i)(password|secret|token)=\S+"))
 
+    def test_runtime_image_records_the_exact_source_revision(self) -> None:
+        dockerfile = (PRODUCT_ROOT / "Dockerfile").read_text()
+
+        self.assertRegex(dockerfile, r"(?m)^ARG SOURCE_SHA$")
+        self.assertIn(
+            'LABEL org.opencontainers.image.revision="$SOURCE_SHA"', dockerfile
+        )
+        self.assertIn('RUN test -n "$SOURCE_SHA"', dockerfile)
+
     def test_healthcheck_uses_the_runtime_port_and_database_readiness(self) -> None:
         dockerfile = (PRODUCT_ROOT / "Dockerfile").read_text()
 

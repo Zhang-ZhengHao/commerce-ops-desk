@@ -281,7 +281,29 @@ export function App() {
       </main>
 
       <footer className="site-footer">
-        <p>A verifiable full-stack reference. It does not connect to a live merchant system.</p>
+        <div className="footer-copy">
+          <p className="footer-label">Synthetic portfolio demo</p>
+          <p>
+            All data and outcomes are fictional. This demo does not connect to a live
+            merchant system.
+          </p>
+        </div>
+        <nav className="footer-links" aria-label="Project evidence">
+          <a
+            href="https://github.com/Zhang-ZhengHao/commerce-ops-desk"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Source code
+          </a>
+          <a
+            href="https://github.com/Zhang-ZhengHao/commerce-ops-desk/blob/main/docs/design-summary.md"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Engineering case study
+          </a>
+        </nav>
       </footer>
     </div>
   );

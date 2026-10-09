@@ -62,6 +62,25 @@ jobs:
       - name: Project contract tests
         run: make project-test
 
+      - name: Verified workstation image builder tests
+        run: .venv/bin/python -m pytest -q scripts/tests/test_verified_image_build.py
+
+      - name: Validate workstation Compose and Caddy 2.6.2 syntax
+        env:
+          SOURCE_SHA: 0123456789abcdef0123456789abcdef01234567
+          HOST_PORT: "18088"
+          DATA_DIR: /var/tmp/commerce-ops-candidate-ci
+          TRUSTED_PROXY_CIDRS_JSON: '["127.0.0.1/32"]'
+        run: |
+          docker compose -f deploy/workstation/compose.yaml config --quiet
+          for caddy_template in \
+            deploy/workstation/commerce-ops-desk.Caddyfile.template \
+            deploy/workstation/commerce-ops-desk.v0.2.0.Caddyfile.template
+          do
+            sed 's/{{UPSTREAM_PORT}}/18088/g' "$caddy_template" |
+              docker run --rm --interactive --network none --entrypoint caddy caddy:2.6.2-alpine@sha256:7992b931b7da3cf0840dd69ea74b2c67d423faf03408da8abdc31b7590a239a7 adapt --adapter caddyfile --config /dev/stdin
+          done
+
       - name: SQLite migration proof
         run: make sqlite-migrate-test
 
@@ -99,6 +118,7 @@ jobs:
       contents: read
     env:
       COMMERCE_OPS_CONTAINER_IMAGE: commerce-ops-desk:postgres-ci
+      COMMERCE_OPS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     services:
       postgres:
         image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
@@ -146,7 +166,7 @@ jobs:
         run: make postgres-test
 
       - name: Build production image
-        run: docker build --file Dockerfile --tag "$COMMERCE_OPS_CONTAINER_IMAGE" .
+        run: docker build --build-arg "SOURCE_SHA=$COMMERCE_OPS_SOURCE_SHA" --file Dockerfile --tag "$COMMERCE_OPS_CONTAINER_IMAGE" .
 
       - name: Prove hardened production container
         env:

@@ -1,0 +1,39 @@
+services:
+  commerce-ops-desk:
+    image: commerce-ops-desk:${SOURCE_SHA:?source SHA required}
+    pull_policy: never
+    container_name: ${CONTAINER_NAME:-app-commerce-ops-desk}
+    user: "10001:10001"
+    init: true
+    restart: unless-stopped
+    environment:
+      COMMERCE_OPS_ENVIRONMENT: demo
+      COMMERCE_OPS_ALLOWED_HOSTS: '["commerce-ops-desk.srrsh.aig.rest","127.0.0.1","localhost"]'
+      COMMERCE_OPS_TRUSTED_PROXY_CIDRS: '${TRUSTED_PROXY_CIDRS_JSON:?trusted proxy CIDR JSON required}'
+      COMMERCE_OPS_COOKIE_SECURE: "true"
+      COMMERCE_OPS_WEBHOOK_ENABLED: "true"
+      PORT: "8000"
+    ports:
+      - "127.0.0.1:${HOST_PORT:?host port required}:8000"
+    volumes:
+      - type: bind
+        source: "${DATA_DIR:?data directory required}"
+        target: /app/data
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: "1.0"
+    mem_limit: 512m
+    pids_limit: 128
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    stop_grace_period: 30s

@@ -103,7 +103,7 @@ def test_trusted_direct_proxy_uses_forwarded_source_without_storing_the_address(
 ) -> None:
     harness = app_harness_factory(
         demo_source_hourly_limit=1,
-        trusted_proxy_cidrs=("192.0.2.0/24",),
+        trusted_proxy_cidrs=("192.0.2.3/32",),
     )
 
     with harness.client(source_ip="192.0.2.3") as client:
@@ -123,19 +123,35 @@ def test_trusted_direct_proxy_uses_forwarded_source_without_storing_the_address(
     assert all("198.51.100" not in digest for (digest,) in stored_digests)
 
 
+def test_neighboring_untrusted_peer_cannot_select_a_forwarded_identity(
+    app_harness_factory: Callable[..., AppHarness],
+) -> None:
+    harness = app_harness_factory(
+        demo_source_hourly_limit=1,
+        trusted_proxy_cidrs=("192.0.2.3/32",),
+    )
+
+    with harness.client(source_ip="192.0.2.4") as client:
+        first = _bootstrap(client, forwarded_for="198.51.100.31")
+        repeated = _bootstrap(client, forwarded_for="198.51.100.32")
+
+    assert first.status_code == 201
+    assert repeated.status_code == 429
+
+
 def test_trusted_proxy_chain_ignores_spoofed_leftmost_addresses(
     app_harness_factory: Callable[..., AppHarness],
 ) -> None:
     harness = app_harness_factory(
         demo_source_hourly_limit=2,
-        trusted_proxy_cidrs=("192.0.2.0/24",),
+        trusted_proxy_cidrs=("192.0.2.3/32",),
     )
 
     with harness.client(source_ip="192.0.2.3") as client:
         responses = [
             _bootstrap(
                 client,
-                forwarded_for=f"203.0.113.{index}, 198.51.100.77, 192.0.2.4",
+                forwarded_for=f"203.0.113.{index}, 198.51.100.77",
             )
             for index in range(1, 4)
         ]
@@ -148,7 +164,7 @@ def test_invalid_trusted_proxy_chain_falls_back_to_the_direct_source(
 ) -> None:
     harness = app_harness_factory(
         demo_source_hourly_limit=1,
-        trusted_proxy_cidrs=("192.0.2.0/24",),
+        trusted_proxy_cidrs=("192.0.2.3/32",),
     )
 
     with harness.client(source_ip="192.0.2.3") as client:
@@ -222,7 +238,7 @@ def test_capacity_lock_identity_does_not_depend_on_the_session_secret(
     assert capacity_lock_rows == (1,)
 
 
-def test_expired_workspace_cleanup_is_an_explicit_unscheduled_service(
+def test_expired_workspace_cleanup_cascades_dependent_demo_data(
     app_harness: AppHarness,
 ) -> None:
     with app_harness.client() as client:

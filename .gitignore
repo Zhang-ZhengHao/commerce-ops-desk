@@ -31,6 +31,10 @@ frontend/coverage/
 *.sqlite
 *.sqlite3
 data/
+/data-*/
+/deploy-state/
+.session-secret
+.webhook-secret
 
 # Browser-test artifacts
 frontend/playwright-report/

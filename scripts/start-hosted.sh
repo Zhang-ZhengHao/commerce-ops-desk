@@ -72,6 +72,45 @@ cd "$PRODUCT_DIR"
 
 export COMMERCE_OPS_ENVIRONMENT="${COMMERCE_OPS_ENVIRONMENT:-demo}"
 
+if [[ "$COMMERCE_OPS_ENVIRONMENT" == "demo" ]] && \
+  [[ -z "${COMMERCE_OPS_ALLOWED_HOSTS:-}" ]]; then
+  COMMERCE_OPS_ALLOWED_HOSTS="$("$PYTHON_BIN" -c '
+import ipaddress
+import json
+import re
+import socket
+
+label = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+hosts = ["127.0.0.1", "localhost"]
+hostname = socket.gethostname().lower().rstrip(".")
+
+if (
+    hostname
+    and len(hostname) <= 253
+    and all(label.fullmatch(part) is not None for part in hostname.split("."))
+):
+    hosts.append(hostname)
+
+try:
+    addresses = socket.getaddrinfo(
+        hostname,
+        None,
+        family=socket.AF_INET,
+        type=socket.SOCK_STREAM,
+    )
+except OSError:
+    addresses = ()
+
+for address in addresses:
+    normalized = str(ipaddress.IPv4Address(address[4][0]))
+    if normalized not in hosts:
+        hosts.append(normalized)
+
+print(json.dumps(hosts, separators=(",", ":")))
+')"
+  export COMMERCE_OPS_ALLOWED_HOSTS
+fi
+
 if [[ -z "${COMMERCE_OPS_DATABASE_URL:-}" ]]; then
   if [[ "$COMMERCE_OPS_ENVIRONMENT" == "production" ]]; then
     echo "[commerce-ops-desk] production requires an explicit database URL" >&2

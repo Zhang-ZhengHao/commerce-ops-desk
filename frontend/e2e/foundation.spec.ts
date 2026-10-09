@@ -17,7 +17,7 @@ test.describe('I01 hosted foundation', () => {
     });
   });
 
-  test('renders the public product promise and offers both demo roles', async ({
+  test('renders the synthetic demo promise and offers both demo roles', async ({
     page,
   }) => {
     await page.goto('/');
@@ -30,7 +30,10 @@ test.describe('I01 hosted foundation', () => {
       }),
     ).toBeVisible();
     await expect(
-      page.getByRole('heading', { level: 2, name: 'Built for a safe public demo' }),
+      page.getByRole('heading', {
+        level: 2,
+        name: 'Boundaries of this synthetic demo',
+      }),
     ).toBeVisible();
     await expect(
       page.getByRole('heading', { level: 2, name: 'Operational workflow' }),

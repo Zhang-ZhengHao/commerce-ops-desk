@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 import { defineConfig, devices } from '@playwright/test';
 
+import { prepareE2EDatabase } from './e2e/database-lifecycle';
+
 const frontendDirectory = path.dirname(fileURLToPath(import.meta.url));
 const productDirectory = path.resolve(frontendDirectory, '..');
 const externalBaseURL = process.env.PLAYWRIGHT_BASE_URL?.replace(/\/+$/, '');
@@ -89,15 +91,21 @@ function e2eDatabaseDirectory(): string {
   return fallbackDirectory;
 }
 
+const preparedDatabase =
+  hostedPort === undefined
+    ? undefined
+    : prepareE2EDatabase({
+        directory: e2eDatabaseDirectory(),
+        pid: process.pid,
+        port: hostedPort,
+      });
+
 function hostedEnvironment(): Record<string, string> {
-  if (hostedPort === undefined) {
+  if (hostedPort === undefined || preparedDatabase === undefined) {
     throw new Error('The internal E2E web server requires a reserved port.');
   }
 
-  const databasePath = path.join(
-    e2eDatabaseDirectory(),
-    `commerce-ops-desk-playwright-${process.pid}-${hostedPort}.sqlite3`,
-  );
+  const databasePath = preparedDatabase.databasePath;
 
   const inheritedEnvironment = Object.fromEntries(
     Object.entries(process.env).filter(
@@ -126,6 +134,7 @@ function hostedEnvironment(): Record<string, string> {
 
 export default defineConfig({
   testDir: './e2e',
+  testIgnore: '**/*.test.ts',
   outputDir: './test-results',
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
@@ -146,6 +155,7 @@ export default defineConfig({
   ...(externalBaseURL
     ? {}
     : {
+        globalTeardown: './e2e/database-global-teardown.ts',
         webServer: {
           command: 'npm run build && bash ../scripts/start-hosted.sh',
           cwd: frontendDirectory,

@@ -10,7 +10,14 @@ from app.database import Base
 
 class Organization(Base):
     __tablename__ = "organizations"
-    __table_args__ = (Index("ix_organizations_demo_expiry", "is_demo", "expires_at"),)
+    __table_args__ = (
+        Index(
+            "ix_organizations_demo_expiry",
+            "is_demo",
+            "expires_at",
+            "id",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)

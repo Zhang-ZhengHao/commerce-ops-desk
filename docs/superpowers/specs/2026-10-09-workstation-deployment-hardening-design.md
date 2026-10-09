@@ -21,6 +21,17 @@ This preserves useful deployment evidence for the portfolio while avoiding new
 registry or signing infrastructure that is not available in the current
 environment.
 
+The human deployment operator is part of the trusted computing base. The
+versioned helper invokes isolated Python under `sudo`, but its embedded root
+code is supplied by the operator's checkout; it is not a preinstalled,
+root-owned program with a restricted sudoers interface. Root ownership of the
+ledger therefore protects the chain from unprivileged application processes,
+accidental same-user file writes, stale operations, and replay through this
+helper. It does not protect against a malicious operator who can alter the
+helper or invoke equivalent root commands. Building that stronger boundary
+would require a separately installed root-owned helper and constrained
+sudoers policy and is outside this revision.
+
 Two alternatives were rejected for this revision:
 
 - Replacing the helper with a manual runbook would reduce implementation risk
@@ -62,22 +73,32 @@ writers are explicitly outside this automation boundary and must coordinate
 changes on the same lock. The design does not claim to eliminate the root-level
 TOCTOU window between a digest read and a later replacement.
 
-Each backup is accompanied by provenance stored in a root-owned deployment
-ledger outside the deploy user's writable backup directory. The ledger binds
-the backup's canonical path, content digest, creation transaction, the one
-allowed CommerceOps site identity, and explicit `backup_profile` and
-`installed_profile` values. Rollback accepts only a ledger entry and a fragment
-that passes a structural allowlist: exactly the CommerceOps address, exactly
-one expected reverse-proxy upstream, and no additional site block. Self-named
-files without root-owned provenance are rejected.
+Each change creates an immutable schema-3 transaction in a root-owned `0700`
+directory. Its canonical ledger binds a random bootstrap ID, transaction ID,
+operation, exact parent transaction and active-byte digest, the one allowed
+CommerceOps site, and complete backup and installed `RouteState` values. A
+route state includes the fragment digest, managed profile, route revision,
+full Docker/network/data/runtime upstream identity, and deployment-asset
+identity where applicable. Backup and ledger files are installed as `0600`
+root files through a no-clobber hard-link publication step. Their inode and
+containing directory are explicitly fsynced before a head can reference them.
 
-The first hardened cutover must also accept the exact currently deployed
-legacy CommerceOps fragment as an input and rollback profile. That profile is
-frozen as a versioned template and compared through Caddy's adapted JSON just
-like the hardened template. It is accepted only for reading, backup, automatic
-restore, and trusted-ledger rollback; every new candidate installation must use
-the hardened canonical profile. A permissive "any one-site fragment" migration
-is not allowed.
+The root-owned canonical schema-1 `active.json` is the only rollback authority.
+It binds the current transaction ledger by exact path and byte digest and
+repeats its installed route. Loading a head verifies active, ledger, and backup
+ownership and canonical bytes; derived paths; all cross-record identities; the
+backup byte digest; and its exact managed structure. Rollback accepts only the
+backup named by that current head. It creates a new transaction and advances
+the head, so T1 cannot be replayed after a T1 rollback has produced T2.
+
+The first hardened cutover may bootstrap only when `active.json` is absent and
+the current deployment matches the complete frozen legacy identity: exact
+fragment bytes and port, exact adapted active Caddy route, readiness without a
+revision header, and the read-only-observed Docker daemon, container, image,
+data directory, network endpoint, and runtime fingerprint. That profile is
+accepted only for reading, backup, automatic restore, and current-head
+rollback; every new candidate installation must use the hardened canonical
+profile. A permissive "any one-site fragment" migration is not allowed.
 
 The migration shape was checked read-only on the workstation on 2026-10-09.
 The installed Caddy reported version 2.6.2. The complete live fragment was the
@@ -87,10 +108,45 @@ and adaptation produced one `:80` server, one exact host route, and one
 loopback reverse-proxy upstream. No workstation state was changed while
 collecting this compatibility evidence.
 
-Tests inject failures at validation, reload, smoke, and restoration. They also
-exercise lock contention, stale-digest refusal, forged backup rejection,
-legacy-profile migration, and extra-site rejection. Documentation must not
-claim atomic exclusion of a root writer that ignores the shared lock.
+Before a route change, the helper requires the target container to be healthy
+and revalidates its complete Docker, network, data, runtime, and loopback-port
+identity. This prevents a stopped rollback target whose released port has been
+claimed by an unrelated local listener from becoming public. The install path
+then passes digest-bound in-memory fragment bytes directly to isolated Python
+under `sudo`, atomically replaces only the managed site, rereads the exact
+installed bytes, validates Caddy, reloads, compares the active route, checks
+the response revision marker, and revalidates the complete upstream. Only
+after every check succeeds does a compare-and-swap-style privileged operation
+publish `active.json`. If publication reports an error, the helper rereads the
+head: the exact proposed head means success, the exact parent permits verified
+restoration, and any other state is external drift and forbids restoration.
+
+The site and head replacements are necessarily two filesystem operations. A
+process killed between them can leave the site ahead of the recorded head, and
+a failed attempt may leave an immutable orphan ledger. Before changing the
+site, the command flushes the exact transaction-ledger path to the operator.
+The lock-protected `reconcile --transaction` command accepts only that fully
+validated transaction when its recorded parent exactly equals the current
+head (including the no-head bootstrap case). If the site equals the orphan's
+installed route, reconcile repeats target-health, configuration, reload,
+active-route, marker, and upstream checks before advancing the head. If those
+checks fail before commit, reconcile rereads and binds the unchanged parent and
+installed site, preflights the trusted backup, restores it, and repeats the
+complete route checks while leaving the parent head unchanged. If the site
+already equals the transaction backup, it revalidates that loaded route and
+also leaves the parent head unchanged. An exact already-committed head is never
+restored implicitly. Any other site, parent, ledger, or unrecoverable upstream
+is refused. Orphans never authorize rollback because rollback still accepts
+only the transaction named by `active.json`.
+
+Tests inject failures at every pre-commit verification, before and after head
+replacement, and in restoration. They also exercise bootstrap and chained
+crash snapshots, pre-install target-health refusal, lock contention,
+stale-digest refusal, forged or noncanonical state, legacy bootstrap,
+current-head-only rollback, replay rejection, marker spoofing, and extra-site
+rejection. Documentation must not claim cross-file atomicity, protection from
+the trusted deployment operator, or exclusion of a root writer that ignores
+the shared lock.
 
 ## Source and image identity
 

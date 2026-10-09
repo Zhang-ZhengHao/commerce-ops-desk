@@ -1,0 +1,3 @@
+http://commerce-ops-desk.srrsh.aig.rest {
+	reverse_proxy 127.0.0.1:{{UPSTREAM_PORT}}
+}

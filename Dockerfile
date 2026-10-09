@@ -11,6 +11,10 @@ RUN npm run build
 
 FROM python:3.12-slim-bookworm AS runtime
 
+ARG SOURCE_SHA
+RUN test -n "$SOURCE_SHA"
+LABEL org.opencontainers.image.revision="$SOURCE_SHA"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     COMMERCE_OPS_DATABASE_URL=sqlite+pysqlite:////app/data/commerce_ops.db \

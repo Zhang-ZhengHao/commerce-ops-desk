@@ -9,7 +9,7 @@ from pathlib import Path
 import tomllib
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
-RELEASE_VERSION = "0.2.0"
+RELEASE_VERSION = "0.2.1"
 
 
 class ProjectToolingContractTest(unittest.TestCase):
@@ -216,6 +216,10 @@ class ProjectToolingContractTest(unittest.TestCase):
             "COMMERCE_OPS_CONTAINER_IMAGE: commerce-ops-desk:postgres-ci",
             job,
         )
+        self.assertIn(
+            "COMMERCE_OPS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}",
+            job,
+        )
 
         dynamic_admin_url = (
             "postgresql+psycopg://commerce_ops_ci:ci_only_postgres@127.0.0.1:"
@@ -224,7 +228,10 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertEqual(job.count(dynamic_admin_url), 2)
         commands = (
             "run: make postgres-test",
-            'run: docker build --file Dockerfile --tag "$COMMERCE_OPS_CONTAINER_IMAGE" .',
+            (
+                'run: docker build --build-arg "SOURCE_SHA=$COMMERCE_OPS_SOURCE_SHA" '
+                '--file Dockerfile --tag "$COMMERCE_OPS_CONTAINER_IMAGE" .'
+            ),
             "run: make postgres-container-test",
         )
         command_offsets = [job.index(command) for command in commands]
@@ -353,7 +360,7 @@ class ProjectToolingContractTest(unittest.TestCase):
             "Production fails closed without an explicit secret and database URL",
             security_model,
         )
-        self.assertIn("The public demo is single-node", security_model)
+        self.assertIn("The hosted synthetic demo is single-node", security_model)
         self.assertIn(
             "PostgreSQL 17 migrations, tenant constraints, readiness",
             security_model,

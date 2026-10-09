@@ -108,12 +108,13 @@ class HostedStartContractTest(unittest.TestCase):
                 {
                     "PORT": str(port),
                     "COMMERCE_OPS_VENV_DIR": str(Path(sys.executable).parent.parent),
-                    "COMMERCE_OPS_ENVIRONMENT": "test",
+                    "COMMERCE_OPS_ENVIRONMENT": "demo",
                     "COMMERCE_OPS_DATABASE_URL": (
                         f"sqlite+pysqlite:///{database_path}"
                     ),
                     "COMMERCE_OPS_DEMO_SOURCE_HOURLY_LIMIT": "1",
                     "COMMERCE_OPS_SESSION_SECRET": TEST_SESSION_SECRET,
+                    "COMMERCE_OPS_WEBHOOK_ENABLED": "false",
                 }
             )
             process = subprocess.Popen(
@@ -162,7 +163,7 @@ class HostedStartContractTest(unittest.TestCase):
                     revision = connection.execute(
                         "SELECT version_num FROM alembic_version"
                     ).fetchone()
-                self.assertEqual(revision, ("0005_webhook_inbox",))
+                self.assertEqual(revision, ("0006_maintenance_indexes",))
 
                 container_address = socket.gethostbyname(socket.gethostname())
                 if not container_address.startswith("127."):

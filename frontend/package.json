@@ -1,13 +1,15 @@
 {
   "name": "commerce-ops-desk-frontend",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "tsc -b && vite build",
     "capture:demo-entry": "UPDATE_README_SCREENSHOTS=1 playwright test e2e/readme-screenshots.spec.ts --project=desktop-chromium --workers=1",
-    "test": "vitest run src",
+    "test": "npm run test:unit && npm run test:e2e-lifecycle",
     "test:e2e": "playwright test --config=playwright.config.ts",
+    "test:e2e-lifecycle": "vitest run --environment node e2e/database-lifecycle.test.ts",
+    "test:unit": "vitest run src",
     "test:watch": "vitest src",
     "typecheck": "tsc -b --pretty false && tsc --project e2e/tsconfig.json --pretty false"
   },

@@ -25,7 +25,8 @@ ALEMBIC_CONFIG = BACKEND_ROOT / "alembic.ini"
 BOOTSTRAP_IDEMPOTENCY_REVISION = "0003_bootstrap_idempotency"
 ORDER_CASE_REVISION = "0004_order_case"
 WEBHOOK_INBOX_REVISION = "0005_webhook_inbox"
-HEAD_REVISION = WEBHOOK_INBOX_REVISION
+MAINTENANCE_INDEXES_REVISION = "0006_maintenance_indexes"
+HEAD_REVISION = MAINTENANCE_INDEXES_REVISION
 NOW = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
 
 CASE_INSERT = text(
@@ -482,6 +483,58 @@ def test_order_case_revision_round_trips_on_postgresql(
         ).one()
     assert row.organization_count == 1
     assert row.note_count == 0
+
+
+def test_maintenance_indexes_revision_round_trips_on_postgresql(
+    postgres_database: TemporaryPostgresDatabase,
+    postgres_engine: Engine,
+) -> None:
+    previous = run_alembic(postgres_database, "upgrade", WEBHOOK_INBOX_REVISION)
+    assert_alembic_succeeded(previous, postgres_database)
+    assert ("is_demo", "expires_at") in index_shapes(
+        postgres_engine,
+        "organizations",
+    )
+    assert ("window_start", "source_digest") not in index_shapes(
+        postgres_engine,
+        "rate_limits",
+    )
+
+    upgrade = run_alembic(postgres_database, "upgrade", MAINTENANCE_INDEXES_REVISION)
+    assert_alembic_succeeded(upgrade, postgres_database)
+    assert read_applied_revision(postgres_engine) == MAINTENANCE_INDEXES_REVISION
+    assert ("is_demo", "expires_at", "id") in index_shapes(
+        postgres_engine,
+        "organizations",
+    )
+    assert ("is_demo", "expires_at") not in index_shapes(
+        postgres_engine,
+        "organizations",
+    )
+    assert ("window_start", "source_digest") in index_shapes(
+        postgres_engine,
+        "rate_limits",
+    )
+
+    downgrade = run_alembic(
+        postgres_database,
+        "downgrade",
+        WEBHOOK_INBOX_REVISION,
+    )
+    assert_alembic_succeeded(downgrade, postgres_database)
+    assert read_applied_revision(postgres_engine) == WEBHOOK_INBOX_REVISION
+    assert ("is_demo", "expires_at") in index_shapes(
+        postgres_engine,
+        "organizations",
+    )
+    assert ("is_demo", "expires_at", "id") not in index_shapes(
+        postgres_engine,
+        "organizations",
+    )
+    assert ("window_start", "source_digest") not in index_shapes(
+        postgres_engine,
+        "rate_limits",
+    )
 
 
 def test_webhook_inbox_revision_backfills_and_round_trips_on_postgresql(
