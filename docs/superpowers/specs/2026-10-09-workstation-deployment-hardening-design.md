@@ -15,10 +15,11 @@ production readiness.
 
 ## Chosen approach
 
-Keep the versioned deployment helper and make every privileged transition
-fail closed. This preserves useful deployment evidence for the portfolio while
-avoiding new registry or signing infrastructure that is not available in the
-current environment.
+Keep the versioned deployment helper and reject unrecognized state at every
+transition it initiates, within the documented cooperating-writer boundary.
+This preserves useful deployment evidence for the portfolio while avoiding new
+registry or signing infrastructure that is not available in the current
+environment.
 
 Two alternatives were rejected for this revision:
 
@@ -51,21 +52,24 @@ cover each rejected mutation independently.
 
 ## Caddy transaction and rollback provenance
 
-A single fixed, root-owned lock serializes the complete read, backup, install,
-validate, reload, smoke, and possible restore transaction for every invocation
-of this tool. After installing a fragment, the helper rechecks its digest
-before an automatic restoration. This is defense in depth against stale tool
-state, not an atomic compare-and-swap against a root administrator that edits
-Caddy without taking the tool lock. Root and out-of-band privileged writers
-are explicitly outside this automation boundary and must coordinate changes.
+A single fixed, root-owned advisory lock serializes the complete read, backup,
+install, validate, reload, smoke, and possible restore transaction among
+cooperating invocations of this tool. After installing a fragment, the helper
+rechecks its digest before an automatic restoration. This is defense in depth
+against stale tool state, not an atomic compare-and-swap against a root writer
+that edits Caddy without taking the tool lock. Root and out-of-band privileged
+writers are explicitly outside this automation boundary and must coordinate
+changes on the same lock. The design does not claim to eliminate the root-level
+TOCTOU window between a digest read and a later replacement.
 
 Each backup is accompanied by provenance stored in a root-owned deployment
 ledger outside the deploy user's writable backup directory. The ledger binds
-the backup's canonical path, content digest, creation transaction, and the one
-allowed CommerceOps site identity. Rollback accepts only a ledger entry and a
-fragment that passes a structural allowlist: exactly the CommerceOps address,
-exactly one expected reverse-proxy upstream, and no additional site block.
-Self-named files without root-owned provenance are rejected.
+the backup's canonical path, content digest, creation transaction, the one
+allowed CommerceOps site identity, and explicit `backup_profile` and
+`installed_profile` values. Rollback accepts only a ledger entry and a fragment
+that passes a structural allowlist: exactly the CommerceOps address, exactly
+one expected reverse-proxy upstream, and no additional site block. Self-named
+files without root-owned provenance are rejected.
 
 The first hardened cutover must also accept the exact currently deployed
 legacy CommerceOps fragment as an input and rollback profile. That profile is
@@ -74,6 +78,14 @@ like the hardened template. It is accepted only for reading, backup, automatic
 restore, and trusted-ledger rollback; every new candidate installation must use
 the hardened canonical profile. A permissive "any one-site fragment" migration
 is not allowed.
+
+The migration shape was checked read-only on the workstation on 2026-10-09.
+The installed Caddy reported version 2.6.2. The complete live fragment was the
+frozen legacy template rendered at port 18087 (SHA-256
+`740ab123464b07d8e6460c974abc901c4025fc08f34a955402ba5db574994e3a`),
+and adaptation produced one `:80` server, one exact host route, and one
+loopback reverse-proxy upstream. No workstation state was changed while
+collecting this compatibility evidence.
 
 Tests inject failures at validation, reload, smoke, and restoration. They also
 exercise lock contention, stale-digest refusal, forged backup rejection,
@@ -85,10 +97,13 @@ claim atomic exclusion of a root writer that ignores the shared lock.
 The documented build path requires the approved remote `main` ref to equal the
 selected SHA. Every Git command runs with replace objects disabled and without
 inherited repository-redirection variables; the resolved repository top level
-must be the requested checkout. The image build context is produced with
-`git archive` from that exact commit rather than from the mutable working tree,
-so dirty and untracked checkout content is deliberately ignored rather than
-treated as an error.
+must be the requested checkout. Archive runs through a temporary bare object
+view with a clean config and attributes namespace, backed only by the approved
+repository's object directory. This prevents mutable `.git/info/attributes`
+or global/system attribute files from applying `export-ignore` or
+`export-subst` to the context. Versioned attributes inside the selected commit
+remain part of that approved source policy. Dirty and untracked checkout
+content is deliberately ignored rather than treated as an error.
 
 After build, one image inspection verifies both the OCI revision label and the
 immutable local image ID. The builder writes those values, the image reference,
