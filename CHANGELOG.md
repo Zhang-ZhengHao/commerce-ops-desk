@@ -28,6 +28,12 @@ All notable changes to CommerceOps Desk are documented here. The project follows
 
 ### Fixed
 
+- Legacy workstation bootstrap now discovers only running port owners and
+  verifies the frozen container as an exact member of its shared Docker bridge;
+  hardened candidates continue to require an exclusive private network.
+- The frozen legacy upstream fingerprint is now recomputed in tests from the
+  complete versioned 2026-10-10 read-only attestation instead of a duplicated
+  literal.
 - Workstation candidate creation now uses the supported Compose `create` flag
   surface, relying on the exact-one-service gate while retaining `--no-deps`
   for the final `up` stage.

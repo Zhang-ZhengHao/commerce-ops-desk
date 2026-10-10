@@ -356,13 +356,24 @@ class ReconcileHarness:
         assert route is self._route_for_stage()
         self.events.append(f"smoke:{self._stage()}")
 
-    def assert_upstream(self, _runner: object, upstream: object) -> None:
+    def assert_upstream(
+        self,
+        _runner: object,
+        upstream: object,
+        *,
+        require_exclusive_network: bool,
+    ) -> None:
         if upstream == self.installed_route.upstream:
             stage = "installed"
+            route = self.installed_route
         elif upstream == self.backup_route.upstream:
             stage = "backup"
+            route = self.backup_route
         else:
             raise AssertionError("unexpected upstream identity target")
+        assert require_exclusive_network is (
+            route.profile == self.module.CADDY_PROFILE_HARDENED
+        )
         self.events.append(f"upstream:{stage}")
 
     def commit(

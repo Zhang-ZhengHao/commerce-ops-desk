@@ -6,6 +6,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -337,7 +338,7 @@ def test_loaded_route_rechecks_health_after_the_smoke_probe(
         lambda *_args: pytest.fail("identity-only final check is insufficient"),
     )
 
-    def reject_stopped(*_args: object) -> None:
+    def reject_stopped(*_args: object, **_kwargs: object) -> None:
         raise module.DeploymentError("upstream is no longer running")
 
     monkeypatch.setattr(module, "_assert_upstream_ready", reject_stopped)
@@ -476,6 +477,71 @@ def test_upstream_extraction_rejects_disagreement_between_docker_views(
         extract_upstream(module, runner)
 
 
+def test_shared_network_peer_is_allowed_only_when_exclusivity_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    runner = FakeRunner(module)
+    install_fake_data_stat(module, runner, monkeypatch)
+    runner.network_inspection[0]["Containers"]["5" * 64] = {
+        "Name": "unrelated-shared-bridge-peer",
+        "EndpointID": "6" * 64,
+        "MacAddress": "02:42:c0:00:02:03",
+        "IPv4Address": "192.0.2.3/24",
+        "IPv6Address": "",
+    }
+
+    actual = module._upstream_identity_from_inspection(
+        runner,
+        runner.container_inspection,
+        expected_container_id=CONTAINER_ID,
+        expected_container_name=CONTAINER_NAME,
+        expected_host_port=HOST_PORT,
+        require_exclusive_network=False,
+    )
+
+    assert actual == expected_upstream(module, runner.container_inspection)
+    with pytest.raises(module.DeploymentError, match="network endpoint"):
+        extract_upstream(module, runner)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("EndpointID", "7" * 64),
+        ("Name", "replacement-target"),
+    ],
+    ids=("endpoint-id", "endpoint-name"),
+)
+def test_shared_network_mode_still_rejects_target_endpoint_drift(
+    field: str,
+    replacement: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    runner = FakeRunner(module)
+    install_fake_data_stat(module, runner, monkeypatch)
+    runner.network_inspection[0]["Containers"]["5" * 64] = {
+        "Name": "unrelated-shared-bridge-peer",
+        "EndpointID": "6" * 64,
+        "MacAddress": "02:42:c0:00:02:03",
+        "IPv4Address": "192.0.2.3/24",
+        "IPv6Address": "",
+    }
+    target_endpoint = runner.network_inspection[0]["Containers"][CONTAINER_ID]
+    target_endpoint[field] = replacement
+
+    with pytest.raises(module.DeploymentError, match="network endpoint"):
+        module._upstream_identity_from_inspection(
+            runner,
+            runner.container_inspection,
+            expected_container_id=CONTAINER_ID,
+            expected_container_name=CONTAINER_NAME,
+            expected_host_port=HOST_PORT,
+            require_exclusive_network=False,
+        )
+
+
 def test_upstream_extraction_rejects_container_and_host_data_stat_disagreement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -494,10 +560,115 @@ def test_upstream_extraction_rejects_container_and_host_data_stat_disagreement(
 
 def test_frozen_legacy_upstream_fingerprint_matches_read_only_evidence() -> None:
     module = load_deploy_tool()
-
-    assert module.LEGACY_UPSTREAM_FINGERPRINT == (
-        "b443797953fc44f8acd0e8a353bec2853d4a100fdf113a48d2815754ce4c30ac"
+    attested = module.UpstreamIdentity(
+        schema=module.UPSTREAM_IDENTITY_SCHEMA,
+        docker_daemon_id="6745d2ba-f78b-4baf-bf04-d1f7fc5e3e70",
+        container_id=(
+            "c00b0e0b0c84f24a91229329c851f4b2d4a9896d4d1b697e237722150aef8f17"
+        ),
+        container_name="app-commerce-ops-desk",
+        image_id=(
+            "sha256:92c1c424f9b1d8707a30a40b4ce086822a8104de7cec4729e010fcbc2c11062f"
+        ),
+        image_reference="commerce-ops-desk:0.2.0",
+        source_sha="80201c4231f5c2f37ec5fd9d4cab983abbfc1eed",
+        host_port=18_087,
+        data_path="/home/getui/apps/commerce-ops-desk/data-v0.2.0-live",
+        data_device=64_769,
+        data_inode=55_451_026,
+        network_name="bridge",
+        network_id=("a52388fc829bf9643c7a348285b5bcb577035d76f33595b4216349b98c2d6a2a"),
+        network_endpoint_id=(
+            "71d12cc167f2f6637b1a5d22d9e1d08174ac797cd352952667a0b25b4a3a25bd"
+        ),
+        runtime_sha256=(
+            "93abe2c38679f8c023bb681f68a40502b7f91b883244b11736109b351f635351"
+        ),
     )
+    expected_fingerprint = (
+        "892810d70dc768db1db79f84276fd6df9b3e83085e34fe8089b604532db11e89"
+    )
+
+    assert module._upstream_identity_fingerprint(attested) == expected_fingerprint
+    assert module.LEGACY_UPSTREAM_FINGERPRINT == expected_fingerprint
+
+
+def test_host_port_discovery_ignores_stopped_binding_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+
+    class DiscoveryRunner(FakeRunner):
+        def __init__(self, loaded_module: ModuleType) -> None:
+            super().__init__(loaded_module)
+            self.stopped_id = "5" * 64
+            self.stopped_inspection = deepcopy(self.container_inspection)
+            self.stopped_inspection["Id"] = self.stopped_id
+            self.stopped_inspection["Name"] = "/stopped-evidence"
+            self.stopped_inspection["State"] = {
+                "Status": "exited",
+                "Running": False,
+                "Paused": False,
+                "Restarting": False,
+                "Dead": False,
+                "Health": {"Status": "healthy"},
+            }
+
+        def run(
+            self, arguments: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            command = list(arguments)
+            running_command = [
+                self.module.DOCKER_BINARY,
+                "container",
+                "ls",
+                "--quiet",
+                "--no-trunc",
+            ]
+            all_command = [
+                self.module.DOCKER_BINARY,
+                "container",
+                "ls",
+                "--all",
+                "--quiet",
+                "--no-trunc",
+            ]
+            if command in (running_command, all_command):
+                self.calls.append(command)
+                identifiers = (
+                    [self.stopped_id, CONTAINER_ID]
+                    if command == all_command
+                    else [CONTAINER_ID]
+                )
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "\n".join(identifiers) + "\n",
+                    "",
+                )
+            if command == [self.module.DOCKER_BINARY, "inspect", self.stopped_id]:
+                self.calls.append(command)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    json.dumps([self.stopped_inspection]),
+                    "",
+                )
+            return super().run(command, **kwargs)
+
+    runner = DiscoveryRunner(module)
+    install_fake_data_stat(module, runner, monkeypatch)
+
+    actual = module._upstream_identity_for_host_port(runner, HOST_PORT)
+
+    assert actual == expected_upstream(module, runner.container_inspection)
+    assert runner.calls[0] == [
+        module.DOCKER_BINARY,
+        "container",
+        "ls",
+        "--quiet",
+        "--no-trunc",
+    ]
 
 
 def test_host_port_discovery_requests_full_ids_and_rejects_truncated_output() -> None:
@@ -524,11 +695,114 @@ def test_host_port_discovery_requests_full_ids_and_rejects_truncated_output() ->
             module.DOCKER_BINARY,
             "container",
             "ls",
-            "--all",
             "--quiet",
             "--no-trunc",
         ]
     ]
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_exclusive"),
+    [
+        ("legacy-v0.2.0", False),
+        ("hardened-v1", True),
+    ],
+)
+def test_route_readiness_selects_network_policy_from_profile(
+    profile: str,
+    expected_exclusive: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    runner = FakeRunner(module)
+    upstream = expected_upstream(module, runner.container_inspection)
+    route = module.RouteState(
+        fragment_sha256="a" * 64,
+        profile=profile,
+        route_revision=None if profile == "legacy-v0.2.0" else "b" * 64,
+        upstream=upstream,
+        deployment_assets=None,
+    )
+    observed: list[bool] = []
+
+    def capture_policy(
+        _runner: object,
+        received: object,
+        *,
+        require_exclusive_network: bool,
+    ) -> None:
+        assert received is upstream
+        observed.append(require_exclusive_network)
+
+    monkeypatch.setattr(module, "_assert_upstream_ready", capture_policy)
+
+    module._assert_route_upstream_ready(object(), route)
+
+    assert observed == [expected_exclusive]
+
+
+@pytest.mark.parametrize(
+    ("profile", "shared_network_allowed"),
+    [
+        ("legacy-v0.2.0", True),
+        ("hardened-v1", False),
+    ],
+)
+def test_route_readiness_propagates_policy_through_identity_verification(
+    profile: str,
+    shared_network_allowed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    runner = FakeRunner(module)
+    install_fake_data_stat(module, runner, monkeypatch)
+    upstream = expected_upstream(module, runner.container_inspection)
+    route = module.RouteState(
+        fragment_sha256="a" * 64,
+        profile=profile,
+        route_revision=None if profile == "legacy-v0.2.0" else "b" * 64,
+        upstream=upstream,
+        deployment_assets=None,
+    )
+    runner.network_inspection[0]["Containers"]["5" * 64] = {
+        "Name": "unrelated-shared-bridge-peer",
+        "EndpointID": "6" * 64,
+        "MacAddress": "02:42:c0:00:02:03",
+        "IPv4Address": "192.0.2.3/24",
+        "IPv6Address": "",
+    }
+
+    def assert_healthy(
+        _runner: object,
+        container_name: str,
+        *,
+        timeout: float,
+    ) -> None:
+        assert container_name == CONTAINER_NAME
+        assert timeout == 15.0
+
+    monkeypatch.setattr(module, "_wait_for_healthy", assert_healthy)
+
+    if shared_network_allowed:
+        module._assert_route_upstream_ready(runner, route)
+    else:
+        with pytest.raises(module.DeploymentError, match="network endpoint"):
+            module._assert_route_upstream_ready(runner, route)
+
+
+def test_route_readiness_rejects_unknown_network_policy_profile() -> None:
+    module = load_deploy_tool()
+    runner = FakeRunner(module)
+    route = module.RouteState(
+        fragment_sha256="a" * 64,
+        profile="unmanaged-profile",
+        route_revision=None,
+        upstream=expected_upstream(module, runner.container_inspection),
+        deployment_assets=None,
+    )
+
+    with pytest.raises(module.DeploymentError, match="profile"):
+        module._assert_route_upstream_ready(object(), route)
 
 
 def test_synthetic_upstream_fingerprint_binds_reconstructed_identity(

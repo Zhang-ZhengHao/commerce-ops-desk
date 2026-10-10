@@ -554,14 +554,22 @@ def test_exact_legacy_bootstrap_loader_binds_fragment_route_marker_and_upstream(
             else pytest.fail("wrong fragment")
         ),
     )
+
+    def load_upstream(
+        _runner: object,
+        port: int,
+        *,
+        require_exclusive_network: bool,
+    ) -> object:
+        assert port == 18_087
+        assert require_exclusive_network is False
+        events.append("load-upstream")
+        return upstream
+
     monkeypatch.setattr(
         module,
         "_upstream_identity_for_host_port",
-        lambda _runner, port: (
-            events.append("load-upstream") or upstream
-            if port == 18_087
-            else pytest.fail("wrong port")
-        ),
+        load_upstream,
         raising=False,
     )
     monkeypatch.setattr(
@@ -580,12 +588,14 @@ def test_exact_legacy_bootstrap_loader_binds_fragment_route_marker_and_upstream(
     )
     monkeypatch.setattr(
         module,
-        "_assert_upstream_ready",
+        "_assert_route_upstream_ready",
         lambda _runner, received: (
             events.append("upstream-ready")
-            if received is upstream
-            else pytest.fail("wrong upstream")
+            if received.upstream is upstream
+            and received.profile == module.CADDY_PROFILE_LEGACY_V020
+            else pytest.fail("wrong route")
         ),
+        raising=False,
     )
 
     route = module._load_exact_legacy_bootstrap_route(
@@ -644,7 +654,7 @@ def test_exact_legacy_bootstrap_loader_rejects_fragment_or_upstream_drift(
     monkeypatch.setattr(
         module,
         "_upstream_identity_for_host_port",
-        lambda *_args: make_upstream(module, marker="3", port=18_087),
+        lambda *_args, **_kwargs: make_upstream(module, marker="3", port=18_087),
         raising=False,
     )
 

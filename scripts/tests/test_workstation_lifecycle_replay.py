@@ -134,6 +134,8 @@ def test_switch_then_rollback_rejects_t1_replay_before_any_fragment_io(
     current_site = legacy_fragment
     fragment_reads: list[Path] = []
     site_installs: list[str] = []
+    upstream_checks: list[tuple[object, bool]] = []
+    fail_legacy_validation_once = False
 
     def publish_immutable(_runner: object, source: Path, target: Path) -> None:
         assert target not in root_files
@@ -182,6 +184,21 @@ def test_switch_then_rollback_rejects_t1_replay_before_any_fragment_io(
         site_installs.append(content)
         current_site = content
 
+    def assert_upstream_ready(
+        _runner: object,
+        upstream: object,
+        *,
+        require_exclusive_network: bool,
+    ) -> None:
+        assert upstream in (candidate_upstream, legacy_upstream)
+        upstream_checks.append((upstream, require_exclusive_network))
+
+    def validate_caddy(_runner: object) -> None:
+        nonlocal fail_legacy_validation_once
+        if fail_legacy_validation_once and current_site == legacy_fragment:
+            fail_legacy_validation_once = False
+            raise module.DeploymentError("injected rollback validation failure")
+
     monkeypatch.setattr(module, "_caddy_transaction_lock", transaction_lock)
     monkeypatch.setattr(module, "_load_candidate_state", lambda _path: candidate_state)
     monkeypatch.setattr(
@@ -206,11 +223,10 @@ def test_switch_then_rollback_rejects_t1_replay_before_any_fragment_io(
         "_adapt_fragment",
         lambda _runner, fragment: {"canonical_fragment": fragment},
     )
-    monkeypatch.setattr(module, "_assert_upstream_ready", lambda *_: None)
-    monkeypatch.setattr(module, "_validate_caddy", lambda _: None)
+    monkeypatch.setattr(module, "_assert_upstream_ready", assert_upstream_ready)
+    monkeypatch.setattr(module, "_validate_caddy", validate_caddy)
     monkeypatch.setattr(module, "_reload_caddy", lambda _: None)
     monkeypatch.setattr(module, "_smoke_caddy", lambda _: None)
-    monkeypatch.setattr(module, "_assert_upstream_identity_current", lambda *_: None)
     monkeypatch.setattr(
         module,
         "_assert_active_caddy_route",
@@ -232,10 +248,36 @@ def test_switch_then_rollback_rejects_t1_replay_before_any_fragment_io(
     assert t1_head.transaction.backup_path == t1_backup
     assert t1_head.installed.route_revision == candidate_revision
     assert current_site == candidate_fragment
+    assert upstream_checks == [
+        (candidate_upstream, True),
+        (candidate_upstream, True),
+    ]
 
     trusted_t1 = module._load_validated_backup(runner, t1_backup)
     assert trusted_t1.parent.transaction_id == t1_head.transaction_id
     assert trusted_t1.fragment == legacy_fragment
+
+    fail_legacy_validation_once = True
+    with pytest.raises(
+        module.DeploymentError,
+        match="injected rollback validation failure",
+    ):
+        module.rollback_site(
+            argparse.Namespace(backup=str(t1_backup)),
+            runner,
+        )
+
+    restored_t1_head = module._load_active_caddy_chain(runner, allow_missing=False)
+    assert restored_t1_head is not None
+    assert restored_t1_head.transaction_id == t1_head.transaction_id
+    assert current_site == candidate_fragment
+    assert upstream_checks == [
+        (candidate_upstream, True),
+        (candidate_upstream, True),
+        (legacy_upstream, False),
+        (candidate_upstream, True),
+        (candidate_upstream, True),
+    ]
 
     t2_backup = module.rollback_site(
         argparse.Namespace(backup=str(t1_backup)),
@@ -250,6 +292,15 @@ def test_switch_then_rollback_rejects_t1_replay_before_any_fragment_io(
     t2_ledger = json.loads(t2_head.transaction.ledger_text)
     assert t2_ledger["parent"]["transaction_id"] == t1_head.transaction_id
     assert t2_head.installed.fragment_sha256 == legacy_route.fragment_sha256
+    assert upstream_checks == [
+        (candidate_upstream, True),
+        (candidate_upstream, True),
+        (legacy_upstream, False),
+        (candidate_upstream, True),
+        (candidate_upstream, True),
+        (legacy_upstream, False),
+        (legacy_upstream, False),
+    ]
 
     fragment_reads.clear()
     site_installs.clear()
