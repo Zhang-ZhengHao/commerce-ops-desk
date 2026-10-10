@@ -5,6 +5,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DemoSession } from '../../api/session';
 import { DemoWorkspace } from './DemoWorkspace';
 
+const fictionalTextRule =
+  'Use fictional text only. Do not enter personal, customer, credential, or confidential data.';
+
 const managerSession: DemoSession = {
   workspace: {
     id: 'workspace-835c',
@@ -83,7 +86,7 @@ const caseDetail = {
   notes: [
     {
       id: 'note-1',
-      body: 'Customer asked us to retry the card after 17:00 UTC.',
+      body: 'Fictional demo customer requested a retry after 17:00 UTC.',
       author: {
         membership_id: 'agent-membership',
         display_name: 'Demo Agent',
@@ -119,6 +122,16 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
 }
 
 type RouteHandler = (
@@ -166,6 +179,24 @@ afterEach(() => {
 });
 
 describe('I03 exception operations workspace', () => {
+  it.each([
+    ['Manager', managerSession],
+    ['Agent', agentSession],
+  ])('keeps the shared five-step guide visible in the %s workspace', async (_role, session) => {
+    installOperationsFetch();
+
+    renderWorkspace(session);
+
+    const guide = screen.getByRole('complementary', {
+      name: /five-step evaluator guide/i,
+    });
+    expect(within(guide).getAllByRole('listitem')).toHaveLength(5);
+    expect(within(guide).getByText('Create an event')).toBeVisible();
+    expect(guide).toHaveTextContent(/enter as Manager/i);
+    expect(within(guide).getByText('Verify the trail')).toBeVisible();
+    expect(await screen.findByRole('region', { name: /operations overview/i })).toBeVisible();
+  });
+
   it('shows the live summary and queue, then opens the order and timeline for a case', async () => {
     const user = userEvent.setup();
     const fetchMock = installOperationsFetch();
@@ -185,7 +216,7 @@ describe('I03 exception operations workspace', () => {
 
     expect(await screen.findByRole('heading', { name: /case demo-1042/i })).toBeVisible();
     expect(screen.getByText('$129.99')).toBeVisible();
-    expect(screen.getByText(/customer asked us to retry/i)).toBeVisible();
+    expect(screen.getByText(/fictional demo customer requested a retry/i)).toBeVisible();
     expect(screen.getByText(/assigned by demo manager/i)).toBeVisible();
     const dashboardCall = fetchMock.mock.calls.find(([input]) =>
       String(input).includes('/api/dashboard'),
@@ -195,6 +226,113 @@ describe('I03 exception operations workspace', () => {
       credentials: 'same-origin',
       method: 'GET',
     });
+  });
+
+  it('orders one accountable timeline by time and case version', async () => {
+    const user = userEvent.setup();
+    const orderedTimelineDetail = {
+      ...caseDetail,
+      notes: [
+        {
+          ...caseDetail.notes[0],
+          created_at: '2026-10-07T16:05:00Z',
+        },
+      ],
+      audit_events: [
+        {
+          ...caseDetail.audit_events[0],
+          changes: { assignee_id: 'agent-membership', version: 2 },
+          created_at: '2026-10-07T16:00:00Z',
+        },
+        {
+          id: 'audit-note-1',
+          action: 'case.note_added',
+          object_type: 'exception_case',
+          object_id: caseDetail.id,
+          actor: {
+            membership_id: 'agent-membership',
+            display_name: 'Demo Agent',
+          },
+          changes: { note_id: 'note-1', version: 3 },
+          created_at: '2026-10-07T16:05:00Z',
+        },
+        {
+          id: 'audit-resolved-1',
+          action: 'case.resolved',
+          object_type: 'exception_case',
+          object_id: caseDetail.id,
+          actor: {
+            membership_id: 'agent-membership',
+            display_name: 'Demo Agent',
+          },
+          changes: { resolution_reason: 'payment_recovered', version: 4 },
+          created_at: '2026-10-07T16:05:00Z',
+        },
+      ],
+    };
+    installOperationsFetch((url) => {
+      if (url.pathname === '/api/cases/case-payment-1042') {
+        return jsonResponse(orderedTimelineDetail);
+      }
+      return undefined;
+    });
+
+    renderWorkspace(agentSession);
+    const queue = await screen.findByRole('region', { name: /exception queue/i });
+    await user.click(within(queue).getByRole('button', { name: /open demo-1042/i }));
+
+    const timeline = await screen.findByRole('region', { name: /accountable timeline/i });
+    const timelineItems = within(timeline).getAllByRole('listitem');
+    expect(timelineItems).toHaveLength(4);
+    expect(timelineItems.map((item) => item.textContent)).toEqual([
+      expect.stringContaining('Assigned by Demo Manager'),
+      expect.stringContaining('Fictional demo customer requested a retry'),
+      expect.stringContaining('Note added by Demo Agent'),
+      expect.stringContaining('Resolved by Demo Agent'),
+    ]);
+  });
+
+  it('orders equivalent timestamp encodings by case version', async () => {
+    const user = userEvent.setup();
+    const equivalentTimestampDetail = {
+      ...caseDetail,
+      notes: [],
+      audit_events: [
+        {
+          ...caseDetail.audit_events[0],
+          changes: { assignee_id: 'agent-membership', version: 3 },
+          created_at: '2026-10-07T16:05:00Z',
+        },
+        {
+          id: 'audit-resolved-1',
+          action: 'case.resolved',
+          object_type: 'exception_case',
+          object_id: caseDetail.id,
+          actor: {
+            membership_id: 'agent-membership',
+            display_name: 'Demo Agent',
+          },
+          changes: { resolution_reason: 'payment_recovered', version: 4 },
+          created_at: '2026-10-07T12:05:00-04:00',
+        },
+      ],
+    };
+    installOperationsFetch((url) => {
+      if (url.pathname === '/api/cases/case-payment-1042') {
+        return jsonResponse(equivalentTimestampDetail);
+      }
+      return undefined;
+    });
+
+    renderWorkspace(agentSession);
+    const queue = await screen.findByRole('region', { name: /exception queue/i });
+    await user.click(within(queue).getByRole('button', { name: /open demo-1042/i }));
+
+    const timeline = await screen.findByRole('region', { name: /accountable timeline/i });
+    expect(within(timeline).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      expect.stringContaining('Assigned by Demo Manager'),
+      expect.stringContaining('Resolved by Demo Agent'),
+    ]);
   });
 
   it('lets a Manager assign a case with the current version and command protections', async () => {
@@ -245,7 +383,8 @@ describe('I03 exception operations workspace', () => {
   it('lets an Agent add a note to an owned case without exposing Manager assignment', async () => {
     const user = userEvent.setup();
     let detailReads = 0;
-    const noteBody = 'Customer confirmed the retry window for 17:00 UTC.';
+    const noteBody = 'Fictional demo customer confirmed a 17:00 UTC retry window.';
+    const noteWrite = deferred<Response>();
     const notedDetail = {
       ...caseDetail,
       version: 4,
@@ -268,7 +407,7 @@ describe('I03 exception operations workspace', () => {
         return jsonResponse(detailReads === 1 ? caseDetail : notedDetail);
       }
       if (url.pathname === '/api/cases/case-payment-1042/notes') {
-        return jsonResponse({ case_id: caseDetail.id, version: 4 }, 201);
+        return noteWrite.promise;
       }
       return undefined;
     });
@@ -281,12 +420,26 @@ describe('I03 exception operations workspace', () => {
     ).toBeVisible();
     expect(screen.queryByRole('combobox', { name: /assign to agent/i })).not.toBeInTheDocument();
 
-    await user.type(screen.getByRole('textbox', { name: /internal note/i }), noteBody);
+    const note = screen.getByRole('textbox', { name: /internal note/i });
+    const warning = screen.getByText(fictionalTextRule);
+    expect(warning).toBeVisible();
+    expect(warning).not.toHaveAttribute('role', 'alert');
+    expect(note).toHaveAccessibleDescription(fictionalTextRule);
+
+    await user.type(note, noteBody);
     await user.click(screen.getByRole('button', { name: /add note/i }));
+
+    expect(await screen.findByRole('button', { name: /adding/i })).toBeDisabled();
+    expect(note).toBeDisabled();
+    expect(note).toHaveAccessibleDescription(fictionalTextRule);
+    noteWrite.resolve(jsonResponse({ case_id: caseDetail.id, version: 4 }, 201));
 
     const timeline = screen.getByRole('region', { name: /accountable timeline/i });
     expect(await within(timeline).findByText(noteBody)).toBeVisible();
     expect(screen.getByRole('textbox', { name: /internal note/i })).toHaveValue('');
+    expect(screen.getByRole('textbox', { name: /internal note/i })).toHaveAccessibleDescription(
+      fictionalTextRule,
+    );
     expect(detailReads).toBe(2);
     expect(
       fetchMock.mock.calls.some(([input]) => String(input).includes('/api/agents')),
@@ -359,7 +512,8 @@ describe('I03 exception operations workspace', () => {
 
   it('recovers a committed note by refreshing detail without replaying the POST', async () => {
     const user = userEvent.setup();
-    const noteBody = 'The bank trace was attached before the detail refresh failed.';
+    const noteBody = 'A fictional bank trace was attached before detail refresh failed.';
+    const recoveryRead = deferred<Response>();
     const notedDetail = {
       ...caseDetail,
       version: 4,
@@ -384,7 +538,7 @@ describe('I03 exception operations workspace', () => {
         if (detailReads === 2) {
           return jsonResponse({ detail: 'Detail service is temporarily unavailable.' }, 503);
         }
-        return jsonResponse(notedDetail);
+        return recoveryRead.promise;
       }
       if (url.pathname === '/api/cases/case-payment-1042/notes') {
         return jsonResponse({ case_id: caseDetail.id, version: 4 }, 201);
@@ -403,6 +557,7 @@ describe('I03 exception operations workspace', () => {
     expect(alert).toHaveTextContent(/change was saved/i);
     expect(alert).toHaveTextContent(/latest case/i);
     expect(note).toHaveValue(noteBody);
+    expect(note).toHaveAccessibleDescription(fictionalTextRule);
     expect(screen.getByRole('button', { name: /add note/i })).toBeDisabled();
     expect(
       fetchMock.mock.calls.filter(([input]) =>
@@ -411,6 +566,10 @@ describe('I03 exception operations workspace', () => {
     ).toHaveLength(1);
 
     await user.click(within(alert).getByRole('button', { name: /refresh case/i }));
+
+    expect(await screen.findByRole('status')).toHaveTextContent(/loading the saved change/i);
+    expect(note).toHaveAccessibleDescription(fictionalTextRule);
+    recoveryRead.resolve(jsonResponse(notedDetail));
 
     const timeline = screen.getByRole('region', { name: /accountable timeline/i });
     expect(await within(timeline).findByText(noteBody)).toBeVisible();
@@ -425,7 +584,7 @@ describe('I03 exception operations workspace', () => {
 
   it('preserves an unsubmitted note after a version conflict and refreshes the case', async () => {
     const user = userEvent.setup();
-    const noteBody = 'Waiting on the customer before another payment attempt.';
+    const noteBody = 'Waiting on the fictional customer before another demo attempt.';
     let detailReads = 0;
     const refreshedDetail = { ...caseDetail, version: 4 };
     installOperationsFetch((url) => {
@@ -448,6 +607,7 @@ describe('I03 exception operations workspace', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/case changed/i);
     expect(note).toHaveValue(noteBody);
+    expect(note).toHaveAccessibleDescription(fictionalTextRule);
     await user.click(screen.getByRole('button', { name: /refresh case/i }));
 
     await waitFor(() => expect(detailReads).toBe(2));

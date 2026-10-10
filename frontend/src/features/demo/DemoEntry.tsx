@@ -1,4 +1,5 @@
 import type { DemoRole } from '../../api/session';
+import { EvaluatorGuide, FICTIONAL_TEXT_RULE } from './EvaluatorGuide';
 
 type EntryState =
   | { kind: 'checking' }
@@ -30,13 +31,6 @@ const demoBoundaries = [
   },
 ] as const;
 
-const targetFlow = [
-  ['01', 'Review', 'Synthetic exception queue'],
-  ['02', 'Triage', 'Manager owns the queue'],
-  ['03', 'Resolve', 'Agent records the outcome'],
-  ['04', 'Trace', 'Audit history stays visible'],
-] as const;
-
 function roleName(role: DemoRole): string {
   return role === 'manager' ? 'Manager' : 'Agent';
 }
@@ -66,7 +60,7 @@ export function DemoEntry({
             className="role-actions"
             role="group"
             aria-labelledby="role-actions-label"
-            aria-describedby="demo-availability"
+            aria-describedby="demo-availability entry-fictional-data-rule"
           >
             <p id="role-actions-label" className="role-actions-label">
               Choose a workspace view
@@ -125,29 +119,16 @@ export function DemoEntry({
                 </button>
               </div>
             )}
+            <p
+              id="entry-fictional-data-rule"
+              className="fictional-data-rule entry-fictional-data-rule"
+            >
+              {FICTIONAL_TEXT_RULE}
+            </p>
           </div>
         </div>
 
-        <aside className="workflow-card" aria-labelledby="workflow-title">
-          <div className="workflow-card-header">
-            <h2 id="workflow-title">Operational workflow</h2>
-            <p>Available in the temporary I03 workspace with synthetic case data.</p>
-          </div>
-
-          <ol className="workflow-list">
-            {targetFlow.map(([index, title, detail]) => (
-              <li key={index} className="workflow-step">
-                <span className="step-index" aria-hidden="true">
-                  {index}
-                </span>
-                <span className="step-copy">
-                  <strong>{title}</strong>
-                  <span>{detail}</span>
-                </span>
-              </li>
-            ))}
-          </ol>
-        </aside>
+        <EvaluatorGuide variant="entry" />
       </section>
 
       <section className="boundaries" aria-labelledby="boundaries-title">

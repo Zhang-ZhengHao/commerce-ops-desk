@@ -1,6 +1,9 @@
 # CommerceOps Desk Security Model
 
-This document describes controls implemented through the I04 signed-webhook simulator slice and the limits of the hosted synthetic demo. It is an engineering boundary, not a compliance claim or a substitute for an independent production review.
+This document describes controls implemented through the I04 signed-webhook
+simulator slice, the `v0.2.1` evaluator candidate, and the limits of the hosted
+synthetic demo. It is an engineering boundary, not a compliance claim, a
+deployment attestation, or a substitute for an independent production review.
 
 ## Threat model
 
@@ -16,6 +19,44 @@ Control of the service account, host filesystem, deployment secret store, or dat
 - Cookie-authenticated writes require an exact Origin/Host authority match and an in-memory synchronizer token.
 - Real role changes revoke the old session and rotate both the cookie and CSRF token. Reset replaces the current organization and credentials atomically.
 - The launcher accepts a stable secret value or a regular service-owned `0600` secret file. Production fails closed without an explicit secret and database URL.
+
+## Evaluator access, identity, and free text
+
+- The release contract requires any externally shared evaluator to remain
+  behind the enterprise access-code gateway. The gateway, not CommerceOps,
+  owns that challenge. The application adds no access-code input, cookie,
+  environment variable, API route, or repository setting, and the code must
+  not appear in source, commands, logs, screenshots, or release notes.
+- The enterprise access code must never be stored in or published through this
+  repository.
+- This checkpoint does not add or publish a live-demo CTA, and it does not
+  claim that the evaluator is deployed, released, or approved for external
+  access.
+- The exact deployment hostname already exists in versioned engineering files
+  and public Git history, so repository URL absence is not a release boundary.
+  The actual publication gates are enterprise access-code distribution and
+  promotion of the deployment as a live evaluator. Access-code sharing
+  requires separate administrator confirmation of scope plus revocation and
+  rotation ownership.
+- The unauthenticated `GET /api/build` endpoint returns exactly the fixed
+  service identifier, semantic version, and a full lowercase 40-character
+  source SHA or `null`. It exposes no environment dump, path, image ID, secret,
+  integration identifier, session, or user data and sends `Cache-Control: no-store`.
+- Verified images bind the same approved SHA to the OCI revision label and the
+  immutable runtime build identity. The client validates the complete response
+  and constructs a commit link from a fixed repository origin; malformed or
+  unavailable metadata cannot block operational UI. A `null` SHA identifies an
+  unverified local build, not an accepted evaluator image.
+- All supplied records are synthetic, but internal notes are evaluator-entered
+  free text. The UI therefore states: `Use fictional text only. Do not enter personal, customer, credential, or confidential data.` The note textarea is
+  programmatically associated with that warning. There is no content scanner,
+  so the evaluator remains responsible for complying with it.
+
+Live evaluator: single-node SQLite; PostgreSQL 17: CI-verified path only
+
+This is a mandatory disclosure of the database and evidence boundary, not a
+claim of multi-node operation, public availability, production readiness, or
+an SLA.
 
 ## Signed webhook boundary
 
@@ -74,7 +115,7 @@ These controls reduce accidental and low-cost abuse. They do not replace upstrea
 
 ## Data and deployment limits
 
-All included identities and order records are fictional. No customer email, address, payment instrument, merchant credential, or live provider token is required or stored.
+All included identities and order records are fictional. No customer email, address, payment instrument, merchant credential, or live provider token is required or stored. Because visitors control internal-note text, this boundary depends on the visible fictional-text rule described above rather than technical content detection.
 
 The hosted synthetic demo is single-node. SQLite WAL is used only on a host-local path; tests explicitly avoid the NFS-mounted workspace after reproducing lock stalls there. The direct launcher keeps its default database in disposable local runtime storage. The workstation deployment instead bind-mounts the database and generated secret files so they survive container replacement; backups and high availability remain outside this demo's scope.
 
@@ -98,4 +139,13 @@ recovery, or protection from root.
 
 Application shutdown gives the maintenance scheduler five seconds by default to finish and then cancels the scheduler coroutine so the FastAPI lifespan can close. Python cannot forcibly terminate a synchronous database call that has already been dispatched through `asyncio.to_thread`; that call may finish after the lifespan timeout, and its Session remains responsible for closing its checked-out connection. Engine disposal releases the application's idle pool without claiming that the worker thread was killed. The timeout is configurable through `COMMERCE_OPS_MAINTENANCE_SHUTDOWN_TIMEOUT_SECONDS` and must be finite and positive.
 
-PostgreSQL 17 migrations, tenant constraints, readiness, selected lock/concurrency behavior, webhook transactions, and the production container path are exercised against a live disposable database in CI. This does not establish multi-node throughput or availability. Edge bandwidth protection, distributed rate limiting, overlapping-key rotation, a real Stripe or Shopify adapter, an outbox/worker, automatic delivery retries, a dead-letter queue, exactly-once delivery, encrypted backups, production observability, disaster recovery, high availability, production readiness, performance claims, and formal compliance remain outside this revision.
+PostgreSQL 17 migrations, tenant constraints, readiness, selected
+lock/concurrency behavior, webhook transactions, and the production container
+path are exercised against a live disposable database in CI. This does not
+establish multi-node throughput or availability. Edge bandwidth protection,
+distributed rate limiting, overlapping-key rotation, a real Stripe or Shopify
+integration, an asynchronous job queue or outbox/worker, automatic delivery
+retries, a dead-letter queue, exactly-once delivery, encrypted backups,
+production observability, disaster recovery, high availability, production
+readiness, a production SLA, performance claims, and formal compliance remain
+outside this revision.

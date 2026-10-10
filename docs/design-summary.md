@@ -2,7 +2,7 @@
 
 ## Current verified slice
 
-I03 delivers the first complete order-exception workflow on top of the hosted foundation and demo identity boundary. The I04 slice adds a Manager-only synthetic provider simulator, safe case provenance, and live PostgreSQL evidence to the signed synthetic-event path:
+I03 delivers the first complete order-exception workflow on top of the hosted foundation and demo identity boundary. The I04 slice adds a Manager-only synthetic provider simulator, safe case provenance, and live PostgreSQL evidence to the signed synthetic-event path. The `v0.2.1` evaluator candidate adds guided evaluation and verifiable build identity without representing the repository as a deployed service:
 
 - FastAPI serves the production React bundle and same-origin JSON API from an injected port, with liveness and database-readiness probes.
 - Visitors can create a four-hour synthetic Manager or Agent workspace, recover it after refresh, switch persisted roles, and reset only their active tenant.
@@ -20,14 +20,37 @@ I03 delivers the first complete order-exception workflow on top of the hosted fo
 - Webhook-created cases show a synthetic source and only safe provider, event type, external event ID, and receipt-time provenance. Seeded cases remain explicitly identified as demo data.
 - The existing live PostgreSQL 17 gate now includes webhook evidence alongside migrations, constraints, readiness, transaction rollback, named lock races, and the production container rather than inferring behavior from compiled SQL.
 - Loading, empty, filtered-empty, error, permission, conflict, committed-write/read-failure, reset, desktop, mobile, and 320-pixel states have automated coverage.
+- One shared, accessible five-step guide tells an evaluator to create a fresh
+  event, test exact replay and tamper rejection, assign the case, work it as an
+  Agent, and inspect safe provenance plus ordered audit history. It performs no
+  actions, persists no progress, and remains available in both role workspaces.
+- Entry and internal-note controls display `Use fictional text only. Do not enter personal, customer, credential, or confidential data.` The note helper
+  is the textarea's accessible description; this is responsibility guidance,
+  not a claim of automated content detection.
+- The unauthenticated `GET /api/build` response contains only the fixed service
+  identifier, version `0.2.1`, and a complete lowercase source SHA or `null`
+  for a local unverified build. The response uses `Cache-Control: no-store`,
+  and the client request uses `cache: "no-store"`; the footer renders `v0.2.1`,
+  and invalid metadata degrades only the footer, not the workflow.
+- A verified image binds the approved full SHA to both its OCI revision label
+  and immutable runtime environment. The frontend links a validated full SHA
+  to the fixed public repository origin rather than trusting a response URL.
 
 The complete signed envelope stays only in panel memory; it is never placed in browser storage, a URL, logs, error objects, or shared application context. The UI renders the allowlisted external event ID, but not the target path, raw body, timestamp, or signature. Replay reuses the original bytes, while tamper and stale scenarios leave the fresh replay cache intact. A successful webhook followed by failed reads is treated as a committed delivery with GET-only recovery, so the UI does not repeat the mutation.
 
-An outbox worker, automated delivery retries, dead-letter recovery, real Stripe or Shopify adapters, overlapping-key rotation, exactly-once delivery, high availability, production-readiness, and performance claims remain unimplemented.
+An outbox worker or asynchronous job queue, automated delivery retries,
+dead-letter recovery, real Stripe or Shopify adapters, overlapping-key
+rotation, exactly-once delivery, high availability, production-readiness,
+production SLA, and performance claims remain unimplemented.
 
 ## Product outcome
 
 CommerceOps Desk is designed for a small ecommerce operations team that needs one accountable place to work payment failures, refund reviews, delayed fulfillment, and event-processing failures.
+
+The in-product evaluator guide compresses the executable path into five
+reviewable outcomes: create an event, test the boundary, assign the case, work
+as Agent, and verify the trail. Each material action remains under evaluator
+control; the guide neither scripts the workflow nor infers completion.
 
 The current executable path is:
 
@@ -65,6 +88,11 @@ authorization       demo envelope signer      synthetic webhook ingress
        SQLite single-node demo / PostgreSQL 17 verified path
 ```
 
+Live evaluator: single-node SQLite; PostgreSQL 17: CI-verified path only
+
+This required label describes the architecture and the evidence available for
+each database. It does not assert that a live endpoint has been deployed.
+
 The browser holds only the current CSRF token, rendered state, and a panel-local signed envelope. It does not persist session or envelope material in web storage or decide authorization. The signer is cookie-authenticated, but the public webhook delivery explicitly omits credentials. A successful case mutation returns a compact receipt; a subsequent GET obtains the authoritative representation.
 
 ## Reliability model
@@ -85,10 +113,34 @@ SQLite uses WAL and a busy timeout only on a host-local filesystem. The hosted l
 
 Implemented controls include opaque cookie sessions, Origin and CSRF checks, a production-absent demo signer, browser delivery without credentials, bounded API bodies, compact validation errors, server-side membership lookup, tenant-scoped data access and provenance, persistent creation and role-write limits, bounded note growth, trusted-proxy parsing, capacity control, stable secret-file handling, raw-byte HMAC verification, dummy authentication work for hidden targets, and keyed source-rate pseudonyms.
 
-All fixtures use fictional identifiers and neutral synthetic order data. The service is disconnected from merchant accounts and cannot issue customer-facing actions. See the [security model](security-model.md) for assumptions and deployment limits.
+All fixtures use fictional identifiers and neutral synthetic order data. The service is disconnected from merchant accounts and cannot issue customer-facing actions. Free-text notes remain evaluator-controlled, so visitors are explicitly responsible for entering fictional text and excluding personal, customer, credential, and confidential information. The product does not claim to scan or classify note content. See the [security model](security-model.md) for assumptions and deployment limits.
+
+Any externally shared evaluator is required to remain behind the enterprise
+access-code gateway. This checkpoint does not add or publish a live-demo CTA,
+and it does not claim that the evaluator is deployed, released, or approved
+for external access. The exact deployment hostname already exists in versioned
+engineering files and public Git history, so repository URL absence is not a
+release boundary. The actual publication gates are enterprise access-code
+distribution and promotion of the deployment as a live evaluator. That
+challenge is outside CommerceOps: no application field, API, cookie,
+repository setting, or log receives the access code. The enterprise access
+code must never be stored in or published through this repository.
 
 ## Verification evidence
 
-The release gate runs backend API, concurrency, authorization, tenant-isolation, migration, reset, pagination, startup, webhook signer/authentication/transaction, and configuration tests; React component tests; real desktop and mobile browser journeys including fresh, replay, tamper, stale, provenance, assignment, Agent note, and resolution; strict Python and TypeScript checks; a production build; and public-history scanning.
+The release gate runs backend API, concurrency, authorization,
+tenant-isolation, migration, reset, pagination, startup, webhook
+signer/authentication/transaction, build-identity, and configuration tests;
+React component tests; real desktop and mobile browser journeys including the
+five-step guide, full-SHA footer, fictional-text warning, fresh, replay, tamper,
+stale, provenance, assignment, Agent note, and resolution; strict Python and
+TypeScript checks; a production build; and public-history scanning.
 
-The parallel PostgreSQL gate runs against PostgreSQL 17 and includes the hardened production container. The repository also contains a versioned workstation deployment contract and a scoped blue/green runbook with an explicit privileged-writer boundary; those assets are implementation evidence, not a claim that a particular public deployment has been verified. An outbox/worker, automatic retry scheduler, dead-letter queue, real provider adapter, generated API client, multi-node claims, and released-build performance evidence remain future work and are not represented as complete.
+The parallel PostgreSQL gate runs against PostgreSQL 17 and includes the
+hardened production container. The repository also contains a versioned workstation deployment contract and a scoped blue/green runbook with an
+explicit privileged-writer boundary; those assets are implementation evidence,
+not a claim that a particular public deployment has been verified. An
+asynchronous queue/outbox worker, automatic retry scheduler, dead-letter queue,
+real provider adapter, generated API client, multi-node or high-availability
+claims, production readiness or SLA, and released-build performance evidence
+remain future work and are not represented as complete.

@@ -138,11 +138,19 @@ if arguments[:2] == ["image", "inspect"]:
     if "--format" not in arguments:
         print(json.dumps([{
             "Id": os.environ.get("FAKE_DOCKER_IMAGE_ID", "sha256:" + "a" * 64),
-            "Config": {"Labels": {
-                "org.opencontainers.image.revision": os.environ.get(
-                    "FAKE_DOCKER_LABEL", os.environ["EXPECTED_SOURCE_SHA"]
-                )
-            }},
+            "Config": {
+                "Env": json.loads(os.environ.get(
+                    "FAKE_DOCKER_ENV_JSON",
+                    json.dumps([
+                        "COMMERCE_OPS_SOURCE_SHA=" + os.environ["EXPECTED_SOURCE_SHA"]
+                    ]),
+                )),
+                "Labels": {
+                    "org.opencontainers.image.revision": os.environ.get(
+                        "FAKE_DOCKER_LABEL", os.environ["EXPECTED_SOURCE_SHA"]
+                    )
+                },
+            },
         }]))
         raise SystemExit(0)
     if os.environ.get("FAKE_DOCKER_REQUIRE_JSON_INSPECT") == "1":
@@ -605,6 +613,59 @@ def test_build_refuses_a_mismatched_oci_revision_label(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "OCI revision label does not match SOURCE_SHA" in result.stderr
+
+
+def test_build_refuses_a_mismatched_runtime_source_sha(tmp_path: Path) -> None:
+    repository, source_sha = _create_repository(tmp_path)
+    capture = tmp_path / "capture.json"
+    environment = _tool_environment(
+        tmp_path,
+        source_sha,
+        capture,
+        FAKE_DOCKER_ENV_JSON=json.dumps(["COMMERCE_OPS_SOURCE_SHA=" + "f" * 40]),
+    )
+
+    result = _build(repository, source_sha, environment)
+
+    assert result.returncode == 1
+    assert "runtime source SHA does not match SOURCE_SHA" in result.stderr
+
+
+def test_build_refuses_a_missing_runtime_source_sha(tmp_path: Path) -> None:
+    repository, source_sha = _create_repository(tmp_path)
+    capture = tmp_path / "capture.json"
+    environment = _tool_environment(
+        tmp_path,
+        source_sha,
+        capture,
+        FAKE_DOCKER_ENV_JSON=json.dumps([]),
+    )
+
+    result = _build(repository, source_sha, environment)
+
+    assert result.returncode == 1
+    assert "runtime source SHA is missing" in result.stderr
+
+
+def test_build_refuses_an_ambiguous_runtime_source_sha(tmp_path: Path) -> None:
+    repository, source_sha = _create_repository(tmp_path)
+    capture = tmp_path / "capture.json"
+    environment = _tool_environment(
+        tmp_path,
+        source_sha,
+        capture,
+        FAKE_DOCKER_ENV_JSON=json.dumps(
+            [
+                f"COMMERCE_OPS_SOURCE_SHA={source_sha}",
+                f"COMMERCE_OPS_SOURCE_SHA={source_sha}",
+            ]
+        ),
+    )
+
+    result = _build(repository, source_sha, environment)
+
+    assert result.returncode == 1
+    assert "runtime source SHA is defined more than once" in result.stderr
 
 
 def test_build_refuses_a_nonimmutable_image_id(tmp_path: Path) -> None:

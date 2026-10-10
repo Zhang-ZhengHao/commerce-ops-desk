@@ -3,6 +3,10 @@ import { fileURLToPath } from 'node:url';
 
 import { expect, test } from './fixtures';
 
+const EVALUATOR_SOURCE_SHA = '0123456789abcdef0123456789abcdef01234567';
+const FICTIONAL_TEXT_RULE =
+  'Use fictional text only. Do not enter personal, customer, credential, or confidential data.';
+
 const assetsDirectory = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../../docs/assets',
@@ -19,7 +23,27 @@ test.describe('README screenshots', () => {
     await page.goto('/');
 
     await expect(page.getByRole('button', { name: 'Enter as Manager' })).toBeEnabled();
-    await expect(page.getByText('Synthetic exception queue')).toBeVisible();
+    await expect(
+      page.getByRole('heading', {
+        level: 1,
+        name: 'Turn ecommerce exceptions into accountable work.',
+      }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole('complementary', { name: 'Five-step evaluator guide' }),
+    ).toBeVisible();
+    await expect(page.getByText(FICTIONAL_TEXT_RULE, { exact: true })).toBeVisible();
+    const footer = page.getByRole('contentinfo');
+    await expect(footer.getByText('v0.2.1', { exact: true })).toBeVisible();
+    await expect(
+      footer.getByRole('link', { name: EVALUATOR_SOURCE_SHA }),
+    ).toHaveAttribute(
+      'href',
+      `https://github.com/Zhang-ZhengHao/commerce-ops-desk/commit/${EVALUATOR_SOURCE_SHA}`,
+    );
+    await expect(
+      footer.getByRole('link', { name: 'Public walkthrough · v0.2.0' }),
+    ).toBeVisible();
     await expect(page.getByText(/signed commerce event/i)).toHaveCount(0);
 
     await page.evaluate(async () => {

@@ -6,6 +6,13 @@ All notable changes to CommerceOps Desk are documented here. The project follows
 
 ### Added
 
+- A compact five-step evaluator guide for creating a synthetic event, testing
+  replay and authentication boundaries, assigning the case, working it as an
+  Agent, and verifying provenance plus audit history.
+- A minimal `GET /api/build` contract for version `0.2.1` and a non-blocking
+  footer that renders `v0.2.1` and, for verified images, links the complete
+  40-character source SHA to its immutable public commit.
+- Persistent entry and internal-note guidance: `Use fictional text only. Do not enter personal, customer, credential, or confidential data.`
 - Bounded hourly cleanup for expired synthetic workspaces and obsolete rate-limit windows, with safe failure metadata and a protected capacity sentinel.
 - Exact Host allowlisting, hardened-environment documentation shutdown, and versioned workstation Compose/Caddy deployment contracts.
 - A root-owned linear Caddy transaction head with current-head-only rollback and explicit fatal-stop reconciliation.
@@ -13,8 +20,36 @@ All notable changes to CommerceOps Desk are documented here. The project follows
 
 ### Changed
 
+- Verified images now bind one approved source SHA to both the OCI revision
+  label and the runtime build identity; candidate checks reject missing,
+  malformed, or mismatched identity.
 - Runtime deployment evidence now requires an immutable source SHA, 1 CPU, 512 MiB memory, 128 PIDs, and bounded local Docker logs.
 - Maintenance scan indexes now include deterministic tie-break columns for SQLite and PostgreSQL.
+
+### Security
+
+- The evaluator contract keeps access-code enforcement at the enterprise
+  gateway; CommerceOps adds no access-code field, cookie, API, repository
+  setting, or logged secret.
+- The enterprise access code must never be stored in or published through this
+  repository.
+- Free-text notes are not content-scanned. Evaluators remain responsible for
+  entering fictional text only and for excluding personal, customer,
+  credential, and confidential data.
+
+### Scope
+
+- Live evaluator: single-node SQLite; PostgreSQL 17: CI-verified path only
+- This checkpoint does not add or publish a live-demo CTA, and it does not
+  claim that the evaluator is deployed, released, or approved for external
+  access.
+- The exact deployment hostname already exists in versioned engineering files
+  and public Git history, so repository URL absence is not a release boundary.
+  The actual publication gates are enterprise access-code distribution and
+  promotion of the deployment as a live evaluator.
+- This checkpoint includes no real Stripe or Shopify integration,
+  asynchronous job queue or worker, high availability, production-readiness,
+  or production SLA.
 
 ## [0.2.0] - 2026-10-08
 

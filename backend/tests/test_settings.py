@@ -6,6 +6,8 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.database import build_engine
 
+VALID_SOURCE_SHA = "0123456789abcdef0123456789abcdef01234567"
+
 
 def test_settings_default_to_the_local_sqlite_boundary() -> None:
     settings = Settings(_env_file=None)
@@ -27,7 +29,36 @@ def test_settings_default_to_the_local_sqlite_boundary() -> None:
     assert settings.api_max_request_body_bytes == 16 * 1024
     assert settings.trusted_proxy_cidrs == ()
     assert settings.allowed_hosts == ()
+    assert settings.source_sha is None
     assert settings.secure_cookies is False
+
+
+def test_source_sha_reads_one_full_lowercase_revision_from_the_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COMMERCE_OPS_SOURCE_SHA", VALID_SOURCE_SHA)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.source_sha == VALID_SOURCE_SHA
+
+
+@pytest.mark.parametrize(
+    "invalid_source_sha",
+    [
+        "",
+        "0" * 7,
+        "0" * 39,
+        "0" * 41,
+        "g" * 40,
+        "A" * 40,
+        f" {VALID_SOURCE_SHA}",
+        f"{VALID_SOURCE_SHA} ",
+    ],
+)
+def test_source_sha_rejects_any_noncanonical_revision(invalid_source_sha: str) -> None:
+    with pytest.raises(ValidationError, match="source SHA"):
+        Settings(_env_file=None, source_sha=invalid_source_sha)
 
 
 def test_production_defaults_demo_off_and_requires_an_explicit_session_secret() -> None:

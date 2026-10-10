@@ -277,6 +277,10 @@ def _assert_container_configuration(
         "Container did not receive the test session secret",
     )
     _require(
+        container_environment.get(SOURCE_SHA_ENV) == source_sha,
+        "Container runtime source SHA does not match the tested source SHA",
+    )
+    _require(
         container_environment.get("COMMERCE_OPS_ENVIRONMENT") == "production",
         "Container is not running with the production environment boundary",
     )
@@ -421,6 +425,43 @@ def _assert_ready(host_port: int, *, deadline: float) -> None:
     )
 
 
+def _assert_build_metadata(
+    host_port: int,
+    *,
+    source_sha: str,
+    deadline: float,
+) -> None:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{host_port}/api/build",
+        headers={"Accept": "application/json"},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=_remaining_timeout(deadline, 5.0)) as response:
+            status = response.status
+            cache_control = response.headers.get("Cache-Control")
+            body = response.read(4_097)
+    except OSError as error:
+        raise ContainerProofError(f"Host build metadata request failed: {error}") from None
+
+    _require(status == 200, "Host build metadata request did not return HTTP 200")
+    _require(cache_control == "no-store", "Host build metadata response is cacheable")
+    _require(len(body) <= 4_096, "Host build metadata response exceeded its size boundary")
+    try:
+        payload = cast(object, json.loads(body))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise ContainerProofError("Host build metadata response was not valid JSON") from None
+    _require(
+        payload
+        == {
+            "service": "commerce-ops-desk",
+            "version": "0.2.1",
+            "source_sha": source_sha,
+        },
+        "Host build metadata did not match the tested source SHA",
+    )
+
+
 def _assert_runtime_process(
     docker: str,
     container_name: str,
@@ -540,7 +581,7 @@ def test_hardened_container_migrates_and_serves_postgresql(
     source_sha = os.environ.get(SOURCE_SHA_ENV)
     if (
         source_sha is None
-        or len(source_sha) not in {40, 64}
+        or len(source_sha) != 40
         or any(character not in "0123456789abcdef" for character in source_sha)
     ):
         pytest.fail(f"{SOURCE_SHA_ENV} must be a full lowercase source SHA", pytrace=False)
@@ -624,6 +665,11 @@ def test_hardened_container_migrates_and_serves_postgresql(
         run_command.extend(("-e", environment_name))
     run_command.append(image)
 
+    _require(
+        SOURCE_SHA_ENV not in RUNTIME_ENVIRONMENT_NAMES and SOURCE_SHA_ENV not in run_command,
+        "Container proof must inherit the source SHA from the image baseline",
+    )
+
     command_text = "\0".join(run_command)
     _require(
         rendered_database_url not in command_text and session_secret not in command_text,
@@ -675,6 +721,11 @@ def test_hardened_container_migrates_and_serves_postgresql(
             session_secret=session_secret,
         )
         _assert_ready(host_port, deadline=deadline)
+        _assert_build_metadata(
+            host_port,
+            source_sha=source_sha,
+            deadline=deadline,
+        )
 
         with postgres_engine.connect() as connection:
             applied_revision = connection.scalar(text("SELECT version_num FROM alembic_version"))

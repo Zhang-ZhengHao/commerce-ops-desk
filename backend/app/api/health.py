@@ -2,20 +2,28 @@
 
 from typing import Literal, cast
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.config import Settings
 from app.database import probe_database
+from app.version import APP_VERSION, SERVICE_ID
 
 router = APIRouter(tags=["system"])
 
 
 class HealthPayload(BaseModel):
     status: Literal["ok"] = "ok"
-    service: Literal["commerce-ops-desk"] = "commerce-ops-desk"
+    service: Literal["commerce-ops-desk"] = SERVICE_ID
+
+
+class BuildPayload(BaseModel):
+    service: Literal["commerce-ops-desk"] = SERVICE_ID
+    version: Literal["0.2.1"] = APP_VERSION
+    source_sha: str | None
 
 
 class ReadinessPayload(BaseModel):
@@ -27,6 +35,14 @@ class ReadinessPayload(BaseModel):
 def health() -> HealthPayload:
     """Report process liveness without depending on external services."""
     return HealthPayload()
+
+
+@router.get("/api/build", response_model=BuildPayload)
+def build_metadata(request: Request, response: Response) -> BuildPayload:
+    """Expose only the immutable public build identity without allowing caches."""
+    settings = cast(Settings, request.app.state.settings)
+    response.headers["Cache-Control"] = "no-store"
+    return BuildPayload(source_sha=settings.source_sha)
 
 
 @router.get(

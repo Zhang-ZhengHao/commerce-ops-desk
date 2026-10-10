@@ -13,6 +13,132 @@ RELEASE_VERSION = "0.2.1"
 
 
 class ProjectToolingContractTest(unittest.TestCase):
+    def test_release_docs_describe_the_live_evaluator_boundary_precisely(
+        self,
+    ) -> None:
+        release_docs = {
+            relative_path: (PRODUCT_ROOT / relative_path).read_text()
+            for relative_path in (
+                "README.md",
+                "CHANGELOG.md",
+                "docs/design-summary.md",
+                "docs/security-model.md",
+            )
+        }
+        required_statements = (
+            "This checkpoint does not add or publish a live-demo CTA",
+            (
+                "does not claim that the evaluator is deployed, released, or "
+                "approved for external access"
+            ),
+            (
+                "The exact deployment hostname already exists in versioned "
+                "engineering files and public Git history"
+            ),
+            (
+                "The actual publication gates are enterprise access-code "
+                "distribution and promotion of the deployment as a live evaluator"
+            ),
+            (
+                "The enterprise access code must never be stored in or published "
+                "through this repository"
+            ),
+            "Live evaluator: single-node SQLite; PostgreSQL 17: CI-verified path only",
+        )
+        false_url_absence_claim = re.compile(
+            r"(?i)(?:does not publish|publishes no|contains no|provides no|has no)\s+"
+            r"(?:a\s+)?live(?:[- ]demo| evaluator)?\s+URL"
+        )
+
+        for relative_path, contents in release_docs.items():
+            with self.subTest(relative_path=relative_path):
+                normalized = " ".join(contents.split())
+                for statement in required_statements:
+                    self.assertIn(statement, normalized)
+                self.assertNotRegex(contents, false_url_absence_claim)
+
+    def test_evaluator_design_and_plan_distinguish_hostname_from_live_demo_cta(
+        self,
+    ) -> None:
+        design = (
+            PRODUCT_ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-10-10-evaluator-release-design.md"
+        ).read_text()
+        plan = (
+            PRODUCT_ROOT
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-10-10-evaluator-release-implementation-plan.md"
+        ).read_text()
+
+        design_status = re.search(r"(?m)^Status: (.+)$", design)
+        plan_status = re.search(r"(?m)^Status: (.+)$", plan)
+        self.assertIsNotNone(design_status)
+        self.assertIsNotNone(plan_status)
+        assert design_status is not None
+        assert plan_status is not None
+        self.assertEqual(design_status.group(1), plan_status.group(1))
+        self.assertEqual(design_status.group(1), "approved for execution")
+
+        self.assertNotIn("srrsh.aig.rest", design)
+        self.assertNotRegex(design, r"(?m)^Target (?:demo|host):\s*`?https?://")
+        design_normalized = " ".join(design.split())
+        plan_normalized = " ".join(plan.split())
+        for contents in (design_normalized, plan_normalized):
+            self.assertIn(
+                "The exact deployment hostname already exists in versioned "
+                "engineering files and public Git history",
+                contents,
+            )
+            self.assertIn(
+                "This checkpoint does not add or promote a live-demo CTA",
+                contents,
+            )
+            self.assertIn(
+                "does not claim that the evaluator is deployed, released, or "
+                "approved for external access",
+                contents,
+            )
+
+        for stale_claim in (
+            "not published at this checkpoint",
+            "the repository has no live product entry point",
+            "publish the URL only after",
+            "Do not add a live URL",
+        ):
+            self.assertNotIn(stale_claim, design)
+            self.assertNotIn(stale_claim, plan)
+
+        for contents in (design_normalized, plan_normalized):
+            self.assertIn("requests 1,000 records", contents)
+            self.assertIn("accepts at most 999", contents)
+            self.assertIn("1,000-result GitHub API cap", contents)
+            self.assertNotIn("requests 1,001 records", contents)
+            self.assertNotIn("accepts at most 1,000", contents)
+
+        self.assertRegex(design, r"(?m)^Target host: .*not promoted as a live-demo CTA")
+        for visible_control_label in (
+            "Deliver new failure",
+            "Replay same event",
+            "Tamper after signing",
+            "Send stale signature",
+            "Assign to agent",
+            "Update assignment",
+            "Switch to Agent",
+            "Internal note",
+            "Add note",
+            "Resolution reason",
+            "Resolve case",
+            "Event provenance",
+            "Accountable timeline",
+        ):
+            with self.subTest(visible_control_label=visible_control_label):
+                self.assertIn(f"`{visible_control_label}`", design)
+
     def test_release_version_is_synchronized_across_public_surfaces(self) -> None:
         backend_pyproject = tomllib.loads(
             (PRODUCT_ROOT / "backend" / "pyproject.toml").read_text()
@@ -24,13 +150,18 @@ class ProjectToolingContractTest(unittest.TestCase):
             (PRODUCT_ROOT / "frontend" / "package-lock.json").read_text()
         )
         app_main = (PRODUCT_ROOT / "backend" / "app" / "main.py").read_text()
-        app_version = re.search(r'(?m)^\s*version="([^"]+)",$', app_main)
-        self.assertIsNotNone(app_version, "FastAPI version must be explicit")
+        version_module = (PRODUCT_ROOT / "backend" / "app" / "version.py").read_text()
+        app_version = re.search(r'(?m)^APP_VERSION: Final = "([^"]+)"$', version_module)
+        self.assertIsNotNone(
+            app_version, "the application version constant must be explicit"
+        )
         assert app_version is not None
+        self.assertIn("version=APP_VERSION", app_main)
+        self.assertIn("from app.version import APP_VERSION", app_main)
 
         versions = {
             "backend package": backend_pyproject["project"]["version"],
-            "FastAPI metadata": app_version.group(1),
+            "application metadata": app_version.group(1),
             "frontend package": frontend_package["version"],
             "frontend lock root": frontend_lock["version"],
             "frontend lock package": frontend_lock["packages"][""]["version"],
@@ -134,6 +265,35 @@ class ProjectToolingContractTest(unittest.TestCase):
         self.assertRegex(
             contents,
             r"(?m)^e2e-smoke:\n\tCOMMERCE_OPS_VENV_DIR=.*npm --prefix frontend run test:e2e$",
+        )
+
+    def test_playwright_backend_has_retry_headroom_without_changing_production_limit(
+        self,
+    ) -> None:
+        playwright_config = (
+            PRODUCT_ROOT / "frontend" / "playwright.config.ts"
+        ).read_text()
+        application_config = (
+            PRODUCT_ROOT / "backend" / "app" / "config.py"
+        ).read_text()
+
+        test_limit = re.search(
+            r"(?m)^\s+COMMERCE_OPS_DEMO_SOURCE_HOURLY_LIMIT: '(\d+)',\s*$",
+            playwright_config,
+        )
+        self.assertIsNotNone(
+            test_limit,
+            "the Playwright backend must set an explicit demo source limit",
+        )
+        assert test_limit is not None
+        self.assertGreaterEqual(
+            int(test_limit.group(1)),
+            100,
+            "the E2E source limit must cover both projects, CI retries, and headroom",
+        )
+        self.assertRegex(
+            application_config,
+            r"(?m)^\s+demo_source_hourly_limit: int = Field\(default=10, gt=0\)$",
         )
 
     def test_hosted_smoke_builds_the_ignored_frontend_bundle_first(self) -> None:

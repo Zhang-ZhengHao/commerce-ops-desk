@@ -22,6 +22,7 @@ import {
   CaseSourceBadge,
 } from '../cases/CaseProvenance';
 import { SyntheticProviderPanel } from '../webhooks/SyntheticProviderPanel';
+import { EvaluatorGuide, FICTIONAL_TEXT_RULE } from './EvaluatorGuide';
 
 export type RoleOperation =
   | { kind: 'idle' }
@@ -158,6 +159,75 @@ function auditDescription(event: CaseDetail['audit_events'][number]): string {
   if (event.action === 'case.resolved') return `Resolved by ${actor}`;
   if (event.action === 'case.note_added') return `Note added by ${actor}`;
   return `${formatLabel(event.action)} by ${actor}`;
+}
+
+type TimelineItem =
+  | {
+      kind: 'note';
+      record: CaseDetail['notes'][number];
+      caseVersion: number | null;
+      sourceOrder: number;
+    }
+  | {
+      kind: 'audit';
+      record: CaseDetail['audit_events'][number];
+      caseVersion: number | null;
+      sourceOrder: number;
+    };
+
+function auditCaseVersion(event: CaseDetail['audit_events'][number]): number | null {
+  const version = event.changes.version;
+  return typeof version === 'number' && Number.isInteger(version) && version > 0
+    ? version
+    : null;
+}
+
+function accountableTimeline(detail: CaseDetail): TimelineItem[] {
+  const noteVersions = new Map<string, number>();
+  detail.audit_events.forEach((event) => {
+    const noteId = event.changes.note_id;
+    const version = auditCaseVersion(event);
+    if (event.action === 'case.note_added' && typeof noteId === 'string' && version !== null) {
+      noteVersions.set(noteId, version);
+    }
+  });
+
+  const items: TimelineItem[] = [
+    ...detail.notes.map((note, index) => ({
+      kind: 'note' as const,
+      record: note,
+      caseVersion: noteVersions.get(note.id) ?? null,
+      sourceOrder: index,
+    })),
+    ...detail.audit_events.map((event, index) => ({
+      kind: 'audit' as const,
+      record: event,
+      caseVersion: auditCaseVersion(event),
+      sourceOrder: detail.notes.length + index,
+    })),
+  ];
+
+  return items.sort((left, right) => {
+    const leftTime = Date.parse(left.record.created_at);
+    const rightTime = Date.parse(right.record.created_at);
+    if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
+      return leftTime - rightTime;
+    }
+    if (Number.isFinite(leftTime) !== Number.isFinite(rightTime)) {
+      return Number.isFinite(leftTime) ? -1 : 1;
+    }
+    if (
+      left.caseVersion !== null &&
+      right.caseVersion !== null &&
+      left.caseVersion !== right.caseVersion
+    ) {
+      return left.caseVersion - right.caseVersion;
+    }
+    if (left.record.created_at !== right.record.created_at) {
+      return left.record.created_at.localeCompare(right.record.created_at);
+    }
+    return left.sourceOrder - right.sourceOrder;
+  });
 }
 
 function errorStatus(error: unknown): number | null {
@@ -403,6 +473,8 @@ export function DemoWorkspace({
         </div>
         <span className="role-badge">{roleName(currentRole)} access</span>
       </div>
+
+      <EvaluatorGuide variant="compact" />
 
       {operations.kind === 'loading' && (
         <div className="operations-loading" role="status">
@@ -704,8 +776,15 @@ export function DemoWorkspace({
                       }}
                     >
                       <label htmlFor="case-note">Internal note</label>
+                      <p
+                        id="case-note-fictional-rule"
+                        className="fictional-data-rule fictional-data-rule-note"
+                      >
+                        {FICTIONAL_TEXT_RULE}
+                      </p>
                       <textarea
                         id="case-note"
+                        aria-describedby="case-note-fictional-rule"
                         value={noteBody}
                         rows={3}
                         maxLength={1000}
@@ -815,25 +894,30 @@ export function DemoWorkspace({
                       <span>{detail.detail.audit_events.length + detail.detail.notes.length} events</span>
                     </div>
                     <ol className="timeline-list">
-                      {detail.detail.notes.map((note) => (
-                        <li key={note.id}>
-                          <span className="timeline-dot" aria-hidden="true" />
-                          <div>
-                            <strong>Note by {note.author.display_name}</strong>
-                            <p>{note.body}</p>
-                            <time dateTime={note.created_at}>{formatDateTime(note.created_at)}</time>
-                          </div>
-                        </li>
-                      ))}
-                      {detail.detail.audit_events.map((event) => (
-                        <li key={event.id}>
-                          <span className="timeline-dot" aria-hidden="true" />
-                          <div>
-                            <strong>{auditDescription(event)}</strong>
-                            <time dateTime={event.created_at}>{formatDateTime(event.created_at)}</time>
-                          </div>
-                        </li>
-                      ))}
+                      {accountableTimeline(detail.detail).map((item) =>
+                        item.kind === 'note' ? (
+                          <li key={`note:${item.record.id}`}>
+                            <span className="timeline-dot" aria-hidden="true" />
+                            <div>
+                              <strong>Note by {item.record.author.display_name}</strong>
+                              <p>{item.record.body}</p>
+                              <time dateTime={item.record.created_at}>
+                                {formatDateTime(item.record.created_at)}
+                              </time>
+                            </div>
+                          </li>
+                        ) : (
+                          <li key={`audit:${item.record.id}`}>
+                            <span className="timeline-dot" aria-hidden="true" />
+                            <div>
+                              <strong>{auditDescription(item.record)}</strong>
+                              <time dateTime={item.record.created_at}>
+                                {formatDateTime(item.record.created_at)}
+                              </time>
+                            </div>
+                          </li>
+                        ),
+                      )}
                     </ol>
                   </section>
                 </article>
