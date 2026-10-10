@@ -295,10 +295,12 @@ is retained and causes refusal; it is never replaced. The same per-SHA lock
 remains held from candidate validation through final state publication. These
 controls bind the candidate data, state, deployment assets, and running
 container to tools from the exact clean `DEPLOY_SHA` checkout.
-`APP_ROOT` and `deploy-state` must remain on the same filesystem so every
-data-only, state-only, or combined quarantine move is one atomic rename; the
-preflight and recovery helper both fail closed before creating an archive when
-that invariant does not hold.
+`APP_ROOT` and `deploy-state` must remain on the same filesystem so each
+candidate input can be quarantined with one atomic rename. Candidate data and
+state are separate moves rather than one combined transaction, so interruption
+between them is possible and is handled by the resumable recovery procedure
+below. The preflight and recovery helper both fail closed before creating an
+archive when the same-filesystem invariant does not hold.
 
 ### Recover interrupted candidate inputs
 
@@ -309,27 +311,99 @@ data. After an administrator confirms that the retained data is not live and no
 container mounts it, use the versioned `quarantine` subcommand below. Its only
 operator-controlled value is the full source SHA; all input names, archive
 names, and move destinations are derived internally and passed through fixed
-argv. The helper anchors operations to dirfd handles opened with `O_NOFOLLOW`,
-checks types, ownership, modes, link counts, and device/inode identities with
-`fstat`, and holds the same non-blocking per-SHA prepare lock through every
-move. Each move uses Linux `renameat2(RENAME_NOREPLACE)`, so a racing archive
+argv. The parent holds the same non-blocking per-SHA prepare lock through every
+move and anchors the hierarchy to dirfd handles opened with `O_NOFOLLOW`.
+Candidate data is owned by runtime identity `10001:10001`, so only that data
+move is delegated through fixed argv to the narrow
+`sudo /usr/bin/python3 -I` helper. The helper independently revalidates the
+application root, archive, source, ownership, modes, and device/inode identities
+before performing the no-clobber rename. Candidate state remains an
+unprivileged move by the deployment user.
+Each input uses its own Linux `renameat2(RENAME_NOREPLACE)`, so a racing archive
 entry is retained and causes refusal instead of being overwritten; a kernel or
 filesystem without that atomic operation also fails closed. A missing,
 replaced, unsafe, or busy lock stops recovery.
 
-The subcommand supports data-only, state-only, or both paths. If a prior run
-moved one item and stopped, rerun it: the remaining item moves into another
-newly created quarantine archive, while the earlier archive remains untouched.
-It never follows a symbolic link and never deletes candidate data or state.
-Every `prepare` invocation creates the required lock before inspecting candidate
-inputs.
+The subcommand supports data-only, state-only, or both paths. The two inputs do
+not move atomically together. If a prior run moved one item and stopped, rerun
+it: the remaining item moves into another newly created quarantine archive,
+while the earlier archive remains untouched. It never changes candidate
+ownership, follows a symbolic link, deletes candidate data or state, or falls
+back to a less constrained move. Every `prepare` invocation creates the
+required lock before inspecting candidate inputs.
 
 ```bash
 set -euo pipefail
+: "${INTERRUPTED_SOURCE_SHA:?export the full SHA of the interrupted attempt}"
+[[ "$INTERRUPTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "INTERRUPTED_SOURCE_SHA must be one full lowercase 40-character Git SHA" >&2
+  exit 1
+}
 verify_exact_checkout
 /usr/bin/python3 -I deploy/workstation/deploy.py quarantine \
-  --source-sha "$SOURCE_SHA"
+  --source-sha "$INTERRUPTED_SOURCE_SHA"
 ```
+
+`INTERRUPTED_SOURCE_SHA` identifies the retained input, not necessarily the
+revision of the currently verified deployment tool. When a compatibility fix
+has produced a new `DEPLOY_SHA`, use the old failed deployment SHA here so the
+derived candidate path and per-SHA lock identify the old residual data.
+
+If the command fails after the privileged helper may have committed, it does
+not guess, restore, or delete anything and might not print the new archive
+path. Inspect the two exact sources and every same-SHA direct-child archive
+before deciding whether to rerun. This inspection follows no symlink and makes
+no mutation:
+
+```bash
+set -euo pipefail
+: "${INTERRUPTED_SOURCE_SHA:?export the full SHA of the interrupted attempt}"
+[[ "$INTERRUPTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+SOURCE_PREFIX="${INTERRUPTED_SOURCE_SHA:0:12}"
+DATA_SOURCE="$APP_ROOT/data-candidate-$SOURCE_PREFIX"
+STATE_SOURCE="$APP_ROOT/deploy-state/candidate-$SOURCE_PREFIX.json"
+for SOURCE_PATH in "$DATA_SOURCE" "$STATE_SOURCE"; do
+  if [[ -e "$SOURCE_PATH" || -L "$SOURCE_PATH" ]]; then
+    /usr/bin/stat --format='source|%n|%F|%d|%i|%u|%g|%a|%h' -- "$SOURCE_PATH"
+  else
+    printf 'source-absent|%s\n' "$SOURCE_PATH"
+  fi
+done
+
+shopt -s nullglob
+ARCHIVES=("$APP_ROOT"/quarantine-candidate-"$SOURCE_PREFIX"-*)
+shopt -u nullglob
+ARCHIVE_COUNT=0
+for ARCHIVE in "${ARCHIVES[@]}"; do
+  ARCHIVE_NAME="${ARCHIVE##*/}"
+  [[ "$ARCHIVE_NAME" =~ ^quarantine-candidate-${SOURCE_PREFIX}-[0-9a-f]{16}$ ]] || continue
+  [[ -d "$ARCHIVE" && ! -L "$ARCHIVE" ]] || {
+    echo "unsafe quarantine archive path: $ARCHIVE" >&2
+    exit 1
+  }
+  ((ARCHIVE_COUNT += 1))
+  /usr/bin/stat --format='archive|%n|%F|%d|%i|%u|%g|%a|%h' -- "$ARCHIVE"
+  for ENTRY in "$ARCHIVE/data" "$ARCHIVE/candidate-$SOURCE_PREFIX.json"; do
+    if [[ -e "$ENTRY" || -L "$ENTRY" ]]; then
+      /usr/bin/stat --format='entry|%n|%F|%d|%i|%u|%g|%a|%h' -- "$ENTRY"
+    fi
+  done
+done
+((ARCHIVE_COUNT > 0)) || {
+  echo "no matching quarantine archive found; stop for diagnosis" >&2
+  exit 1
+}
+```
+
+Require each archive to remain a deployment-user-owned `0700` directory. An
+archived `data` entry must be the retained `10001:10001`, `0700` directory with
+the incident's original device/inode; an archived state entry must be the
+deployment-user-owned `0600` one-link file. If one exact source remains, rerun
+the versioned subcommand so it moves that input into a new archive. If both
+sources are absent and the retained identities are accounted for in the
+archives, do not rerun: preserve the archives and continue with the fail-closed
+preflight. Any symlink, unexpected identity, unmatched source, or missing
+archive is a stop condition for administrator diagnosis.
 
 Preserve every quarantine archive for diagnosis. Then rerun the fail-closed
 preflight and `prepare`; the tool creates a new candidate inode. Do not copy
@@ -362,10 +436,13 @@ deployment asset set recorded in the manifest or state. It opens each canonical
 regular file once, bounds its size, verifies its SHA-256 digest and UTF-8
 encoding, and retains the verified bytes in memory. `prepare` checks that the
 verified Compose document contains exactly the single `commerce-ops-desk`
-service, then supplies those in-memory bytes with `--file -`; both create and
-up name that service explicitly with `--no-deps`. It never reopens the worktree
-Compose file during the operation. The manifest source, immutable image,
-deployment assets, and current fixed local Docker daemon ID must all match.
+service, then supplies those in-memory bytes with `--file -`. The `create`
+stage names that exact service and uses `--no-build` without `--no-deps`, which
+is not accepted by the workstation's Compose `create` command and is redundant
+after the exact-one-service gate. The final `up` stage names the same service
+and retains `--no-deps`. Neither stage reopens the worktree Compose file. The
+manifest source, immutable image, deployment assets, and current fixed local
+Docker daemon ID must all match.
 
 Before switching, inspect only this candidate's logs and exercise its loopback endpoint with the required public Host:
 

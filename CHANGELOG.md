@@ -26,6 +26,15 @@ All notable changes to CommerceOps Desk are documented here. The project follows
 - Runtime deployment evidence now requires an immutable source SHA, 1 CPU, 512 MiB memory, 128 PIDs, and bounded local Docker logs.
 - Maintenance scan indexes now include deterministic tie-break columns for SQLite and PostgreSQL.
 
+### Fixed
+
+- Workstation candidate creation now uses the supported Compose `create` flag
+  surface, relying on the exact-one-service gate while retaining `--no-deps`
+  for the final `up` stage.
+- Interrupted runtime-owned candidate data can now be quarantined through an
+  identity-bound privileged helper without changing ownership or deleting
+  retained data; deployment-user-owned candidate state remains unprivileged.
+
 ### Security
 
 - The evaluator contract keeps access-code enforcement at the enterprise

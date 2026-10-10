@@ -14,7 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 
@@ -55,6 +55,98 @@ def create_candidate_prepare_lock(app_root: Path) -> Path:
     lock_path.write_text("", encoding="utf-8")
     lock_path.chmod(0o600)
     return lock_path
+
+
+class InlineSudoPythonRunner:
+    """Execute the exact isolated sudo-Python helper as the test user."""
+
+    def __init__(
+        self,
+        module: ModuleType,
+        *,
+        before_execute: Callable[[list[str]], None] | None = None,
+        rewrite_stdout: Callable[[str], str] | None = None,
+    ) -> None:
+        self.module = module
+        self.before_execute = before_execute
+        self.rewrite_stdout = rewrite_stdout
+        self.calls: list[list[str]] = []
+        self.results: list[subprocess.CompletedProcess[str]] = []
+
+    def run(
+        self,
+        arguments: Sequence[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        command = list(arguments)
+        self.calls.append(command)
+        assert command[:5] == [
+            self.module.SUDO_BINARY,
+            self.module.PYTHON_BINARY,
+            "-I",
+            "-c",
+            self.module.CANDIDATE_DATA_QUARANTINE_HELPER,
+        ]
+        if self.before_execute is not None:
+            self.before_execute(command)
+        result = subprocess.run(
+            [sys.executable, *command[2:]],
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.results.append(result)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            suffix = f": {detail}" if detail else ""
+            raise self.module.DeploymentError(
+                f"command failed ({command[0]}, exit {result.returncode}){suffix}"
+            )
+        if self.rewrite_stdout is None:
+            return result
+        return subprocess.CompletedProcess(
+            command,
+            result.returncode,
+            self.rewrite_stdout(result.stdout),
+            result.stderr,
+        )
+
+
+def quarantine_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def prepare_candidate_quarantine_inputs(
+    module: ModuleType,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    include_state: bool = False,
+) -> tuple[Path, Path, Path, Path]:
+    app_root = root / "apps" / "commerce-ops-desk"
+    state_directory = app_root / "deploy-state"
+    state_directory.mkdir(mode=0o700, parents=True)
+    app_root.chmod(0o700)
+    monkeypatch.setattr(module, "APP_ROOT", app_root)
+    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
+    monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
+    create_candidate_prepare_lock(app_root)
+    data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
+    data_path.mkdir(mode=0o700)
+    retained = data_path / ".retained"
+    retained.write_text("keep\n", encoding="utf-8")
+    state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
+    if include_state:
+        state_path.write_text('{"keep": true}\n', encoding="utf-8")
+        state_path.chmod(0o600)
+    return app_root, state_directory, data_path, state_path
 
 
 @pytest.fixture
@@ -510,7 +602,6 @@ def test_compose_commands_use_verified_stdin_and_one_explicit_service() -> None:
         identity,
         "create",
         "--no-build",
-        "--no-deps",
         module.COMPOSE_SERVICE,
     ) == [
         "/usr/bin/docker",
@@ -521,7 +612,6 @@ def test_compose_commands_use_verified_stdin_and_one_explicit_service() -> None:
         "-",
         "create",
         "--no-build",
-        "--no-deps",
         "commerce-ops-desk",
     ]
 
@@ -1893,8 +1983,40 @@ def test_quarantine_candidate_inputs_moves_each_shape_under_the_prepare_lock(
     if candidate_shape in {"state-only", "both"}:
         state_path.write_text('{"keep": true}\n', encoding="utf-8")
         state_path.chmod(0o600)
+    root_identity = quarantine_identity(app_root.stat())
+    data_identity = (
+        quarantine_identity(data_path.stat())
+        if candidate_shape != "state-only"
+        else None
+    )
+    local_moves: list[str] = []
+    real_rename = module._rename_candidate_input_noreplace
 
-    archive = module.quarantine_candidate_inputs(VALID_SHA)
+    def record_local_rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+    ) -> None:
+        if source == data_path.name:
+            pytest.fail("runtime-owned candidate data must use the sudo helper")
+        local_moves.append(source)
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(
+        module,
+        "_rename_candidate_input_noreplace",
+        record_local_rename,
+    )
+    runner = InlineSudoPythonRunner(module)
+
+    archive = module.quarantine_candidate_inputs(VALID_SHA, runner)
 
     assert archive.parent == app_root
     assert archive.name.startswith(f"quarantine-candidate-{VALID_SHA[:12]}-")
@@ -1907,6 +2029,21 @@ def test_quarantine_candidate_inputs_moves_each_shape_under_the_prepare_lock(
         assert (archive / "data" / ".retained").read_text(encoding="utf-8") == (
             "keep\n"
         )
+    assert len(runner.calls) == (candidate_shape != "state-only")
+    if data_identity is not None:
+        assert quarantine_identity((archive / "data").stat()) == data_identity
+        assert runner.calls[0][5:] == [
+            str(app_root),
+            data_path.name,
+            archive.name,
+            *(str(value) for value in root_identity),
+            *(str(value) for value in quarantine_identity(archive.stat())),
+            *(str(value) for value in data_identity),
+        ]
+        assert runner.results[0].stdout == (
+            "|".join(str(value) for value in data_identity) + "\n"
+        )
+    assert local_moves == ([state_path.name] if candidate_shape != "data-only" else [])
 
 
 def test_quarantine_candidate_inputs_holds_prepare_lock_through_both_moves(
@@ -1931,6 +2068,14 @@ def test_quarantine_candidate_inputs_holds_prepare_lock_through_both_moves(
     state_path.chmod(0o600)
     real_rename = module._rename_candidate_input_noreplace
     observed_moves: list[str] = []
+
+    def assert_lock_during_data_helper(_command: list[str]) -> None:
+        with (
+            pytest.raises(module.DeploymentError, match="already in progress"),
+            module._candidate_prepare_lock(VALID_SHA),
+        ):
+            pytest.fail("quarantine released its SHA lock before the data helper")
+        observed_moves.append(data_path.name)
 
     def assert_lock_then_rename(
         source: str,
@@ -1958,9 +2103,193 @@ def test_quarantine_candidate_inputs_holds_prepare_lock_through_both_moves(
         assert_lock_then_rename,
     )
 
-    module.quarantine_candidate_inputs(VALID_SHA)
+    runner = InlineSudoPythonRunner(
+        module,
+        before_execute=assert_lock_during_data_helper,
+    )
+    module.quarantine_candidate_inputs(VALID_SHA, runner)
 
     assert observed_moves == [data_path.name, state_path.name]
+    assert len(runner.calls) == 1
+
+
+def test_candidate_data_quarantine_helper_never_replaces_a_prepositioned_destination(
+    rename_noreplace_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    app_root, _state_directory, data_path, _state_path = (
+        prepare_candidate_quarantine_inputs(
+            module,
+            rename_noreplace_path,
+            monkeypatch,
+        )
+    )
+    original_identity = quarantine_identity(data_path.stat())
+    prepositioned: Path | None = None
+
+    def insert_archive_destination(command: list[str]) -> None:
+        nonlocal prepositioned
+        assert len(command) == 20
+        archive = app_root / command[7]
+        prepositioned = archive / "data"
+        prepositioned.write_text("pre-positioned\n", encoding="utf-8")
+
+    runner = InlineSudoPythonRunner(
+        module,
+        before_execute=insert_archive_destination,
+    )
+
+    with pytest.raises(module.DeploymentError):
+        module.quarantine_candidate_inputs(VALID_SHA, runner)
+
+    assert quarantine_identity(data_path.stat()) == original_identity
+    assert (data_path / ".retained").read_text(encoding="utf-8") == "keep\n"
+    assert prepositioned is not None
+    assert prepositioned.read_text(encoding="utf-8") == "pre-positioned\n"
+    assert len(runner.calls) == 1
+    assert runner.results[0].returncode != 0
+
+
+@pytest.mark.parametrize(
+    "metadata_race",
+    [
+        "data-inode",
+        "data-mode",
+        "data-symlink",
+        "archive-inode",
+        "archive-mode",
+        "archive-symlink",
+    ],
+)
+def test_candidate_data_quarantine_helper_rejects_changed_bound_metadata(
+    rename_noreplace_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_race: str,
+) -> None:
+    module = load_deploy_tool()
+    app_root, _state_directory, data_path, _state_path = (
+        prepare_candidate_quarantine_inputs(
+            module,
+            rename_noreplace_path,
+            monkeypatch,
+        )
+    )
+    displaced = app_root / f"displaced-{metadata_race}"
+
+    def mutate_after_parent_validation(command: list[str]) -> None:
+        assert len(command) == 20
+        archive = app_root / command[7]
+        if metadata_race == "data-inode":
+            data_path.rename(displaced)
+            data_path.mkdir(mode=0o700)
+            (data_path / ".replacement").write_text("replacement\n", encoding="utf-8")
+        elif metadata_race == "data-mode":
+            data_path.chmod(0o755)
+        elif metadata_race == "data-symlink":
+            data_path.rename(displaced)
+            data_path.symlink_to(displaced, target_is_directory=True)
+        elif metadata_race == "archive-inode":
+            archive.rename(displaced)
+            archive.mkdir(mode=0o700)
+        elif metadata_race == "archive-symlink":
+            archive.rename(displaced)
+            archive.symlink_to(displaced, target_is_directory=True)
+        else:
+            archive.chmod(0o755)
+
+    runner = InlineSudoPythonRunner(
+        module,
+        before_execute=mutate_after_parent_validation,
+    )
+
+    with pytest.raises(module.DeploymentError):
+        module.quarantine_candidate_inputs(VALID_SHA, runner)
+
+    assert len(runner.calls) == 1
+    assert runner.results[0].returncode != 0
+    assert data_path.is_dir()
+    if metadata_race == "data-inode":
+        assert (displaced / ".retained").read_text(encoding="utf-8") == "keep\n"
+        assert (data_path / ".replacement").read_text(encoding="utf-8") == (
+            "replacement\n"
+        )
+    elif metadata_race == "data-symlink":
+        assert data_path.is_symlink()
+        assert (displaced / ".retained").read_text(encoding="utf-8") == "keep\n"
+    else:
+        assert (data_path / ".retained").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_candidate_data_quarantine_helper_is_dirfd_bound_and_durable() -> None:
+    module = load_deploy_tool()
+    helper = module.CANDIDATE_DATA_QUARANTINE_HELPER
+
+    for required_contract in (
+        "O_NOFOLLOW",
+        "renameat2",
+        "RENAME_NOREPLACE",
+        "data_descriptor = os.open",
+        "os.fstat(data_descriptor)",
+        "os.fsync(archive_descriptor)",
+        "os.fsync(root_descriptor)",
+    ):
+        assert required_contract in helper
+    compile(helper, "<candidate-data-quarantine-helper>", "exec")
+
+    rename_offset = helper.rindex("renameat2(")
+    receipt_offset = helper.rindex("print(")
+    assert helper.index("data_descriptor = os.open") < rename_offset
+    assert helper.rindex("os.fstat(data_descriptor)") > rename_offset
+    assert helper.rindex("os.close(data_descriptor)") > rename_offset
+    assert rename_offset < helper.rindex("os.fsync(archive_descriptor)")
+    assert rename_offset < helper.rindex("os.fsync(root_descriptor)")
+    assert helper.rindex("os.fsync(archive_descriptor)") < receipt_offset
+    assert helper.rindex("os.fsync(root_descriptor)") < receipt_offset
+
+
+@pytest.mark.parametrize(
+    "receipt_mutation",
+    ["missing-newline", "extra-line", "noncanonical", "wrong-inode"],
+)
+def test_candidate_data_quarantine_requires_one_exact_identity_receipt(
+    rename_noreplace_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_mutation: str,
+) -> None:
+    module = load_deploy_tool()
+    app_root, _state_directory, data_path, state_path = (
+        prepare_candidate_quarantine_inputs(
+            module,
+            rename_noreplace_path,
+            monkeypatch,
+            include_state=True,
+        )
+    )
+
+    def corrupt_receipt(receipt: str) -> str:
+        fields = receipt.removesuffix("\n").split("|")
+        assert len(fields) == 4
+        if receipt_mutation == "missing-newline":
+            return receipt.removesuffix("\n")
+        if receipt_mutation == "extra-line":
+            return receipt + "unexpected\n"
+        if receipt_mutation == "noncanonical":
+            fields[0] = "0" + fields[0]
+        else:
+            fields[1] = str(int(fields[1]) + 1)
+        return "|".join(fields) + "\n"
+
+    runner = InlineSudoPythonRunner(module, rewrite_stdout=corrupt_receipt)
+
+    with pytest.raises(module.DeploymentError, match="receipt|identity"):
+        module.quarantine_candidate_inputs(VALID_SHA, runner)
+
+    assert not data_path.exists()
+    assert state_path.read_text(encoding="utf-8") == '{"keep": true}\n'
+    assert len(runner.calls) == 1
+    archive = app_root / runner.calls[0][7]
+    assert (archive / "data" / ".retained").read_text(encoding="utf-8") == ("keep\n")
 
 
 @pytest.mark.parametrize(
@@ -2148,6 +2477,53 @@ def test_quarantine_rejects_cross_device_state_before_creating_an_archive(
         os.close(state_fd)
 
     assert state_path.is_file()
+    assert not list(app_root.glob(f"quarantine-candidate-{VALID_SHA[:12]}-*"))
+
+
+def test_quarantine_rejects_a_cross_device_state_file_before_creating_an_archive(
+    rename_noreplace_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    app_root = rename_noreplace_path / "apps" / "commerce-ops-desk"
+    state_directory = app_root / "deploy-state"
+    state_directory.mkdir(mode=0o700, parents=True)
+    app_root.chmod(0o700)
+    monkeypatch.setattr(module, "APP_ROOT", app_root)
+    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    create_candidate_prepare_lock(app_root)
+    state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
+    state_path.write_text('{"keep": true}\n', encoding="utf-8")
+    state_path.chmod(0o600)
+    real_metadata = module._candidate_input_metadata
+
+    def cross_device_state_metadata(
+        name: str,
+        *,
+        directory_fd: int,
+        label: str,
+    ) -> os.stat_result | None:
+        metadata = real_metadata(
+            name,
+            directory_fd=directory_fd,
+            label=label,
+        )
+        if label != "candidate state" or metadata is None:
+            return metadata
+        fields = list(metadata)
+        fields[stat.ST_DEV] = app_root.stat().st_dev + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(
+        module,
+        "_candidate_input_metadata",
+        cross_device_state_metadata,
+    )
+
+    with pytest.raises(module.DeploymentError, match="same filesystem"):
+        module.quarantine_candidate_inputs(VALID_SHA)
+
+    assert state_path.read_text(encoding="utf-8") == '{"keep": true}\n'
     assert not list(app_root.glob(f"quarantine-candidate-{VALID_SHA[:12]}-*"))
 
 
@@ -2416,8 +2792,9 @@ def test_quarantine_candidate_inputs_resumes_without_reusing_the_first_archive(
         "_rename_candidate_input_noreplace",
         interrupt_before_state_move,
     )
+    first_runner = InlineSudoPythonRunner(module)
     with pytest.raises(module.DeploymentError, match="candidate state"):
-        module.quarantine_candidate_inputs(VALID_SHA)
+        module.quarantine_candidate_inputs(VALID_SHA, first_runner)
 
     first_archives = list(app_root.glob(f"quarantine-candidate-{VALID_SHA[:12]}-*"))
     assert len(first_archives) == 1
@@ -2428,7 +2805,8 @@ def test_quarantine_candidate_inputs_resumes_without_reusing_the_first_archive(
     assert state_path.is_file()
 
     monkeypatch.setattr(module, "_rename_candidate_input_noreplace", real_rename)
-    second_archive = module.quarantine_candidate_inputs(VALID_SHA)
+    second_runner = InlineSudoPythonRunner(module)
+    second_archive = module.quarantine_candidate_inputs(VALID_SHA, second_runner)
 
     assert second_archive != first_archive
     assert (first_archive / "data" / ".retained").read_text(encoding="utf-8") == (
@@ -2438,6 +2816,8 @@ def test_quarantine_candidate_inputs_resumes_without_reusing_the_first_archive(
         '{"keep": true}\n'
     )
     assert not state_path.exists()
+    assert len(first_runner.calls) == 1
+    assert second_runner.calls == []
 
 
 def test_candidate_quarantine_rename_never_replaces_an_existing_destination(
@@ -2834,10 +3214,17 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
     module.prepare_candidate(arguments, runner)
 
     compose_calls = [call for call in runner.calls if call[0][1] == "compose"]
-    assert [call[0][-2:] for call in compose_calls] == [
+    assert [call[0][6:] for call in compose_calls] == [
         ["config", "--services"],
-        ["--no-deps", "commerce-ops-desk"],
-        ["--no-deps", "commerce-ops-desk"],
+        ["create", "--no-build", "commerce-ops-desk"],
+        [
+            "up",
+            "--detach",
+            "--force-recreate",
+            "--no-build",
+            "--no-deps",
+            "commerce-ops-desk",
+        ],
     ]
     assert all(call[1] == contents[DEPLOYMENT_ASSET_PATHS[0]] for call in compose_calls)
     assert exact_container_calls == [create_container_id, final_container_id]
@@ -3536,11 +3923,14 @@ def test_deploy_tool_cli_dispatches_quarantine_and_prints_the_archive(
     module = load_deploy_tool()
     archive = tmp_path / f"quarantine-candidate-{VALID_SHA[:12]}-retained"
     observed_shas: list[str] = []
+    runner = object()
 
-    def quarantine(source_sha: str) -> Path:
+    def quarantine(source_sha: str, received_runner: object) -> Path:
         observed_shas.append(source_sha)
+        assert received_runner is runner
         return archive
 
+    monkeypatch.setattr(module, "CommandRunner", lambda: runner)
     monkeypatch.setattr(module, "quarantine_candidate_inputs", quarantine)
 
     assert module.main(["quarantine", "--source-sha", VALID_SHA]) == 0
@@ -4041,7 +4431,7 @@ def test_runbook_fails_closed_and_archives_stale_candidate_inputs() -> None:
         "same filesystem",
         "verify_exact_checkout",
         "/usr/bin/python3 -I deploy/workstation/deploy.py quarantine",
-        '--source-sha "$SOURCE_SHA"',
+        '--source-sha "$INTERRUPTED_SOURCE_SHA"',
     ):
         assert required_contract in normalized
 

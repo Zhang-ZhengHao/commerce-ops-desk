@@ -119,6 +119,16 @@ All included identities and order records are fictional. No customer email, addr
 
 The hosted synthetic demo is single-node. SQLite WAL is used only on a host-local path; tests explicitly avoid the NFS-mounted workspace after reproducing lock stalls there. The direct launcher keeps its default database in disposable local runtime storage. The workstation deployment instead bind-mounts the database and generated secret files so they survive container replacement; backups and high availability remain outside this demo's scope.
 
+Interrupted candidate recovery holds the per-SHA preparation lock while it
+validates and moves each retained input. Because candidate data is owned by the
+numeric runtime identity, only that data move crosses the privilege boundary:
+a narrow fixed-argv isolated privileged Python helper rebinds the application
+root, archive, and source identities before one no-clobber atomic rename.
+Deployment-user-owned candidate state remains on the unprivileged path. Data
+and state are separate atomic moves and recovery is resumable between them;
+the helper does not change ownership, delete or copy retained inputs, follow
+symlinks, or fall back to an unconstrained move.
+
 The workstation Caddy helper maintains a root-owned, canonical, linear route
 head and permits rollback only from the current head's immutable schema-3
 transaction. Target health and full upstream identity are checked before a

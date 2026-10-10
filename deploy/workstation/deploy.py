@@ -274,6 +274,209 @@ try:
 finally:
     os.close(root_descriptor)
 """
+CANDIDATE_DATA_QUARANTINE_HELPER = """\
+import ctypes
+import errno
+import os
+import stat
+import sys
+
+if len(sys.argv) != 16:
+    raise SystemExit("invalid candidate data quarantine arguments")
+(
+    app_root,
+    data_name,
+    archive_name,
+    *raw_identity,
+) = sys.argv[1:]
+data_prefix = "data-candidate-"
+archive_prefix = "quarantine-candidate-"
+if (
+    not os.path.isabs(app_root)
+    or os.path.realpath(app_root) != app_root
+    or os.path.basename(data_name) != data_name
+    or os.path.basename(archive_name) != archive_name
+    or not data_name.startswith(data_prefix)
+    or len(data_name) != len(data_prefix) + 12
+    or any(character not in "0123456789abcdef" for character in data_name[-12:])
+    or not archive_name.startswith(f"{archive_prefix}{data_name[-12:]}-")
+    or len(archive_name) != len(archive_prefix) + 12 + 1 + 16
+    or any(character not in "0123456789abcdef" for character in archive_name[-16:])
+    or len(raw_identity) != 12
+    or any(not value.isascii() or not value.isdigit() for value in raw_identity)
+):
+    raise SystemExit("invalid candidate data quarantine arguments")
+
+identity_values = tuple(int(value) for value in raw_identity)
+if any(
+    str(value) != raw
+    for value, raw in zip(identity_values, raw_identity, strict=True)
+):
+    raise SystemExit("invalid candidate data quarantine identity")
+root_identity = identity_values[0:4]
+archive_identity = identity_values[4:8]
+data_identity = identity_values[8:12]
+for identity in (root_identity, archive_identity, data_identity):
+    if identity[0] < 0 or identity[1] <= 0 or identity[2] < 0 or identity[3] < 0:
+        raise SystemExit("invalid candidate data quarantine identity")
+if not (root_identity[0] == archive_identity[0] == data_identity[0]):
+    raise SystemExit("candidate data quarantine requires one filesystem")
+
+
+def matches_directory(metadata, expected):
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+        and (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_uid,
+            metadata.st_gid,
+        )
+        == expected
+    )
+
+
+listed_root = os.lstat(app_root)
+if not matches_directory(listed_root, root_identity):
+    raise SystemExit("application root identity changed before quarantine")
+
+directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+directory_flags |= getattr(os, "O_CLOEXEC", 0)
+directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+root_descriptor = -1
+archive_descriptor = -1
+data_descriptor = -1
+try:
+    root_descriptor = os.open(app_root, directory_flags)
+    opened_root = os.fstat(root_descriptor)
+    if not matches_directory(opened_root, root_identity):
+        raise SystemExit("application root identity changed while opening")
+
+    linked_archive = os.stat(
+        archive_name,
+        dir_fd=root_descriptor,
+        follow_symlinks=False,
+    )
+    if not matches_directory(linked_archive, archive_identity):
+        raise SystemExit("quarantine archive identity changed before opening")
+    archive_descriptor = os.open(
+        archive_name,
+        directory_flags,
+        dir_fd=root_descriptor,
+    )
+    opened_archive = os.fstat(archive_descriptor)
+    if not matches_directory(opened_archive, archive_identity):
+        raise SystemExit("quarantine archive identity changed while opening")
+
+    linked_data = os.stat(
+        data_name,
+        dir_fd=root_descriptor,
+        follow_symlinks=False,
+    )
+    if not matches_directory(linked_data, data_identity):
+        raise SystemExit("candidate data identity changed before opening")
+    data_descriptor = os.open(
+        data_name,
+        directory_flags,
+        dir_fd=root_descriptor,
+    )
+    opened_data = os.fstat(data_descriptor)
+    if not matches_directory(opened_data, data_identity):
+        raise SystemExit("candidate data identity changed while opening")
+
+    current_root = os.stat(app_root, follow_symlinks=False)
+    current_archive = os.stat(
+        archive_name,
+        dir_fd=root_descriptor,
+        follow_symlinks=False,
+    )
+    current_data = os.stat(
+        data_name,
+        dir_fd=root_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not matches_directory(current_root, root_identity)
+        or not matches_directory(current_archive, archive_identity)
+        or not matches_directory(current_data, data_identity)
+    ):
+        raise SystemExit("candidate data quarantine hierarchy changed")
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError:
+        raise SystemExit(
+            "renameat2 is required for no-clobber candidate data quarantine"
+        ) from None
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    RENAME_NOREPLACE = 1
+    result = renameat2(
+        root_descriptor,
+        os.fsencode(data_name),
+        archive_descriptor,
+        b"data",
+        RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise SystemExit("candidate data quarantine destination already exists")
+        raise SystemExit("candidate data could not be quarantined safely")
+
+    moved_data = os.stat(
+        "data",
+        dir_fd=archive_descriptor,
+        follow_symlinks=False,
+    )
+    opened_data = os.fstat(data_descriptor)
+    if (
+        not matches_directory(moved_data, data_identity)
+        or not matches_directory(opened_data, data_identity)
+    ):
+        raise SystemExit("candidate data identity changed during quarantine")
+    try:
+        os.stat(data_name, dir_fd=root_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise SystemExit("candidate data source still exists after quarantine")
+
+    current_root = os.stat(app_root, follow_symlinks=False)
+    current_archive = os.stat(
+        archive_name,
+        dir_fd=root_descriptor,
+        follow_symlinks=False,
+    )
+    opened_root = os.fstat(root_descriptor)
+    opened_archive = os.fstat(archive_descriptor)
+    if (
+        not matches_directory(current_root, root_identity)
+        or not matches_directory(opened_root, root_identity)
+        or not matches_directory(current_archive, archive_identity)
+        or not matches_directory(opened_archive, archive_identity)
+    ):
+        raise SystemExit("candidate data quarantine hierarchy changed")
+
+    os.fsync(archive_descriptor)
+    os.fsync(root_descriptor)
+    print("|".join(str(value) for value in data_identity))
+finally:
+    if data_descriptor >= 0:
+        os.close(data_descriptor)
+    if archive_descriptor >= 0:
+        os.close(archive_descriptor)
+    if root_descriptor >= 0:
+        os.close(root_descriptor)
+"""
 CANDIDATE_DATA_FRESHNESS_HELPER = """\
 import os
 import stat
@@ -3337,8 +3540,8 @@ def _create_quarantine_archive(
                 not stat.S_ISDIR(opened.st_mode)
                 or not stat.S_ISDIR(linked.st_mode)
                 or (linked.st_dev, linked.st_ino) != identity
-                or opened.st_uid != os.geteuid()
-                or linked.st_uid != os.geteuid()
+                or (opened.st_uid, opened.st_gid) != (os.geteuid(), os.getegid())
+                or (linked.st_uid, linked.st_gid) != (os.geteuid(), os.getegid())
                 or stat.S_IMODE(opened.st_mode) != 0o700
                 or stat.S_IMODE(linked.st_mode) != 0o700
             ):
@@ -3458,7 +3661,152 @@ def _move_candidate_input_to_quarantine(
     _assert_quarantine_hierarchy_current(app_root_fd, app_root_identity, lock)
 
 
-def quarantine_candidate_inputs(source_sha: str) -> Path:
+def _move_candidate_data_to_quarantine(
+    runner: CommandRunner,
+    *,
+    source_name: str,
+    archive_name: str,
+    archive_fd: int,
+    archive_identity: tuple[int, int],
+    expected: os.stat_result,
+    app_root_fd: int,
+    app_root_identity: tuple[int, int],
+    lock: CandidatePrepareLock,
+) -> None:
+    """Move runtime-owned candidate data through the isolated root helper."""
+
+    _assert_quarantine_hierarchy_current(app_root_fd, app_root_identity, lock)
+    current = _candidate_input_metadata(
+        source_name,
+        directory_fd=app_root_fd,
+        label="candidate data",
+    )
+    if current is None:
+        raise DeploymentError("candidate data changed before quarantine")
+    _validate_quarantine_data(current)
+    if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+        raise DeploymentError("candidate data changed before quarantine")
+
+    try:
+        root_metadata = os.fstat(app_root_fd)
+        linked_archive = os.stat(
+            archive_name,
+            dir_fd=app_root_fd,
+            follow_symlinks=False,
+        )
+        archive_metadata = os.fstat(archive_fd)
+    except OSError:
+        raise DeploymentError("candidate data quarantine hierarchy changed") from None
+    expected_owner = (os.geteuid(), os.getegid())
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or (root_metadata.st_dev, root_metadata.st_ino) != app_root_identity
+        or (root_metadata.st_uid, root_metadata.st_gid) != expected_owner
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        or not stat.S_ISDIR(linked_archive.st_mode)
+        or not stat.S_ISDIR(archive_metadata.st_mode)
+        or (linked_archive.st_dev, linked_archive.st_ino) != archive_identity
+        or (archive_metadata.st_dev, archive_metadata.st_ino) != archive_identity
+        or (linked_archive.st_uid, linked_archive.st_gid) != expected_owner
+        or (archive_metadata.st_uid, archive_metadata.st_gid) != expected_owner
+        or stat.S_IMODE(linked_archive.st_mode) != 0o700
+        or stat.S_IMODE(archive_metadata.st_mode) != 0o700
+        or not (root_metadata.st_dev == archive_metadata.st_dev == current.st_dev)
+    ):
+        raise DeploymentError("candidate data quarantine hierarchy changed")
+
+    root_receipt = (
+        root_metadata.st_dev,
+        root_metadata.st_ino,
+        root_metadata.st_uid,
+        root_metadata.st_gid,
+    )
+    archive_receipt = (
+        archive_metadata.st_dev,
+        archive_metadata.st_ino,
+        archive_metadata.st_uid,
+        archive_metadata.st_gid,
+    )
+    data_receipt = (
+        current.st_dev,
+        current.st_ino,
+        current.st_uid,
+        current.st_gid,
+    )
+    result = runner.run(
+        [
+            SUDO_BINARY,
+            PYTHON_BINARY,
+            "-I",
+            "-c",
+            CANDIDATE_DATA_QUARANTINE_HELPER,
+            str(APP_ROOT),
+            source_name,
+            archive_name,
+            *(str(value) for value in root_receipt),
+            *(str(value) for value in archive_receipt),
+            *(str(value) for value in data_receipt),
+        ]
+    )
+    expected_receipt = "|".join(str(value) for value in data_receipt) + "\n"
+    if result.stdout != expected_receipt:
+        raise DeploymentError("candidate data quarantine receipt identity is invalid")
+
+    moved = _candidate_input_metadata(
+        "data",
+        directory_fd=archive_fd,
+        label="quarantined candidate data",
+    )
+    if moved is None:
+        raise DeploymentError("candidate data quarantine receipt was not committed")
+    _validate_quarantine_data(moved)
+    if (
+        moved.st_dev,
+        moved.st_ino,
+        moved.st_uid,
+        moved.st_gid,
+    ) != data_receipt:
+        raise DeploymentError("candidate data identity changed during quarantine")
+    if (
+        _candidate_input_metadata(
+            source_name,
+            directory_fd=app_root_fd,
+            label="candidate data",
+        )
+        is not None
+    ):
+        raise DeploymentError("candidate data was replaced while being quarantined")
+
+    _assert_quarantine_hierarchy_current(app_root_fd, app_root_identity, lock)
+    try:
+        linked_archive = os.stat(
+            archive_name,
+            dir_fd=app_root_fd,
+            follow_symlinks=False,
+        )
+        opened_archive = os.fstat(archive_fd)
+    except OSError:
+        raise DeploymentError("candidate data quarantine archive changed") from None
+    if (
+        not stat.S_ISDIR(linked_archive.st_mode)
+        or not stat.S_ISDIR(opened_archive.st_mode)
+        or (linked_archive.st_dev, linked_archive.st_ino) != archive_identity
+        or (opened_archive.st_dev, opened_archive.st_ino) != archive_identity
+        or (linked_archive.st_uid, linked_archive.st_gid) != expected_owner
+        or (opened_archive.st_uid, opened_archive.st_gid) != expected_owner
+        or stat.S_IMODE(linked_archive.st_mode) != 0o700
+        or stat.S_IMODE(opened_archive.st_mode) != 0o700
+    ):
+        raise DeploymentError("candidate data quarantine archive changed")
+    os.fsync(archive_fd)
+    os.fsync(app_root_fd)
+    _assert_quarantine_hierarchy_current(app_root_fd, app_root_identity, lock)
+
+
+def quarantine_candidate_inputs(
+    source_sha: str,
+    runner: CommandRunner | None = None,
+) -> Path:
     """Move retained candidate inputs into a fresh, durable archive."""
 
     identity = candidate_identity(source_sha)
@@ -3489,8 +3837,18 @@ def quarantine_candidate_inputs(source_sha: str) -> Path:
             )
             if data_metadata is not None:
                 _validate_quarantine_data(data_metadata)
+                if data_metadata.st_dev != app_root_identity[0]:
+                    raise DeploymentError(
+                        "candidate data and application root must use the same "
+                        "filesystem"
+                    )
             if state_metadata is not None:
                 _validate_quarantine_state(state_metadata)
+                if state_metadata.st_dev != app_root_identity[0]:
+                    raise DeploymentError(
+                        "candidate state and application root must use the same "
+                        "filesystem"
+                    )
             if data_metadata is None and state_metadata is None:
                 raise DeploymentError(
                     "no candidate data or state remains to quarantine"
@@ -3501,14 +3859,14 @@ def quarantine_candidate_inputs(source_sha: str) -> Path:
                 source_sha=identity.source_sha,
             )
             if data_metadata is not None:
-                _move_candidate_input_to_quarantine(
+                command_runner = runner if runner is not None else CommandRunner()
+                _move_candidate_data_to_quarantine(
+                    command_runner,
                     source_name=data_name,
-                    source_directory_fd=app_root_fd,
-                    destination_name="data",
+                    archive_name=archive_name,
                     archive_fd=archive_fd,
+                    archive_identity=archive_identity,
                     expected=data_metadata,
-                    validate=_validate_quarantine_data,
-                    label="candidate data",
                     app_root_fd=app_root_fd,
                     app_root_identity=app_root_identity,
                     lock=lock,
@@ -3542,8 +3900,10 @@ def quarantine_candidate_inputs(source_sha: str) -> Path:
                 or not stat.S_ISDIR(opened_archive.st_mode)
                 or (linked_archive.st_dev, linked_archive.st_ino) != archive_identity
                 or (opened_archive.st_dev, opened_archive.st_ino) != archive_identity
-                or linked_archive.st_uid != os.geteuid()
-                or opened_archive.st_uid != os.geteuid()
+                or (linked_archive.st_uid, linked_archive.st_gid)
+                != (os.geteuid(), os.getegid())
+                or (opened_archive.st_uid, opened_archive.st_gid)
+                != (os.geteuid(), os.getegid())
                 or stat.S_IMODE(linked_archive.st_mode) != 0o700
                 or stat.S_IMODE(opened_archive.st_mode) != 0o700
             ):
@@ -4019,7 +4379,6 @@ def _prepare_candidate_locked(
             identity,
             "create",
             "--no-build",
-            "--no-deps",
             COMPOSE_SERVICE,
         ),
         environment=placeholder_environment,
@@ -6880,7 +7239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             state = prepare_candidate(arguments, runner)
             print(f"candidate healthy; state recorded at {state}")
         elif arguments.command == "quarantine":
-            archive = quarantine_candidate_inputs(arguments.source_sha)
+            archive = quarantine_candidate_inputs(arguments.source_sha, runner)
             print(f"candidate inputs retained at {archive}")
         elif arguments.command == "switch":
             backup = switch_candidate(arguments, runner)
