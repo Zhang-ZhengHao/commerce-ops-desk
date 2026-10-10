@@ -485,6 +485,22 @@ def _inspect_built_image(
     )
     if revision != source_sha:
         raise BuildError("built image OCI revision label does not match SOURCE_SHA")
+    environment = config.get("Env") if isinstance(config, dict) else None
+    runtime_source_shas = (
+        [
+            entry.partition("=")[2]
+            for entry in environment
+            if isinstance(entry, str) and entry.startswith("COMMERCE_OPS_SOURCE_SHA=")
+        ]
+        if isinstance(environment, list)
+        else []
+    )
+    if not runtime_source_shas:
+        raise BuildError("built image runtime source SHA is missing")
+    if len(runtime_source_shas) > 1:
+        raise BuildError("built image runtime source SHA is defined more than once")
+    if runtime_source_shas[0] != source_sha:
+        raise BuildError("built image runtime source SHA does not match SOURCE_SHA")
     image_id = image_document.get("Id")
     if not isinstance(image_id, str) or IMAGE_ID_PATTERN.fullmatch(image_id) is None:
         raise BuildError("built image did not return one immutable image ID")

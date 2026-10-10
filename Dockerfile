@@ -12,13 +12,16 @@ RUN npm run build
 FROM python:3.12-slim-bookworm AS runtime
 
 ARG SOURCE_SHA
-RUN test -n "$SOURCE_SHA"
+RUN test -n "$SOURCE_SHA" \
+    && test "${#SOURCE_SHA}" -eq 40 \
+    && case "$SOURCE_SHA" in *[!0-9a-f]*) exit 1 ;; esac
 LABEL org.opencontainers.image.revision="$SOURCE_SHA"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     COMMERCE_OPS_DATABASE_URL=sqlite+pysqlite:////app/data/commerce_ops.db \
     COMMERCE_OPS_ENVIRONMENT=demo \
+    COMMERCE_OPS_SOURCE_SHA=$SOURCE_SHA \
     COMMERCE_OPS_VENV_DIR=/opt/venv \
     PORT=8000
 

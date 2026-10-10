@@ -29,6 +29,7 @@ def valid_image_config() -> dict[str, object]:
         "Env": [
             "COMMERCE_OPS_DATABASE_URL=sqlite+pysqlite:////app/data/commerce_ops.db",
             "COMMERCE_OPS_ENVIRONMENT=demo",
+            f"COMMERCE_OPS_SOURCE_SHA={VALID_SHA}",
             "COMMERCE_OPS_VENV_DIR=/opt/venv",
             "PORT=8000",
             "PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin",
@@ -77,6 +78,7 @@ def valid_inspection(module: ModuleType) -> dict[str, object]:
             "Env": [
                 "COMMERCE_OPS_DATABASE_URL=sqlite+pysqlite:////app/data/commerce_ops.db",
                 "COMMERCE_OPS_ENVIRONMENT=demo",
+                f"COMMERCE_OPS_SOURCE_SHA={VALID_SHA}",
                 "COMMERCE_OPS_VENV_DIR=/opt/venv",
                 'COMMERCE_OPS_ALLOWED_HOSTS=["commerce-ops-desk.srrsh.aig.rest","127.0.0.1","localhost"]',
                 f"COMMERCE_OPS_TRUSTED_PROXY_CIDRS={TRUSTED_PROXY_JSON}",
@@ -206,6 +208,28 @@ def test_candidate_runtime_accepts_the_exact_hardened_contract() -> None:
     module = load_deploy_tool()
 
     validate(module, valid_inspection(module))
+
+
+def test_candidate_runtime_rejects_source_sha_that_only_matches_image_baseline() -> (
+    None
+):
+    module = load_deploy_tool()
+    inspection = valid_inspection(module)
+    image_config = valid_image_config()
+    wrong_source_sha = "f" * 40
+    for config in (inspection["Config"], image_config):
+        assert isinstance(config, dict)
+        environment = config["Env"]
+        assert isinstance(environment, list)
+        environment[:] = [
+            f"COMMERCE_OPS_SOURCE_SHA={wrong_source_sha}"
+            if entry.startswith("COMMERCE_OPS_SOURCE_SHA=")
+            else entry
+            for entry in environment
+        ]
+
+    with pytest.raises(module.DeploymentError, match="source SHA"):
+        validate(module, inspection, image_config=image_config)
 
 
 def test_candidate_runtime_accepts_docker_null_devices_without_device_mapping() -> None:

@@ -914,6 +914,7 @@ def _valid_image_config() -> dict[str, object]:
         "Env": [
             "COMMERCE_OPS_DATABASE_URL=sqlite+pysqlite:////app/data/commerce_ops.db",
             "COMMERCE_OPS_ENVIRONMENT=demo",
+            f"COMMERCE_OPS_SOURCE_SHA={VALID_SHA}",
             "COMMERCE_OPS_VENV_DIR=/opt/venv",
             "PORT=8000",
         ],
@@ -923,6 +924,72 @@ def _valid_image_config() -> dict[str, object]:
         "Volumes": {"/app/data": {}},
         "WorkingDir": "/app",
     }
+
+
+def test_immutable_candidate_image_rejects_mismatched_runtime_source_sha() -> None:
+    module = load_deploy_tool()
+    identity = module.candidate_identity(VALID_SHA)
+    image_id = "sha256:" + "1" * 64
+    config = _valid_image_config()
+    config["Labels"] = {"org.opencontainers.image.revision": VALID_SHA}
+    environment = config["Env"]
+    assert isinstance(environment, list)
+    environment[:] = [
+        f"COMMERCE_OPS_SOURCE_SHA={'f' * 40}"
+        if entry.startswith("COMMERCE_OPS_SOURCE_SHA=")
+        else entry
+        for entry in environment
+    ]
+
+    class ImageRunner:
+        def run(
+            self, arguments: list[str], **_: object
+        ) -> subprocess.CompletedProcess[str]:
+            command = list(arguments)
+            assert command == ["/usr/bin/docker", "image", "inspect", image_id]
+            inspection = [{"Id": image_id, "Config": config}]
+            return subprocess.CompletedProcess(command, 0, json.dumps(inspection), "")
+
+    with pytest.raises(module.DeploymentError, match="runtime source SHA"):
+        module._immutable_image_config(ImageRunner(), identity, image_id)
+
+
+@pytest.mark.parametrize(
+    "source_entries",
+    [
+        [],
+        [
+            f"COMMERCE_OPS_SOURCE_SHA={VALID_SHA}",
+            f"COMMERCE_OPS_SOURCE_SHA={VALID_SHA}",
+        ],
+    ],
+)
+def test_immutable_candidate_image_requires_exactly_one_runtime_source_sha(
+    source_entries: list[str],
+) -> None:
+    module = load_deploy_tool()
+    identity = module.candidate_identity(VALID_SHA)
+    image_id = "sha256:" + "1" * 64
+    config = _valid_image_config()
+    config["Labels"] = {"org.opencontainers.image.revision": VALID_SHA}
+    environment = config["Env"]
+    assert isinstance(environment, list)
+    config["Env"] = [
+        entry
+        for entry in environment
+        if not entry.startswith("COMMERCE_OPS_SOURCE_SHA=")
+    ] + source_entries
+
+    class ImageRunner:
+        def run(
+            self, arguments: list[str], **_: object
+        ) -> subprocess.CompletedProcess[str]:
+            command = list(arguments)
+            inspection = [{"Id": image_id, "Config": config}]
+            return subprocess.CompletedProcess(command, 0, json.dumps(inspection), "")
+
+    with pytest.raises(module.DeploymentError, match="exactly one runtime source SHA"):
+        module._immutable_image_config(ImageRunner(), identity, image_id)
 
 
 def _valid_candidate_inspection(module: ModuleType) -> dict[str, object]:
@@ -946,6 +1013,7 @@ def _valid_candidate_inspection(module: ModuleType) -> dict[str, object]:
             "Env": [
                 "COMMERCE_OPS_DATABASE_URL=sqlite+pysqlite:////app/data/commerce_ops.db",
                 "COMMERCE_OPS_ENVIRONMENT=demo",
+                f"COMMERCE_OPS_SOURCE_SHA={VALID_SHA}",
                 "COMMERCE_OPS_VENV_DIR=/opt/venv",
                 'COMMERCE_OPS_ALLOWED_HOSTS=["commerce-ops-desk.srrsh.aig.rest","127.0.0.1","localhost"]',
                 'COMMERCE_OPS_TRUSTED_PROXY_CIDRS=["192.0.2.1/32"]',

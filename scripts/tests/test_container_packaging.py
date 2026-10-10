@@ -37,6 +37,15 @@ class ContainerPackagingContractTest(unittest.TestCase):
             'LABEL org.opencontainers.image.revision="$SOURCE_SHA"', dockerfile
         )
         self.assertIn('RUN test -n "$SOURCE_SHA"', dockerfile)
+        self.assertIn("COMMERCE_OPS_SOURCE_SHA=$SOURCE_SHA", dockerfile)
+
+    def test_source_revision_build_arg_requires_a_full_lowercase_git_sha(
+        self,
+    ) -> None:
+        dockerfile = (PRODUCT_ROOT / "Dockerfile").read_text()
+
+        self.assertIn('test "${#SOURCE_SHA}" -eq 40', dockerfile)
+        self.assertIn('case "$SOURCE_SHA" in *[!0-9a-f]*)', dockerfile)
 
     def test_healthcheck_uses_the_runtime_port_and_database_readiness(self) -> None:
         dockerfile = (PRODUCT_ROOT / "Dockerfile").read_text()

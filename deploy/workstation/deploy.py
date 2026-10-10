@@ -1493,6 +1493,24 @@ def _immutable_image_config(
         raise DeploymentError(
             "immutable candidate image OCI revision does not match SOURCE_SHA"
         )
+    environment = config.get("Env")
+    runtime_source_shas = (
+        [
+            entry.partition("=")[2]
+            for entry in environment
+            if isinstance(entry, str) and entry.startswith("COMMERCE_OPS_SOURCE_SHA=")
+        ]
+        if isinstance(environment, list)
+        else []
+    )
+    if len(runtime_source_shas) != 1:
+        raise DeploymentError(
+            "immutable candidate image must define exactly one runtime source SHA"
+        )
+    if runtime_source_shas[0] != identity.source_sha:
+        raise DeploymentError(
+            "immutable candidate image runtime source SHA does not match SOURCE_SHA"
+        )
     return cast(dict[str, Any], config)
 
 
@@ -2394,6 +2412,14 @@ def validate_candidate_runtime_inspection(
     baseline_environment = parse_environment(
         image_config.get("Env"), label="candidate image"
     )
+    if baseline_environment.get("COMMERCE_OPS_SOURCE_SHA") != identity.source_sha:
+        raise DeploymentError(
+            "candidate image runtime source SHA does not match SOURCE_SHA"
+        )
+    if environment.get("COMMERCE_OPS_SOURCE_SHA") != identity.source_sha:
+        raise DeploymentError(
+            "candidate container runtime source SHA does not match SOURCE_SHA"
+        )
     expected_environment = dict(baseline_environment)
     expected_environment.update(
         {
