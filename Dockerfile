@@ -32,6 +32,7 @@ RUN groupadd --gid 10001 commerceops \
 WORKDIR /app
 COPY backend/requirements.lock /app/backend/requirements.lock
 RUN /opt/venv/bin/python -m pip install \
+    --timeout 300 \
     --no-cache-dir \
     --requirement /app/backend/requirements.lock
 

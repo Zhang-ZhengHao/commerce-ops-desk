@@ -21,6 +21,16 @@ class ContainerPackagingContractTest(unittest.TestCase):
         self.assertIn("--from=frontend-build", dockerfile)
         self.assertIn("/build/frontend/dist /app/frontend/dist", dockerfile)
 
+    def test_runtime_dependency_install_tolerates_slow_package_delivery(self) -> None:
+        dockerfile = (PRODUCT_ROOT / "Dockerfile").read_text()
+        install_command = dockerfile.split(
+            "RUN /opt/venv/bin/python -m pip install", maxsplit=1
+        )[1].split("\n\n", maxsplit=1)[0]
+
+        self.assertRegex(install_command, r"(?m)^\s+--timeout 300 \\\s*$")
+        self.assertIn("--no-cache-dir", install_command)
+        self.assertIn("--requirement /app/backend/requirements.lock", install_command)
+
     def test_runtime_is_non_root_and_uses_the_hardened_hosted_entrypoint(self) -> None:
         dockerfile = (PRODUCT_ROOT / "Dockerfile").read_text()
 
