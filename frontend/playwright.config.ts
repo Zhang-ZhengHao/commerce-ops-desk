@@ -12,6 +12,7 @@ import { prepareE2EDatabase } from './e2e/database-lifecycle';
 const frontendDirectory = path.dirname(fileURLToPath(import.meta.url));
 const productDirectory = path.resolve(frontendDirectory, '..');
 const externalBaseURL = process.env.PLAYWRIGHT_BASE_URL?.replace(/\/+$/, '');
+const evaluatorSourceSha = '0123456789abcdef0123456789abcdef01234567';
 
 function reserveEphemeralPort(): number {
   const probe = [
@@ -124,6 +125,7 @@ function hostedEnvironment(): Record<string, string> {
     COMMERCE_OPS_DEMO_MODE: 'true',
     COMMERCE_OPS_ENVIRONMENT: 'test',
     COMMERCE_OPS_SESSION_SECRET: sessionSecretBytes.toString('base64url'),
+    COMMERCE_OPS_SOURCE_SHA: evaluatorSourceSha,
     COMMERCE_OPS_VENV_DIR:
       process.env.COMMERCE_OPS_VENV_DIR ?? path.join(productDirectory, '.venv'),
     COMMERCE_OPS_WEBHOOK_ENABLED: 'true',

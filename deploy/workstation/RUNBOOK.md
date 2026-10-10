@@ -24,7 +24,11 @@ This runbook deploys one synthetic CommerceOps candidate on the shared workstati
   its full source SHA.
 - The tool accepts no trusted-proxy argument. It first creates the isolated Compose network without starting the app, inspects its single IPv4 gateway, and then recreates the candidate trusting only that single `/32`.
 - The candidate uses fresh synthetic state. Never copy a live SQLite database while its container is running and never mount one SQLite directory into two application processes.
-- The enterprise access code remains outside this repository. Do not put the access code in Compose, Caddy, shell history, screenshots, logs, or this runbook.
+- The enterprise access code remains outside all commands, repository data,
+  application/Caddy/container logs, screenshots, and artifacts. It must also
+  never enter Compose, Caddy, shell arguments or history, this runbook, Git
+  metadata, test output, HAR exports, or release notes. Do not put the access
+  code in any of those locations.
 
 The Caddy template overwrites `X-Forwarded-For` with the source address Caddy actually observes. When the enterprise access-code gateway uses one upstream address, all viewers safely use a shared source bucket. This deployment must not claim independent visitor rate limiting unless the administrator supplies and approves a different authenticated forwarding contract.
 
@@ -133,6 +137,48 @@ curl --fail --silent --show-error \
   --header 'Host: commerce-ops-desk.srrsh.aig.rest' \
   http://127.0.0.1:18088/ready
 ```
+
+Require the candidate's exact build identity from
+`http://127.0.0.1:18088/api/build` before switching. This local probe requires
+the fixed service, version `0.2.1`, the full `$SOURCE_SHA`, and the
+`Cache-Control` header value exactly `no-store`; it does not print the response
+or add credentials:
+
+```bash
+SOURCE_SHA="$SOURCE_SHA" /usr/bin/python3 - <<'PY'
+import http.client
+import json
+import os
+
+source_sha = os.environ["SOURCE_SHA"]
+connection = http.client.HTTPConnection("127.0.0.1", 18088, timeout=10)
+try:
+    connection.request(
+        "GET",
+        "/api/build",
+        headers={"Host": "commerce-ops-desk.srrsh.aig.rest"},
+    )
+    response = connection.getresponse()
+    body = response.read()
+    if response.status != 200:
+        raise SystemExit("candidate build identity did not return HTTP 200")
+    expected = {
+        "service": "commerce-ops-desk",
+        "version": "0.2.1",
+        "source_sha": source_sha,
+    }
+    if json.loads(body) != expected:
+        raise SystemExit("candidate build identity does not match SOURCE_SHA")
+    if response.headers.get_all("Cache-Control", []) != ["no-store"]:
+        raise SystemExit("candidate Cache-Control is not exactly no-store")
+finally:
+    connection.close()
+PY
+```
+
+Do not weaken Secure cookies, alter Caddy, or create a second publication path
+to run the browser journey before `switch`. The full journey runs through the
+existing HTTPS route only after the verified route change.
 
 If preparation fails after resource creation, inspect the exact derived
 container and network first. Do not run Compose against
@@ -281,6 +327,26 @@ writer that ignores it.
 
 Do not send the URL or access code to a prospect until the administrator confirms that the access-code gate is appropriate for external viewers and does not expose unrelated sites.
 
+### Interpret every switch result using exactly four branches
+
+1. **Normal success:** proceed to external acceptance.
+2. **Normal failure with proven automatic restoration:** stop publication and
+   verify that the old route and old upstream remain active.
+3. **Indeterminate result after the ledger path was flushed:** after SIGKILL,
+   host restart, power loss, sudo timeout, an unknown commit outcome, or any
+   other ambiguous return, use `reconcile` with the exact flushed transaction
+   path. Do not retry `switch`, invoke `rollback`, or choose a different ledger
+   first.
+4. **Unrecoverable or externally changed state:** if the exact ledger is not
+   available, reconciliation refuses, automatic restoration fails, or external
+   drift is present, stop all deployment actions. Preserve the site, ledger,
+   `active.json`, and relevant non-secret logs for administrator inspection.
+
+If external acceptance fails after a proven successful switch, run rollback
+only with the immutable backup authorized by the current root-owned
+`active.json` head. Never hand-edit Caddy, the ledger, or `active.json`, and do
+not delete the previous container or data during the acceptance window.
+
 ## 5. Reconcile an interrupted route transaction
 
 Use this only when `switch` or `rollback` was terminated without returning a
@@ -310,7 +376,22 @@ refused; stop and preserve the files for administrator inspection.
 
 ## 6. External acceptance
 
-Use a browser session so the access code is not placed in a command line. Verify HTTPS, Host rejection, docs `404`, security headers, Manager/Agent workflow, signed webhook cases, mobile layout, restart persistence, and the absence of secrets in logs. Keep the old container and data directory unchanged during the acceptance window.
+Use a clean browser session so the access code is entered only into the gateway
+UI and is never placed in a command. Do not record the gateway challenge,
+authenticated cookies, or access code in screenshots, HAR files, logs, or test
+artifacts.
+
+Repeat the build-identity check after the route switch through the stable HTTPS
+route. In the authorized browser, open `/api/build` and inspect its
+Network response without exporting it. Require HTTP 200, exactly the three
+allowlisted JSON fields, service `commerce-ops-desk`, version `0.2.1`, the full
+`SOURCE_SHA`, and exactly `Cache-Control: no-store`. A mismatch stops
+publication and follows the proven-success rollback branch above.
+
+Verify HTTPS, Host rejection, docs `404`, security headers, Manager/Agent
+workflow, signed webhook cases, mobile layout, restart persistence, and the
+absence of secrets in logs. Keep the old container and data directory unchanged
+during the acceptance window.
 
 ## 7. Roll back
 

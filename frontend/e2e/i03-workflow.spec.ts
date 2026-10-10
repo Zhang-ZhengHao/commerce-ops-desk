@@ -1,5 +1,8 @@
 import { expect, test } from './fixtures';
 
+const FICTIONAL_TEXT_RULE =
+  'Use fictional text only. Do not enter personal, customer, credential, or confidential data.';
+
 function isCommand(
   response: { url(): string; request(): { method(): string } },
   suffix: string,
@@ -51,11 +54,20 @@ test.describe('I03 real case workflow', () => {
     await expect(page.getByRole('heading', { name: 'Agent workspace' })).toBeVisible({
       timeout: 15_000,
     });
+    const guide = page.getByRole('complementary', {
+      name: 'Five-step evaluator guide',
+    });
+    await expect(guide).toBeVisible();
+    await expect(guide.getByRole('listitem')).toHaveCount(5);
     await expect(queue.getByText('2 total')).toBeVisible();
     await queue.getByRole('button', { name: 'Open DEMO-1043' }).click();
 
-    const noteBody = 'Refund evidence checked against the synthetic order.';
-    await page.getByRole('textbox', { name: 'Internal note' }).fill(noteBody);
+    const note = page.getByRole('textbox', { name: 'Internal note' });
+    await expect(page.getByText(FICTIONAL_TEXT_RULE, { exact: true })).toBeVisible();
+    await expect(note).toHaveAccessibleDescription(FICTIONAL_TEXT_RULE);
+    const noteBody =
+      'Fictional refund evidence checked against the synthetic demo order.';
+    await note.fill(noteBody);
     const noteResponse = page.waitForResponse((response) =>
       isCommand(response, '/notes'),
     );

@@ -2,6 +2,10 @@ import type { Page } from '@playwright/test';
 
 import { expect, test } from './fixtures';
 
+const EVALUATOR_SOURCE_SHA = '0123456789abcdef0123456789abcdef01234567';
+const FICTIONAL_TEXT_RULE =
+  'Use fictional text only. Do not enter personal, customer, credential, or confidential data.';
+
 const session = {
   workspace: {
     id: 'workspace-i03',
@@ -89,7 +93,13 @@ async function mockWorkspaceApi(page: Page) {
     let body: unknown;
     let status = 200;
     if (url.pathname === '/api/session') body = activeSession;
-    else if (
+    else if (url.pathname === '/api/build') {
+      body = {
+        service: 'commerce-ops-desk',
+        version: '0.2.1',
+        source_sha: EVALUATOR_SOURCE_SHA,
+      };
+    } else if (
       url.pathname === '/api/demo/reset' &&
       route.request().method() === 'POST'
     ) {
@@ -117,6 +127,27 @@ async function mockWorkspaceApi(page: Page) {
 }
 
 test.describe('I03 operations layout', () => {
+  test(
+    'keeps evaluator guidance and the fictional note boundary in the workspace',
+    async ({ page }) => {
+      await mockWorkspaceApi(page);
+      await page.goto('/');
+
+      const guide = page.getByRole('complementary', {
+        name: 'Five-step evaluator guide',
+      });
+      await expect(guide).toBeVisible();
+      await expect(guide.getByRole('listitem')).toHaveCount(5);
+      await expect(guide.getByText('Create an event')).toBeVisible();
+      await expect(guide.getByText('Verify the trail')).toBeVisible();
+
+      await page.getByRole('button', { name: 'Open DEMO-1042' }).click();
+      const note = page.getByRole('textbox', { name: 'Internal note' });
+      await expect(page.getByText(FICTIONAL_TEXT_RULE, { exact: true })).toBeVisible();
+      await expect(note).toHaveAccessibleDescription(FICTIONAL_TEXT_RULE);
+    },
+  );
+
   test('uses a queue and detail split on a desktop workspace', async ({ page }, testInfo) => {
     test.skip(
       testInfo.project.name !== 'desktop-chromium',

@@ -2023,6 +2023,73 @@ def test_runbook_is_explicit_about_blue_green_and_gateway_limitations() -> None:
         assert cleanup_contract in cleanup
 
 
+def test_runbook_requires_exact_build_identity_before_and_after_switch() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    candidate_acceptance = " ".join(
+        runbook.split("Before switching, inspect only this candidate's logs", 1)[1]
+        .split("If preparation fails", 1)[0]
+        .split()
+    )
+
+    for required_phrase in (
+        "http://127.0.0.1:18088/api/build",
+        '"service": "commerce-ops-desk"',
+        '"version": "0.2.1"',
+        '"source_sha": source_sha',
+        "Cache-Control",
+        "exactly `no-store`",
+        "$SOURCE_SHA",
+        "Do not weaken Secure cookies",
+        "second publication path",
+    ):
+        assert required_phrase in candidate_acceptance
+
+    external_acceptance = " ".join(
+        runbook.split("## 6. External acceptance", 1)[1]
+        .split("## 7. Roll back", 1)[0]
+        .split()
+    )
+    for required_phrase in (
+        "after the route switch",
+        "/api/build",
+        "0.2.1",
+        "SOURCE_SHA",
+        "Cache-Control",
+        "no-store",
+    ):
+        assert required_phrase in external_acceptance
+
+
+def test_runbook_preserves_access_code_and_four_way_recovery_contracts() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    boundaries = runbook.split("## 1. Stage the exact source and image", 1)[0]
+    normalized_runbook = " ".join(runbook.split())
+
+    for prohibited_location in (
+        "commands",
+        "repository",
+        "logs",
+        "screenshots",
+        "artifacts",
+    ):
+        assert prohibited_location in boundaries.lower()
+
+    for recovery_branch in (
+        "**Normal success:**",
+        "**Normal failure with proven automatic restoration:**",
+        "**Indeterminate result after the ledger path was flushed:**",
+        "**Unrecoverable or externally changed state:**",
+    ):
+        assert runbook.count(recovery_branch) == 1
+    assert "Do not retry `switch`, invoke `rollback`, or choose a different ledger" in (
+        normalized_runbook
+    )
+    assert "rollback only with the immutable backup authorized by the current" in (
+        normalized_runbook
+    )
+    assert "Never hand-edit Caddy, the ledger, or `active.json`" in normalized_runbook
+
+
 def test_caddy_docs_scope_lock_and_legacy_migration_claims() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
     design = HARDENING_DESIGN.read_text(encoding="utf-8")
