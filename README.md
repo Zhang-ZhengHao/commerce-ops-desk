@@ -8,6 +8,10 @@ A working full-stack operations desk for triaging ecommerce payment, refund, and
 
 All identities, orders, and outcomes are synthetic. The demo never connects to a store or performs a real payment, refund, or fulfillment action.
 
+The repository currently contains the `v0.2.1` evaluator candidate. This
+release-facing checkpoint does not publish a live evaluator URL or claim that
+the candidate has been deployed or released.
+
 ![CommerceOps Desk exception queue and case detail](docs/assets/exception-workflow.png)
 
 ## What you can verify
@@ -22,21 +26,50 @@ All identities, orders, and outcomes are synthetic. The demo never connects to a
 - **Safe provenance:** seeded and synthetic-webhook cases are distinguished in the queue and detail view. Synthetic cases expose only provider, event type, constrained external event ID, and receipt time—not integration IDs, digests, signatures, headers, or raw bodies.
 - **Unknown-outcome recovery:** the UI never automatically resends after an ambiguous delivery. If delivery committed but the refresh failed, Recovery repeats only the GET reads and opens the already-created case.
 - **Live PostgreSQL evidence:** a PostgreSQL 17 CI job runs fresh and repeat migrations, tenant constraints, transaction and lock races, webhook concurrency, and the hardened production container readiness path.
+- **Guided evaluation:** the entry screen and both workspaces retain one
+  accessible five-step guide covering synthetic event creation, replay and
+  tamper boundaries, assignment, Agent work, and the final provenance/audit
+  check. The guide performs no action and records no progress.
+- **Build identity:** `GET /api/build` returns only the fixed service name,
+  version `0.2.1`, and either a complete lowercase 40-character source SHA or
+  `null` for an unverified local build. The footer validates that response,
+  renders `v0.2.1`, never blocks operational UI on metadata failure, and builds
+  verified commit links from the fixed public repository origin.
 
 ### Walkthrough
 
-1. Enter as **Manager** and find the synthetic provider panel.
-2. Deliver a `fresh` payment failure and open the case created through the real signed ingress.
-3. Select `replay` and confirm that the same event returns the same case without a second effect.
-4. Select `tamper` and confirm that changing one signed body byte is rejected.
-5. Select `stale` and confirm that an envelope 301 seconds old is rejected.
-6. Manager assigns the generated case to **Demo Agent**.
-7. Switch to **Agent** and reopen the now-visible assigned case.
-8. Agent adds a note, resolves the case, and inspects its safe provenance and ordered audit history.
+1. **Create an event:** enter as **Manager**, find the synthetic provider panel,
+   deliver a `fresh` payment failure, and open the generated case.
+2. **Test the boundary:** use `replay` to confirm one effect, `tamper` to confirm
+   that changing one signed body byte is rejected, and `stale` to confirm that
+   an envelope 301 seconds outside the accepted age is rejected.
+3. **Assign the case:** Manager assigns the generated case to **Demo Agent**.
+4. **Work as Agent:** switch to **Agent**, reopen the assigned case, and use
+   fictional text only. Agent adds a note and resolves the case with an allowed
+   reason.
+5. **Verify the trail:** inspect safe provenance and the ordered audit
+   history.
+
+For the internal-note field: `Use fictional text only. Do not enter personal, customer, credential, or confidential data.`
 
 ![Manager-only signed synthetic webhook simulator after a committed delivery](docs/assets/signed-webhook-workflow-v0.2.0.png)
 
 [Watch the 139-second v0.2 walkthrough](https://github.com/Zhang-ZhengHao/commerce-ops-desk/releases/tag/v0.2.0).
+
+### Evaluator boundary
+
+The `v0.2.1` candidate is designed for an access-controlled evaluator behind
+an enterprise gateway, not an unrestricted public sandbox. The gateway owns
+the access-code challenge; the application and repository do not collect,
+store, log, or publish that code. Access is shared separately with an invited
+evaluator only after deployment acceptance and administrator confirmation.
+
+Live evaluator: single-node SQLite; PostgreSQL 17: CI-verified path only
+
+That line is a capacity and evidence boundary, not a live-deployment or
+production-readiness claim. The public `v0.2.0` release and walkthrough remain
+the fallback until the evaluator candidate has passed the separate deployment,
+release, and provenance gates.
 
 ## Architecture
 
@@ -111,7 +144,11 @@ The current 0.2.1 candidate hardens the hosted portfolio boundary around the I01
 
 PostgreSQL 17 migration, constraint, readiness, transaction, and selected concurrency behavior run against a live service in CI. The signed webhook uses an HMAC-authenticated inbox and one business transaction; it is synchronous, synthetic, and safely supports retries from an at-least-once sender rather than claiming exactly-once delivery.
 
-The project has no Stripe or Shopify adapter, asynchronous outbox/worker, automatic delivery retry, dead-letter queue (DLQ), exactly-once guarantee, high availability claim, production-ready claim, or performance claim. Overlapping-key rotation and real commerce-provider credentials are also outside this slice.
+The project has no real Stripe or Shopify adapter, asynchronous job queue or
+outbox/worker, automatic delivery retry, dead-letter queue (DLQ), exactly-once
+guarantee, high availability claim, production-ready claim, production SLA, or
+performance claim. Overlapping-key rotation and real commerce-provider
+credentials are also outside this slice.
 
 See the [design summary](docs/design-summary.md) and [security model](docs/security-model.md) for the exact boundaries and evidence.
 
