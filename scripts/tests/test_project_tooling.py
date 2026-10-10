@@ -24,13 +24,18 @@ class ProjectToolingContractTest(unittest.TestCase):
             (PRODUCT_ROOT / "frontend" / "package-lock.json").read_text()
         )
         app_main = (PRODUCT_ROOT / "backend" / "app" / "main.py").read_text()
-        app_version = re.search(r'(?m)^\s*version="([^"]+)",$', app_main)
-        self.assertIsNotNone(app_version, "FastAPI version must be explicit")
+        version_module = (PRODUCT_ROOT / "backend" / "app" / "version.py").read_text()
+        app_version = re.search(r'(?m)^APP_VERSION: Final = "([^"]+)"$', version_module)
+        self.assertIsNotNone(
+            app_version, "the application version constant must be explicit"
+        )
         assert app_version is not None
+        self.assertIn("version=APP_VERSION", app_main)
+        self.assertIn("from app.version import APP_VERSION", app_main)
 
         versions = {
             "backend package": backend_pyproject["project"]["version"],
-            "FastAPI metadata": app_version.group(1),
+            "application metadata": app_version.group(1),
             "frontend package": frontend_package["version"],
             "frontend lock root": frontend_lock["version"],
             "frontend lock package": frontend_lock["packages"][""]["version"],

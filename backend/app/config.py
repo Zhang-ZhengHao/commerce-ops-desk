@@ -13,6 +13,7 @@ from sqlalchemy.exc import ArgumentError
 Environment = Literal["development", "test", "demo", "production"]
 IPNetwork = IPv4Network | IPv6Network
 HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+SOURCE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 
 
 class Settings(BaseSettings):
@@ -27,6 +28,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "CommerceOps Desk"
+    source_sha: str | None = None
     environment: Environment = "development"
     database_url: SecretStr = SecretStr("sqlite+pysqlite:///./data/commerce_ops.db")
     demo_mode: bool | None = None
@@ -49,6 +51,15 @@ class Settings(BaseSettings):
     )
     trusted_proxy_cidrs: tuple[str, ...] = ()
     allowed_hosts: tuple[str, ...] = ()
+
+    @field_validator("source_sha", mode="before")
+    @classmethod
+    def validate_source_sha(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or SOURCE_SHA_PATTERN.fullmatch(value) is None:
+            raise ValueError("source SHA must be a full lowercase 40-character Git revision")
+        return value
 
     @field_validator("database_url", mode="before")
     @classmethod

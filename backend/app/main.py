@@ -31,6 +31,7 @@ from app.services.maintenance import (
     run_maintenance_scheduler,
     wait_for_maintenance_stop,
 )
+from app.version import APP_VERSION
 
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 LOGGER = logging.getLogger(__name__)
@@ -102,7 +103,7 @@ def create_app(
 
     application = FastAPI(
         title=resolved_settings.app_name,
-        version="0.2.1",
+        version=APP_VERSION,
         lifespan=lifespan,
         docs_url=None if hardened_environment else "/docs",
         redoc_url=None if hardened_environment else "/redoc",
