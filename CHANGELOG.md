@@ -31,6 +31,8 @@ All notable changes to CommerceOps Desk are documented here. The project follows
 - The evaluator contract keeps access-code enforcement at the enterprise
   gateway; CommerceOps adds no access-code field, cookie, API, repository
   setting, or logged secret.
+- The enterprise access code must never be stored in or published through this
+  repository.
 - Free-text notes are not content-scanned. Evaluators remain responsible for
   entering fictional text only and for excluding personal, customer,
   credential, and confidential data.
@@ -38,8 +40,14 @@ All notable changes to CommerceOps Desk are documented here. The project follows
 ### Scope
 
 - Live evaluator: single-node SQLite; PostgreSQL 17: CI-verified path only
-- This checkpoint publishes no live evaluator URL and makes no deployment or
-  release claim. It includes no real Stripe or Shopify integration,
+- This checkpoint does not add or publish a live-demo CTA, and it does not
+  claim that the evaluator is deployed, released, or approved for external
+  access.
+- The exact deployment hostname already exists in versioned engineering files
+  and public Git history, so repository URL absence is not a release boundary.
+  The actual publication gates are enterprise access-code distribution and
+  promotion of the deployment as a live evaluator.
+- This checkpoint includes no real Stripe or Shopify integration,
   asynchronous job queue or worker, high availability, production-readiness,
   or production SLA.
 

@@ -15,10 +15,12 @@ This runbook deploys one synthetic CommerceOps candidate on the shared workstati
 - Root-owned linear route head:
   `/var/lib/commerce-ops-desk/caddy-transactions/active.json`
 - Runtime UID/GID: numeric `10001:10001`.
-- Live and candidate data directories must already exist under the application
-  home, outside both `code/` and `deploy-state/`. They must be canonical,
-  non-symlink directories owned by numeric `10001:10001` with mode `0700`, and
-  neither may contain the other.
+- The live data directory must already exist under the application home,
+  outside both `code/` and `deploy-state/`, as a canonical non-symlink directory
+  owned by numeric `10001:10001` with mode `0700`. The candidate path must not
+  exist; `prepare` atomically creates its exact direct-child directory with the
+  same ownership/mode, binds its inode, and ensures neither data directory can
+  contain the other.
 - A candidate gets a unique Compose project, container, network, image tag, and
   the exact direct-child `data-candidate-<12-char-sha>` directory derived from
   its full source SHA.
@@ -34,22 +36,180 @@ The Caddy template overwrites `X-Forwarded-For` with the source address Caddy ac
 
 ## 1. Stage the exact source and image
 
-Stage the candidate checkout at the exact canonical
-`~/apps/commerce-ops-desk/code` path. Fetch the approved remote-tracking ref,
-review its full lowercase 40-character commit, and build through the verified
-entry point:
+The release decision and the workstation installation are two different trust
+contexts. The operator supplies one explicitly approved lowercase full
+`DEPLOY_SHA`; neither context derives approval from whichever branch happens to
+be current.
+
+### Trusted release-controller context
+
+Run this block only in the trusted sandbox/release controller checkout where
+`origin` is the platform repository and `github` is the public GitHub mirror.
+It proves both published `main` refs agree, checks out that exact commit in a
+detached and completely clean tree, and runs the selector from those committed
+bytes. GitHub authentication is ambient to `gh`; a token and the enterprise
+access code must never be placed in argv, shell tracing, logs, or the JSON
+files.
 
 ```bash
+set -euo pipefail
+umask 077
+: "${DEPLOY_SHA:?export DEPLOY_SHA as the explicitly approved full commit}"
+: "${CONTROLLER_CODE_ROOT:?set the trusted release-controller checkout}"
+: "${VERIFY_WORKFLOW_DATABASE_ID:?copy the Verify workflowDatabaseId from the trusted record}"
+: "${CODEQL_WORKFLOW_DATABASE_ID:?copy the CodeQL workflowDatabaseId from the trusted record}"
+[[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "DEPLOY_SHA must be one full lowercase 40-character Git SHA" >&2
+  exit 1
+}
+GITHUB_REPOSITORY="Zhang-ZhengHao/commerce-ops-desk"
+cd -- "$CONTROLLER_CODE_ROOT"
+git fetch --prune origin main
+git fetch --prune github main
+APPROVED_REMOTE_REF="refs/remotes/origin/main"
+GITHUB_REMOTE_REF="refs/remotes/github/main"
+ORIGIN_MAIN_SHA="$(git rev-parse --verify "${APPROVED_REMOTE_REF}^{commit}")"
+GITHUB_MAIN_SHA="$(git rev-parse --verify "${GITHUB_REMOTE_REF}^{commit}")"
+test "$ORIGIN_MAIN_SHA" = "$DEPLOY_SHA"
+test "$GITHUB_MAIN_SHA" = "$DEPLOY_SHA"
+git checkout --detach "$DEPLOY_SHA"
+test "$(git rev-parse --verify HEAD)" = "$DEPLOY_SHA"
+if git symbolic-ref --quiet HEAD >/dev/null; then
+  echo "release-controller checkout must be detached" >&2
+  exit 1
+fi
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+test "$(git hash-object scripts/select_release_evidence.py)" = \
+  "$(git rev-parse "${DEPLOY_SHA}:scripts/select_release_evidence.py")"
+
+PRIVATE_TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/commerce-ops-release.XXXXXXXX")"
+GITHUB_RUNS_TMP="$(mktemp "$PRIVATE_TMP_ROOT/github-runs.XXXXXXXX.json")"
+RELEASE_EVIDENCE_TMP="$(mktemp "$PRIVATE_TMP_ROOT/release-evidence.XXXXXXXX.json")"
+trap 'rm -rf -- "$PRIVATE_TMP_ROOT"' EXIT
+chmod 0700 "$PRIVATE_TMP_ROOT"
+chmod 0600 "$GITHUB_RUNS_TMP" "$RELEASE_EVIDENCE_TMP"
+gh run list --repo "$GITHUB_REPOSITORY" --commit "$DEPLOY_SHA" --limit 1000 --json attempt,conclusion,databaseId,event,headBranch,headSha,status,url,workflowName,workflowDatabaseId > "$GITHUB_RUNS_TMP"
+/usr/bin/python3 -I scripts/select_release_evidence.py \
+  --repository Zhang-ZhengHao/commerce-ops-desk \
+  --deploy-sha "$DEPLOY_SHA" \
+  --require-workflow "Verify=${VERIFY_WORKFLOW_DATABASE_ID}@push" \
+  --require-workflow "CodeQL=${CODEQL_WORKFLOW_DATABASE_ID}@dynamic" \
+  --input "$GITHUB_RUNS_TMP" > "$RELEASE_EVIDENCE_TMP"
+cat -- "$RELEASE_EVIDENCE_TMP"
+```
+
+The selector output records each exact run attempt and its immutable
+`/attempts/<attempt>` URL. Preserve that non-secret result in the release
+record. A missing, duplicate, wrong-event, wrong-branch, wrong-SHA, unsuccessful,
+or non-canonical run fails closed. The controller requests 1,000 records while
+the selector has a 999-run acceptance ceiling. Because filtered workflow-run
+searches have a 1,000-result GitHub API cap, a full 1,000-record response is a
+truncation sentinel and fails closed instead of making a uniqueness claim from
+an incomplete list.
+
+### Enterprise workstation context
+
+The workstation uses only the public GitHub repository. It does not trust the
+existing `code` path to be a Git checkout: first create a new staging clone,
+verify its exact detached clean identity, recoverably quarantine whatever old
+path exists, and only then place the verified clone at the canonical path.
+
+```bash
+set -euo pipefail
+umask 077
+: "${DEPLOY_SHA:?export the exact SHA approved by the release controller}"
+[[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "DEPLOY_SHA must be one full lowercase 40-character Git SHA" >&2
+  exit 1
+}
+GITHUB_REPOSITORY_URL="https://github.com/Zhang-ZhengHao/commerce-ops-desk.git"
 APP_ROOT="$HOME/apps/commerce-ops-desk"
 CODE_ROOT="$APP_ROOT/code"
+DEPLOY_STATE="$APP_ROOT/deploy-state"
+test -d "$APP_ROOT"
+test ! -L "$APP_ROOT"
+test "$(realpath -e -- "$APP_ROOT")" = "$APP_ROOT"
+test "$(/usr/bin/stat --format=%u -- "$APP_ROOT")" = "$(/usr/bin/id -u)"
+test "$(/usr/bin/stat --format=%g -- "$APP_ROOT")" = "$(/usr/bin/id -g)"
+test "$(/usr/bin/stat --format=%a -- "$APP_ROOT")" = "700"
+if [[ ! -e "$DEPLOY_STATE" && ! -L "$DEPLOY_STATE" ]]; then
+  mkdir -m 0700 -- "$DEPLOY_STATE"
+fi
+test -d "$DEPLOY_STATE"
+test ! -L "$DEPLOY_STATE"
+test "$(realpath -e -- "$DEPLOY_STATE")" = "$DEPLOY_STATE"
+test "$(/usr/bin/stat --format=%u -- "$DEPLOY_STATE")" = "$(/usr/bin/id -u)"
+test "$(/usr/bin/stat --format=%a -- "$DEPLOY_STATE")" = "700"
+test "$(/usr/bin/stat --format=%d -- "$APP_ROOT")" = \
+  "$(/usr/bin/stat --format=%d -- "$DEPLOY_STATE")"
+
+STAGING_ROOT="$(mktemp -d -p "$APP_ROOT" ".code-staging-${DEPLOY_SHA:0:12}.XXXXXXXX")"
+chmod 0700 "$STAGING_ROOT"
+STAGING_CODE="$STAGING_ROOT/repository"
+git clone --no-checkout "$GITHUB_REPOSITORY_URL" "$STAGING_CODE"
+git -C "$STAGING_CODE" fetch --prune origin main
+WORKSTATION_ORIGIN_MAIN_SHA="$(git -C "$STAGING_CODE" rev-parse --verify refs/remotes/origin/main^{commit})"
+test "$WORKSTATION_ORIGIN_MAIN_SHA" = "$DEPLOY_SHA"
+git -C "$STAGING_CODE" checkout --detach "$DEPLOY_SHA"
+WORKSTATION_HEAD_SHA="$(git -C "$STAGING_CODE" rev-parse --verify HEAD)"
+test "$WORKSTATION_HEAD_SHA" = "$DEPLOY_SHA"
+if git -C "$STAGING_CODE" symbolic-ref --quiet HEAD >/dev/null; then
+  echo "workstation staging checkout must be detached" >&2
+  exit 1
+fi
+test -z "$(git -C "$STAGING_CODE" status --porcelain=v1 --untracked-files=all)"
+for relative_tool in \
+  scripts/select_release_evidence.py \
+  deploy/workstation/build_verified_image.py \
+  deploy/workstation/deploy.py
+do
+  test -f "$STAGING_CODE/$relative_tool"
+  test ! -L "$STAGING_CODE/$relative_tool"
+  test "$(git -C "$STAGING_CODE" hash-object -- "$relative_tool")" = \
+    "$(git -C "$STAGING_CODE" rev-parse "${DEPLOY_SHA}:${relative_tool}")"
+done
+
+if [[ -e "$CODE_ROOT" || -L "$CODE_ROOT" ]]; then
+  CODE_QUARANTINE="$(mktemp -d -p "$APP_ROOT" "code-quarantine-${DEPLOY_SHA:0:12}.XXXXXXXX")"
+  chmod 0700 "$CODE_QUARANTINE"
+  mv -T -- "$CODE_ROOT" "$CODE_QUARANTINE/code"
+fi
+mv -T -- "$STAGING_CODE" "$CODE_ROOT"
+test -d "$CODE_ROOT"
+test ! -L "$CODE_ROOT"
+test "$(realpath -e -- "$CODE_ROOT")" = "$CODE_ROOT"
 cd -- "$CODE_ROOT"
-git fetch --prune origin
+
+verify_exact_checkout() {
+  local head_sha origin_main_sha relative_tool
+  head_sha="$(git rev-parse --verify HEAD)"
+  origin_main_sha="$(git rev-parse --verify refs/remotes/origin/main^{commit})"
+  test "$head_sha" = "$DEPLOY_SHA"
+  test "$origin_main_sha" = "$DEPLOY_SHA"
+  if git symbolic-ref --quiet HEAD >/dev/null; then
+    echo "canonical workstation checkout must be detached" >&2
+    return 1
+  fi
+  test -z "$(git status --porcelain=v1 --untracked-files=all)"
+  for relative_tool in \
+    scripts/select_release_evidence.py \
+    deploy/workstation/build_verified_image.py \
+    deploy/workstation/deploy.py
+  do
+    test -f "$relative_tool"
+    test ! -L "$relative_tool"
+    test "$(git hash-object -- "$relative_tool")" = \
+      "$(git rev-parse "${DEPLOY_SHA}:${relative_tool}")"
+  done
+}
+
+verify_exact_checkout
+SOURCE_SHA="$DEPLOY_SHA"
 APPROVED_REMOTE_REF="refs/remotes/origin/main"
-SOURCE_SHA="$(git rev-parse "$APPROVED_REMOTE_REF")"
-BUILD_MANIFEST="$APP_ROOT/deploy-state/build-${SOURCE_SHA}.json"
-/usr/bin/python3 deploy/workstation/build_verified_image.py \
+BUILD_MANIFEST="$DEPLOY_STATE/build-${DEPLOY_SHA}.json"
+/usr/bin/python3 -I deploy/workstation/build_verified_image.py \
   --repository "$CODE_ROOT" \
-  --source-sha "$SOURCE_SHA" \
+  --source-sha "$DEPLOY_SHA" \
   --approved-remote-ref "$APPROVED_REMOTE_REF" \
   --build-manifest "$BUILD_MANIFEST"
 ```
@@ -78,34 +238,111 @@ is removed on success or failure.
 This is a local provenance control, not a cryptographic signature, transparency
 record, or remote supply-chain attestation. It proves what local Git object was
 used as the Docker context; it does not prove who authored or approved that
-object. Do not continue unless the printed SHA is the reviewed remote commit.
+object. Do not continue unless the release controller's two fetched `main`
+refs, the workstation's public GitHub `main`, the canonical detached checkout,
+the manifest source, and the printed SHA are the same explicitly approved
+`DEPLOY_SHA`. Preserve every old-code quarantine and failed staging tree for
+inspection; neither is silently deleted or reused.
 
 ## 2. Prepare independent state
 
-Choose the current live directory deliberately. Create a fresh candidate directory whose name is derived from the same SHA:
+Choose the current live directory deliberately and derive the one allowed
+candidate path from the approved SHA. Do not create the candidate directory by
+hand: `deploy.py prepare` owns its atomic creation and binds the newly created
+inode before any candidate-preparation Docker inspection or resource creation.
 
 ```bash
+set -euo pipefail
+verify_exact_checkout
 LIVE_DATA_DIR="$APP_ROOT/data-v0.2.0-live"
 CANDIDATE_DATA_DIR="$APP_ROOT/data-candidate-${SOURCE_SHA:0:12}"
-mkdir -- "$CANDIDATE_DATA_DIR"
-sudo chown 10001:10001 "$CANDIDATE_DATA_DIR"
-sudo chmod 0700 "$CANDIDATE_DATA_DIR"
+CANDIDATE_STATE="$APP_ROOT/deploy-state/candidate-${SOURCE_SHA:0:12}.json"
+if [[ -e "$CANDIDATE_DATA_DIR" || -L "$CANDIDATE_DATA_DIR" ]]; then
+  echo "candidate data path already exists; stop for inspection" >&2
+  exit 1
+fi
+if [[ -e "$CANDIDATE_STATE" || -L "$CANDIDATE_STATE" ]]; then
+  echo "candidate state already exists; stop for inspection" >&2
+  exit 1
+fi
 ```
 
 `10001:10001` are literal numeric IDs; do not replace them with account names.
 The existing live directory must already have the same numeric ownership and
 mode, but do not blindly change a live directory. The live directory and
 candidate directory must be different. Check both paths before continuing; do
-not create either directory through Docker or Compose. A pre-existing
-candidate path makes `mkdir` fail closed and must be inspected rather than
-reused.
+not create either directory through Docker or Compose. Under the per-SHA
+prepare lock, the tool's fixed-argv isolated privileged helper atomically
+creates a random hidden sibling, assigns numeric `10001:10001` and mode `0700`,
+flushes its inode and parent, and only then publishes exactly the direct child
+derived from the SHA with Linux `renameat2(RENAME_NOREPLACE)`—that final
+no-clobber rename atomically creates exactly the direct child derived from the
+SHA. An interruption
+before publication can leave a hidden retained staging directory for
+administrator inspection, but it cannot occupy the final candidate path. The
+helper returns the published device/inode identity. Any
+pre-existing object—an empty directory, regular file, hidden-content directory,
+symlink, or broken symlink—fails closed. The identity-bound empty check is still
+performed immediately before any candidate-preparation Docker inspection or
+resource creation. This freshness statement does not cover the earlier
+verified-image build.
+
+The final candidate state is flushed to a hidden file and published through the
+same dirfd-bound Linux `renameat2(RENAME_NOREPLACE)` atomic no-clobber operation. An
+interruption leaves either the hidden pre-publication file or the single-link
+final state, never a two-link intermediate state. A concurrent state insertion
+is retained and causes refusal; it is never replaced. The same per-SHA lock
+remains held from candidate validation through final state publication. These
+controls bind the candidate data, state, deployment assets, and running
+container to tools from the exact clean `DEPLOY_SHA` checkout.
+`APP_ROOT` and `deploy-state` must remain on the same filesystem so every
+data-only, state-only, or combined quarantine move is one atomic rename; the
+preflight and recovery helper both fail closed before creating an archive when
+that invariant does not hold.
+
+### Recover interrupted candidate inputs
+
+If an interrupted attempt left either path, first inspect the exact candidate
+container, network, state, and data identity. If Docker resources remain, use
+only the identity-checked cleanup procedure in section 3; never delete candidate
+data. After an administrator confirms that the retained data is not live and no
+container mounts it, use the versioned `quarantine` subcommand below. Its only
+operator-controlled value is the full source SHA; all input names, archive
+names, and move destinations are derived internally and passed through fixed
+argv. The helper anchors operations to dirfd handles opened with `O_NOFOLLOW`,
+checks types, ownership, modes, link counts, and device/inode identities with
+`fstat`, and holds the same non-blocking per-SHA prepare lock through every
+move. Each move uses Linux `renameat2(RENAME_NOREPLACE)`, so a racing archive
+entry is retained and causes refusal instead of being overwritten; a kernel or
+filesystem without that atomic operation also fails closed. A missing,
+replaced, unsafe, or busy lock stops recovery.
+
+The subcommand supports data-only, state-only, or both paths. If a prior run
+moved one item and stopped, rerun it: the remaining item moves into another
+newly created quarantine archive, while the earlier archive remains untouched.
+It never follows a symbolic link and never deletes candidate data or state.
+Every `prepare` invocation creates the required lock before inspecting candidate
+inputs.
+
+```bash
+set -euo pipefail
+verify_exact_checkout
+/usr/bin/python3 -I deploy/workstation/deploy.py quarantine \
+  --source-sha "$SOURCE_SHA"
+```
+
+Preserve every quarantine archive for diagnosis. Then rerun the fail-closed
+preflight and `prepare`; the tool creates a new candidate inode. Do not copy
+anything back from an archive. This is an explicit operator recovery step, not
+automatic cleanup, and it must never delete candidate data or state.
 
 ## 3. Prepare and verify the candidate
 
 Select a canonical decimal loopback port. The tool refuses a listener, any Docker binding, or any Caddy reference to that port. It also refuses an existing candidate project/container so an interrupted attempt cannot be mistaken for a fresh deployment.
 
 ```bash
-/usr/bin/python3 deploy/workstation/deploy.py prepare \
+verify_exact_checkout
+/usr/bin/python3 -I deploy/workstation/deploy.py prepare \
   --build-manifest "$BUILD_MANIFEST" \
   --candidate-port 18088 \
   --live-data-dir "$LIVE_DATA_DIR" \
@@ -184,8 +421,9 @@ If preparation fails after resource creation, inspect the exact derived
 container and network first. Do not run Compose against
 `deploy/workstation/compose.yaml`: a mutable worktree file is not a trusted
 cleanup input. The following Bash recipe uses the same fixed local Docker
-boundary, requires exactly one project-labelled container and network, and
-checks their exact name and Compose labels before removing them:
+boundary, requires at most one project-labelled container and one network with
+at least one of them present, and checks every present resource's exact name and
+Compose labels before removing either one:
 
 ```bash
 (
@@ -203,37 +441,50 @@ DOCKER=(
 
 CONTAINER_IDS="$("${DOCKER[@]}" ps --all --quiet \
   --filter "label=com.docker.compose.project=$PROJECT_NAME")"
-test -n "$CONTAINER_IDS"
-test "$(printf '%s\n' "$CONTAINER_IDS" | /usr/bin/wc -l)" -eq 1
-CONTAINER_ID="$CONTAINER_IDS"
-test "$("${DOCKER[@]}" inspect --format '{{.Name}}' "$CONTAINER_ID")" = \
-  "/$CONTAINER_NAME"
-test "$("${DOCKER[@]}" inspect --format \
-  '{{index .Config.Labels "com.docker.compose.project"}}' "$CONTAINER_ID")" = \
-  "$PROJECT_NAME"
-test "$("${DOCKER[@]}" inspect --format \
-  '{{index .Config.Labels "com.docker.compose.service"}}' "$CONTAINER_ID")" = \
-  "commerce-ops-desk"
-
 NETWORK_IDS="$("${DOCKER[@]}" network ls --quiet \
   --filter "label=com.docker.compose.project=$PROJECT_NAME")"
-test -n "$NETWORK_IDS"
-test "$(printf '%s\n' "$NETWORK_IDS" | /usr/bin/wc -l)" -eq 1
-NETWORK_ID="$NETWORK_IDS"
-test "$("${DOCKER[@]}" network inspect --format '{{.Name}}' "$NETWORK_ID")" = \
-  "$NETWORK_NAME"
-test "$("${DOCKER[@]}" network inspect --format \
-  '{{index .Labels "com.docker.compose.project"}}' "$NETWORK_ID")" = \
-  "$PROJECT_NAME"
-test "$("${DOCKER[@]}" network inspect --format \
-  '{{index .Labels "com.docker.compose.network"}}' "$NETWORK_ID")" = default
+if [[ -z "$CONTAINER_IDS" && -z "$NETWORK_IDS" ]]; then
+  echo "no candidate container or network remains to clean up" >&2
+  exit 1
+fi
+if [[ -n "$CONTAINER_IDS" ]]; then
+  test "$(printf '%s\n' "$CONTAINER_IDS" | /usr/bin/wc -l)" -eq 1
+  CONTAINER_ID="$CONTAINER_IDS"
+  test "$("${DOCKER[@]}" inspect --format '{{.Name}}' "$CONTAINER_ID")" = \
+    "/$CONTAINER_NAME"
+  test "$("${DOCKER[@]}" inspect --format \
+    '{{index .Config.Labels "com.docker.compose.project"}}' "$CONTAINER_ID")" = \
+    "$PROJECT_NAME"
+  test "$("${DOCKER[@]}" inspect --format \
+    '{{index .Config.Labels "com.docker.compose.service"}}' "$CONTAINER_ID")" = \
+    "commerce-ops-desk"
+fi
+if [[ -n "$NETWORK_IDS" ]]; then
+  test "$(printf '%s\n' "$NETWORK_IDS" | /usr/bin/wc -l)" -eq 1
+  NETWORK_ID="$NETWORK_IDS"
+  test "$("${DOCKER[@]}" network inspect --format '{{.Name}}' "$NETWORK_ID")" = \
+    "$NETWORK_NAME"
+  test "$("${DOCKER[@]}" network inspect --format \
+    '{{index .Labels "com.docker.compose.project"}}' "$NETWORK_ID")" = \
+    "$PROJECT_NAME"
+  test "$("${DOCKER[@]}" network inspect --format \
+    '{{index .Labels "com.docker.compose.network"}}' "$NETWORK_ID")" = default
+fi
 
-"${DOCKER[@]}" container rm --force "$CONTAINER_ID"
-"${DOCKER[@]}" network rm "$NETWORK_ID"
+if [[ -n "$CONTAINER_IDS" ]]; then
+  "${DOCKER[@]}" container rm --force "$CONTAINER_ID"
+fi
+if [[ -n "$NETWORK_IDS" ]]; then
+  "${DOCKER[@]}" network rm "$NETWORK_ID"
+fi
 )
 ```
 
-The candidate data directory is intentionally retained.
+The cleanup accepts the three interrupted Compose shapes: container only,
+network only, or both. Every resource that exists must independently pass the
+exact project label, expected name, uniqueness, and container service/network
+label checks before either removal runs. No matching resource is also a refusal,
+not a false success. The candidate data directory is intentionally retained.
 
 ## 4. Switch only the CommerceOps site
 
@@ -268,7 +519,8 @@ Use the state path printed by `prepare`:
 
 ```bash
 STATE_FILE="$APP_ROOT/deploy-state/candidate-${SOURCE_SHA:0:12}.json"
-/usr/bin/python3 deploy/workstation/deploy.py switch --state "$STATE_FILE"
+verify_exact_checkout
+/usr/bin/python3 -I deploy/workstation/deploy.py switch --state "$STATE_FILE"
 ```
 
 `switch` holds the fixed root-owned advisory lock from candidate revalidation
@@ -325,7 +577,22 @@ not rollback-authorized unless `active.json` names it. Privileged writers must
 coordinate on the advisory lock; the helper does not claim to exclude a root
 writer that ignores it.
 
-Do not send the URL or access code to a prospect until the administrator confirms that the access-code gate is appropriate for external viewers and does not expose unrelated sites.
+### Access-code governance gate
+
+Before release publication, a live-demo CTA, or sharing the URL or code, the
+workstation administrator must explicitly confirm all four points in a
+non-secret operator record:
+
+1. The enterprise access code may be shared with external evaluators.
+2. Its authorization scope does not unintentionally expose unrelated sites.
+3. The record identifies who owns revocation/rotation.
+4. The record explains how an access grant is withdrawn.
+
+An observed gateway challenge is not a substitute for those scope and lifecycle
+confirmations. Without all four, the deployed route may remain under private
+operator evaluation, but no access code or live-demo CTA is shared. Public
+source, exact-SHA CI evidence, and the existing public walkthrough remain the
+only published evaluation paths.
 
 ### Interpret every switch result using exactly four branches
 
@@ -355,7 +622,8 @@ ledger path from the flushed `Caddy transaction prepared` line; do not choose a
 different orphan or edit the ledger:
 
 ```bash
-/usr/bin/python3 deploy/workstation/deploy.py reconcile \
+verify_exact_checkout
+/usr/bin/python3 -I deploy/workstation/deploy.py reconcile \
   --transaction "/var/lib/commerce-ops-desk/caddy-transactions/<printed-transaction>.json"
 ```
 
@@ -388,17 +656,50 @@ allowlisted JSON fields, service `commerce-ops-desk`, version `0.2.1`, the full
 `SOURCE_SHA`, and exactly `Cache-Control: no-store`. A mismatch stops
 publication and follows the proven-success rollback branch above.
 
-Verify HTTPS, Host rejection, docs `404`, security headers, Manager/Agent
-workflow, signed webhook cases, mobile layout, restart persistence, and the
-absence of secrets in logs. Keep the old container and data directory unchanged
-during the acceptance window.
+Record a non-secret pass/fail outcome for every item below. All nine are
+required; a partial pass does not authorize publication:
+
+1. An independent unauthorized browser context cannot reach application
+   content through the HTTPS gateway.
+2. The page shows `v0.2.1` and the exact full `DEPLOY_SHA`; its commit link
+   resolves to the approved GitHub commit.
+3. A fresh Manager workspace can deliver one synthetic event, replay it without
+   a duplicate effect, and observe tamper rejection.
+4. The Manager can assign the generated case to Demo Agent; after switching to
+   Agent, the evaluator can add a clearly fictional note, resolve the case, and
+   see safe provenance plus ordered audit history. The fictional-text warning
+   remains visible, readable, and programmatically associated at both
+   viewports.
+5. Reset affects only the active synthetic tenant, and a clean browser receives
+   an independent workspace.
+6. The five-step guide, controls, case detail, and footer remain usable at both
+   a desktop viewport and a 320-pixel mobile viewport with keyboard navigation
+   and without horizontal page overflow.
+7. In a fresh authorized browser context, `/docs`, `/redoc`, and
+   `/openapi.json` reach the application and return real `404` responses;
+   expected security headers occur once; build metadata is `no-store` and
+   exposes only its allowlisted fields. Separately, a no-code, incorrect-Host
+   probe at the scoped Caddy boundary is rejected rather than routed to the
+   application.
+8. Candidate/container health and readiness remain green after a controlled
+   restart, and the workspace persists through that restart.
+9. The controlled acceptance flow uses only fictional note text. Application,
+   Caddy, and container logs contain no access code, session or CSRF value,
+   webhook signature, master secret, raw event body, or personal/customer data.
+   This verifies only the controlled run and does not claim that future
+   free-text visitors are technically prevented from violating the displayed
+   rule.
+
+Keep the old container and data directory unchanged throughout the acceptance
+window.
 
 ## 7. Roll back
 
 The successful `switch` prints the exact root-owned backup path. Copy that path verbatim; do not copy, rename, edit, or recreate either the backup or its adjacent JSON ledger:
 
 ```bash
-/usr/bin/python3 deploy/workstation/deploy.py rollback \
+verify_exact_checkout
+/usr/bin/python3 -I deploy/workstation/deploy.py rollback \
   --backup "/var/lib/commerce-ops-desk/caddy-transactions/<printed-commerce-ops-backup>.conf"
 ```
 
@@ -416,6 +717,14 @@ requires the target container to be healthy and to match the recorded complete
 upstream identity, so a stopped container's released loopback port cannot be
 substituted by another local listener. It does not stop or delete either
 container and never writes another Caddy site.
+
+A successful rollback command is not the end of the failed acceptance path.
+Run a second external smoke from clean browser contexts and verify all four
+outcomes again: public HTTPS is reachable, an unauthorized context still meets
+gateway protection, the authorized response carries the restored route marker,
+and workstation inspection plus the public build identity prove the old
+upstream identity is serving. Until all four pass, the failure path remains open
+and no link, code, release, or live-demo CTA may be published.
 
 If automatic restoration itself fails, stop all deployment activity and give
 the administrator the printed trusted backup path plus the exact error. If the

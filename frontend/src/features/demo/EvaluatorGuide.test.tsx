@@ -12,6 +12,8 @@ describe('EvaluatorGuide', () => {
     });
     const orderedList = within(guide).getByRole('list');
 
+    expect(guide.tagName).toBe('ASIDE');
+    expect(guide).not.toHaveAttribute('tabindex');
     expect(orderedList.tagName).toBe('OL');
     expect(orderedList).toHaveAttribute('role', 'list');
     expect(within(orderedList).getAllByRole('listitem')).toHaveLength(5);
@@ -26,13 +28,28 @@ describe('EvaluatorGuide', () => {
       expect(within(orderedList).getByText(title)).toBeVisible();
     }
 
-    expect(orderedList).toHaveTextContent(/enter as Manager/i);
-    expect(orderedList).toHaveTextContent(/fresh payment\.failed event/i);
-    expect(orderedList).toHaveTextContent(/tamper with one signed byte/i);
-    expect(orderedList).toHaveTextContent(/assign it to Demo Agent/i);
-    expect(orderedList).toHaveTextContent(/fictional internal note/i);
-    expect(orderedList).toHaveTextContent(/safe provenance/i);
-    expect(orderedList).toHaveTextContent(/ordered audit history/i);
+    for (const visibleControlLabel of [
+      'Enter as Manager',
+      'Synthetic provider',
+      'Deliver new failure',
+      'Replay same event',
+      'Tamper after signing',
+      'Send stale signature',
+      'Assign to agent',
+      'Update assignment',
+      'Switch to Agent',
+      'Internal note',
+      'Add note',
+      'Resolution reason',
+      'Resolve case',
+      'Event provenance',
+      'Accountable timeline',
+    ]) {
+      expect(orderedList).toHaveTextContent(visibleControlLabel);
+    }
+    expect(orderedList).toHaveTextContent(/payment\.failed/i);
+    expect(orderedList).toHaveTextContent(/Demo Agent/i);
+    expect(orderedList).toHaveTextContent(/fictional/i);
 
     expect(within(guide).queryByRole('button')).not.toBeInTheDocument();
     expect(within(guide).queryByRole('checkbox')).not.toBeInTheDocument();

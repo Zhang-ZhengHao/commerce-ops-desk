@@ -49,11 +49,14 @@ Verified base: `215fb4088fa3db7a66d812507fb49a4190f08a07`
 | P3 | Shared evaluator guide and safe free-text guidance | `增加五步评估指引` |
 | P4 | Non-blocking frontend build provenance | `展示运行版本与完整源码提交` |
 | P5 | Desktop/mobile browser proof and runbook update | `验证评估版桌面与移动流程` |
-| P6 | Release-facing documentation without premature live links | `准备评估版本发布证据` |
+| P6 | Release-facing documentation without premature live-demo promotion | `准备评估版本发布证据` |
+| P7 | Release-gate audit closeout | `补齐评估发布安全门禁` |
 
-The access-controlled URL is not added to public README/profile metadata in
-this application pull request. Those links are a post-deployment publication
-step after external acceptance and the post-release provenance gate.
+The exact deployment hostname already exists in versioned engineering files
+and public Git history. This checkpoint does not add or promote a live-demo CTA,
+and it does not claim that the evaluator is deployed, released, or approved for
+external access. README/profile promotion remains a post-deployment step after
+external acceptance and the post-release provenance gate.
 
 ## 3. P0 — baseline and plan
 
@@ -400,10 +403,43 @@ Document only implemented, executable evidence:
 - fictional free-text responsibility;
 - exact exclusions already approved in the design.
 
-Do not add a live URL, claim a deployed instance, claim production readiness,
-or create the GitHub release in this checkpoint.
+Do not add or promote a live-demo CTA, claim a deployed instance, claim
+production readiness, or create the GitHub release in this checkpoint.
 
-## 10. Pull-request and merge gate
+## 10. P7 — release-gate audit closeout
+
+Close every release-audit finding before opening the pull request:
+
+- select GitHub Actions evidence only from exactly one completed successful
+  Verify `push` run and one completed successful CodeQL Default Setup
+  (`workflowName: CodeQL`) `dynamic` run; both must target `main`, match the
+  expected workflow database ID, and report the full approved `DEPLOY_SHA`;
+- require a fresh, empty candidate data directory and absent candidate state
+  before any candidate-preparation Docker inspection or resource creation,
+  while preserving interrupted state in quarantine instead of deleting or
+  reusing it; publish the flushed state through a dirfd-bound
+  `renameat2(RENAME_NOREPLACE)` so interruption cannot leave a two-hard-link
+  state that the quarantine path refuses;
+- pin both remote `main` refs to the explicitly approved `DEPLOY_SHA` and make
+  staging fail immediately on any mismatch;
+- enumerate the complete external-acceptance, access-code governance, and
+  post-rollback smoke gates in the authoritative workstation runbook; and
+- keep the evaluator guide aligned with visible control labels and prove the
+  entry, exact-SHA link, Manager action, and Agent note/resolution path with
+  real keyboard navigation on desktop and mobile.
+
+The selector reads repository-external private JSON from the real `gh run list`
+schema, including `attempt`. Required workflow arguments use
+`LABEL=workflowDatabaseId@event`, specifically `Verify=$ID@push` and
+`CodeQL=$ID@dynamic`. The selector strictly validates each input base run URL,
+then emits only allowlisted evidence with the attempt and an attempt-specific
+immutable `/actions/runs/<id>/attempts/<attempt>` URL. It never receives a
+token, access code, or cookie through its arguments or output. The controller
+requests 1,000 records while the selector accepts at most 999; reaching the
+1,000-result GitHub API cap is treated as potentially truncated input and
+fails closed rather than claiming global uniqueness from an incomplete list.
+
+## 11. Pull-request and merge gate
 
 Before opening the application pull request:
 
@@ -417,13 +453,16 @@ Push both remotes and require all GitHub PR checks green. Then create a local
 merge commit using the configured noreply identity, run `make public-scan` on
 that exact candidate merge, and push it only with an explicit lease against the
 verified remote `main`. After merge, record the new full `DEPLOY_SHA` and wait
-for `push`-to-`main` Verify and CodeQL runs whose `head_sha` equals it.
+for one completed successful Verify `push` run and one completed successful
+CodeQL Default Setup (`workflowName: CodeQL`) `dynamic` run. Both must target
+`main`, use the expected workflow database ID, and report
+`headSha == DEPLOY_SHA`.
 
 No build, workstation prepare, route switch, tag, release, README live link,
 repository homepage update, profile update, or Website-field update occurs
 until those exact-main checks pass.
 
-## 11. Deployment, release, and public entry points
+## 12. Deployment, release, and public entry points
 
 After the application branch is merged and exact-main is green:
 

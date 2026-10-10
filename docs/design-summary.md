@@ -116,10 +116,15 @@ Implemented controls include opaque cookie sessions, Origin and CSRF checks, a p
 All fixtures use fictional identifiers and neutral synthetic order data. The service is disconnected from merchant accounts and cannot issue customer-facing actions. Free-text notes remain evaluator-controlled, so visitors are explicitly responsible for entering fictional text and excluding personal, customer, credential, and confidential information. The product does not claim to scan or classify note content. See the [security model](security-model.md) for assumptions and deployment limits.
 
 Any externally shared evaluator is required to remain behind the enterprise
-access-code gateway. That challenge is outside CommerceOps: no application
-field, API, cookie, repository setting, or log receives the access code. This
-repository checkpoint intentionally provides no live URL and makes no claim
-that external access has been approved.
+access-code gateway. This checkpoint does not add or publish a live-demo CTA,
+and it does not claim that the evaluator is deployed, released, or approved
+for external access. The exact deployment hostname already exists in versioned
+engineering files and public Git history, so repository URL absence is not a
+release boundary. The actual publication gates are enterprise access-code
+distribution and promotion of the deployment as a live evaluator. That
+challenge is outside CommerceOps: no application field, API, cookie,
+repository setting, or log receives the access code. The enterprise access
+code must never be stored in or published through this repository.
 
 ## Verification evidence
 

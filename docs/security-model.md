@@ -27,10 +27,17 @@ Control of the service account, host filesystem, deployment secret store, or dat
   owns that challenge. The application adds no access-code input, cookie,
   environment variable, API route, or repository setting, and the code must
   not appear in source, commands, logs, screenshots, or release notes.
-- This repository checkpoint contains no live evaluator URL and does not attest
-  that a candidate has been deployed, released, or approved for external
-  access. Access-code sharing requires separate administrator confirmation of
-  scope plus revocation and rotation ownership.
+- The enterprise access code must never be stored in or published through this
+  repository.
+- This checkpoint does not add or publish a live-demo CTA, and it does not
+  claim that the evaluator is deployed, released, or approved for external
+  access.
+- The exact deployment hostname already exists in versioned engineering files
+  and public Git history, so repository URL absence is not a release boundary.
+  The actual publication gates are enterprise access-code distribution and
+  promotion of the deployment as a live evaluator. Access-code sharing
+  requires separate administrator confirmation of scope plus revocation and
+  rotation ownership.
 - The unauthenticated `GET /api/build` endpoint returns exactly the fixed
   service identifier, semantic version, and a full lowercase 40-character
   source SHA or `null`. It exposes no environment dump, path, image ID, secret,

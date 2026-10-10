@@ -8,6 +8,8 @@ CommerceOps Caddy site fragment.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -103,6 +105,222 @@ SAFE_SUDO_SUBCOMMANDS = MappingProxyType(
         "true": "/usr/bin/true",
     }
 )
+CANDIDATE_DATA_CREATE_HELPER = """\
+import ctypes
+import errno
+import os
+import secrets
+import stat
+import sys
+
+if len(sys.argv) != 7:
+    raise SystemExit("invalid candidate data creation arguments")
+(
+    app_root,
+    child_name,
+    raw_root_uid,
+    raw_root_gid,
+    raw_uid,
+    raw_gid,
+) = sys.argv[1:]
+if (
+    not os.path.isabs(app_root)
+    or os.path.realpath(app_root) != app_root
+    or os.path.basename(child_name) != child_name
+    or not child_name.startswith("data-candidate-")
+    or len(child_name) != len("data-candidate-") + 12
+    or any(character not in "0123456789abcdef" for character in child_name[-12:])
+    or any(
+        not value.isascii() or not value.isdigit()
+        for value in (raw_root_uid, raw_root_gid, raw_uid, raw_gid)
+    )
+):
+    raise SystemExit("invalid candidate data creation arguments")
+root_uid = int(raw_root_uid)
+root_gid = int(raw_root_gid)
+uid = int(raw_uid)
+gid = int(raw_gid)
+if (
+    str(root_uid) != raw_root_uid
+    or str(root_gid) != raw_root_gid
+    or str(uid) != raw_uid
+    or str(gid) != raw_gid
+):
+    raise SystemExit("invalid candidate runtime identity")
+
+root_stat = os.lstat(app_root)
+if (
+    not stat.S_ISDIR(root_stat.st_mode)
+    or (root_stat.st_uid, root_stat.st_gid) != (root_uid, root_gid)
+    or stat.S_IMODE(root_stat.st_mode) != 0o700
+):
+    raise SystemExit("unsafe application root")
+directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+directory_flags |= getattr(os, "O_CLOEXEC", 0)
+directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+root_descriptor = os.open(app_root, directory_flags)
+try:
+    opened_root = os.fstat(root_descriptor)
+    if (
+        not stat.S_ISDIR(opened_root.st_mode)
+        or (opened_root.st_dev, opened_root.st_ino)
+        != (root_stat.st_dev, root_stat.st_ino)
+        or (opened_root.st_uid, opened_root.st_gid) != (root_uid, root_gid)
+        or stat.S_IMODE(opened_root.st_mode) != 0o700
+    ):
+        raise SystemExit("unsafe application root")
+
+    staging_name = ""
+    for _attempt in range(128):
+        staging_name = f".{child_name}.{secrets.token_hex(16)}.tmp"
+        try:
+            os.mkdir(staging_name, 0o700, dir_fd=root_descriptor)
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise SystemExit("candidate data staging path could not be allocated")
+
+    child_descriptor = os.open(
+        staging_name,
+        directory_flags,
+        dir_fd=root_descriptor,
+    )
+    try:
+        os.fchown(child_descriptor, uid, gid)
+        os.fchmod(child_descriptor, 0o700)
+        opened_child = os.fstat(child_descriptor)
+        linked_staging = os.stat(
+            staging_name,
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(opened_child.st_mode)
+            or stat.S_IMODE(opened_child.st_mode) != 0o700
+            or (opened_child.st_uid, opened_child.st_gid) != (uid, gid)
+            or (opened_child.st_dev, opened_child.st_ino)
+            != (linked_staging.st_dev, linked_staging.st_ino)
+        ):
+            raise SystemExit("candidate data directory identity is unsafe")
+        os.fsync(child_descriptor)
+        os.fsync(root_descriptor)
+
+        current_root = os.stat(app_root, follow_symlinks=False)
+        opened_root = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(current_root.st_mode)
+            or not stat.S_ISDIR(opened_root.st_mode)
+            or (current_root.st_dev, current_root.st_ino)
+            != (root_stat.st_dev, root_stat.st_ino)
+            or (opened_root.st_dev, opened_root.st_ino)
+            != (root_stat.st_dev, root_stat.st_ino)
+            or (current_root.st_uid, current_root.st_gid) != (root_uid, root_gid)
+            or (opened_root.st_uid, opened_root.st_gid) != (root_uid, root_gid)
+            or stat.S_IMODE(current_root.st_mode) != 0o700
+            or stat.S_IMODE(opened_root.st_mode) != 0o700
+        ):
+            raise SystemExit("unsafe application root")
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            renameat2 = libc.renameat2
+        except AttributeError:
+            raise SystemExit(
+                "renameat2 is required for no-clobber candidate publication"
+            ) from None
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        RENAME_NOREPLACE = 1
+        result = renameat2(
+            root_descriptor,
+            os.fsencode(staging_name),
+            root_descriptor,
+            os.fsencode(child_name),
+            RENAME_NOREPLACE,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                raise SystemExit("candidate data path already exists")
+            raise SystemExit("candidate data directory could not be published safely")
+
+        linked_child = os.stat(
+            child_name,
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(linked_child.st_mode)
+            or stat.S_IMODE(linked_child.st_mode) != 0o700
+            or (linked_child.st_uid, linked_child.st_gid) != (uid, gid)
+            or (linked_child.st_dev, linked_child.st_ino)
+            != (opened_child.st_dev, opened_child.st_ino)
+        ):
+            raise SystemExit("published candidate data identity is unsafe")
+        os.fsync(root_descriptor)
+        print(
+            f"{opened_child.st_dev}|{opened_child.st_ino}|"
+            f"{opened_child.st_uid}|{opened_child.st_gid}"
+        )
+    finally:
+        os.close(child_descriptor)
+finally:
+    os.close(root_descriptor)
+"""
+CANDIDATE_DATA_FRESHNESS_HELPER = """\
+import os
+import stat
+import sys
+
+if len(sys.argv) != 6:
+    raise SystemExit("invalid candidate data freshness arguments")
+path = sys.argv[1]
+raw_identity = sys.argv[2:]
+if (
+    not os.path.isabs(path)
+    or os.path.realpath(path) != path
+    or any(not value.isascii() or not value.isdigit() for value in raw_identity)
+):
+    raise SystemExit("invalid candidate data freshness arguments")
+identity = tuple(int(value) for value in raw_identity)
+if any(str(value) != raw for value, raw in zip(identity, raw_identity, strict=True)):
+    raise SystemExit("invalid candidate data identity")
+
+path_stat = os.lstat(path)
+if (
+    not stat.S_ISDIR(path_stat.st_mode)
+    or stat.S_IMODE(path_stat.st_mode) != 0o700
+    or (path_stat.st_dev, path_stat.st_ino, path_stat.st_uid, path_stat.st_gid)
+    != identity
+):
+    raise SystemExit("candidate data directory changed before freshness check")
+
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+flags |= getattr(os, "O_CLOEXEC", 0)
+flags |= getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or stat.S_IMODE(opened.st_mode) != 0o700
+        or (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_gid) != identity
+        or (opened.st_dev, opened.st_ino) != (path_stat.st_dev, path_stat.st_ino)
+    ):
+        raise SystemExit("candidate data directory changed while opening")
+    with os.scandir(descriptor) as entries:
+        if next(entries, None) is not None:
+            raise SystemExit(3)
+finally:
+    os.close(descriptor)
+"""
 CADDY_MUTATION_FENCE_PRELUDE = """\
 import fcntl
 import os
@@ -352,6 +570,50 @@ class CandidateIdentity:
     container_name: str
     image: str
     data_directory_name: str
+
+
+@dataclass(frozen=True)
+class CandidatePrepareLock:
+    """An inode-bound per-candidate lock held for the context lifetime."""
+
+    state_directory_fd: int
+    state_directory_path: Path
+    state_directory_identity: tuple[int, int]
+    lock_fd: int
+    lock_name: str
+    lock_identity: tuple[int, int]
+
+    def assert_current(self) -> None:
+        """Fail if either pathname no longer names the locked inode."""
+
+        try:
+            opened_directory = os.fstat(self.state_directory_fd)
+            current_directory = self.state_directory_path.lstat()
+            current_lock = os.stat(
+                self.lock_name,
+                dir_fd=self.state_directory_fd,
+                follow_symlinks=False,
+            )
+            opened_lock = os.fstat(self.lock_fd)
+        except OSError:
+            raise DeploymentError("candidate prepare lock changed while held") from None
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or not stat.S_ISDIR(current_directory.st_mode)
+            or (opened_directory.st_dev, opened_directory.st_ino)
+            != self.state_directory_identity
+            or (current_directory.st_dev, current_directory.st_ino)
+            != self.state_directory_identity
+            or opened_directory.st_uid != os.geteuid()
+            or current_directory.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_directory.st_mode) != 0o700
+            or stat.S_IMODE(current_directory.st_mode) != 0o700
+            or not _safe_candidate_prepare_lock_metadata(current_lock)
+            or not _safe_candidate_prepare_lock_metadata(opened_lock)
+            or (current_lock.st_dev, current_lock.st_ino) != self.lock_identity
+            or (opened_lock.st_dev, opened_lock.st_ino) != self.lock_identity
+        ):
+            raise DeploymentError("candidate prepare lock changed while held")
 
 
 DataDirectoryIdentity = tuple[int, int, int, int]
@@ -928,6 +1190,37 @@ def validate_candidate_port(value: str) -> int:
     return port
 
 
+def _candidate_data_path_for_creation(
+    *,
+    app_root: Path,
+    requested_path: Path,
+    source_sha: str,
+) -> Path:
+    identity = candidate_identity(source_sha)
+    if not app_root.is_absolute() or not requested_path.is_absolute():
+        raise DeploymentError("candidate data directory must be an absolute path")
+    try:
+        resolved_root = app_root.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        raise DeploymentError("application root must already exist") from None
+    if resolved_root != app_root:
+        raise DeploymentError(
+            "application root must be canonical and contain no symlink"
+        )
+    expected = resolved_root / identity.data_directory_name
+    if requested_path != expected:
+        raise DeploymentError(f"candidate data directory must be exactly {expected}")
+    try:
+        os.lstat(expected)
+    except FileNotFoundError:
+        return expected
+    except OSError:
+        raise DeploymentError(
+            "candidate data path could not be inspected before creation"
+        ) from None
+    raise DeploymentError("candidate data path must not already exist")
+
+
 def _validate_directory(
     path: Path,
     *,
@@ -1140,6 +1433,132 @@ def validate_deployment_layout(
         resolved_state,
         resolved_live,
         resolved_candidate,
+    )
+
+
+def _assert_initial_candidate_data(
+    runner: CommandRunner,
+    candidate_data_dir: Path,
+    expected_identity: DataDirectoryIdentity,
+) -> None:
+    result = runner.run(
+        [
+            SUDO_BINARY,
+            PYTHON_BINARY,
+            "-I",
+            "-c",
+            CANDIDATE_DATA_FRESHNESS_HELPER,
+            str(candidate_data_dir),
+            *(str(value) for value in expected_identity),
+        ],
+        allowed_returncodes=frozenset({0, 3}),
+    )
+    if result.returncode == 3:
+        raise DeploymentError(
+            "candidate data directory must be empty for initial preparation"
+        )
+
+
+def _open_private_application_root(
+    app_root: Path,
+) -> tuple[int, tuple[int, int], tuple[int, int]]:
+    """Open and bind the exact private application root."""
+
+    if not app_root.is_absolute():
+        raise DeploymentError("application root must be an absolute path")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        listed = app_root.lstat()
+        resolved = app_root.resolve(strict=True)
+        descriptor = os.open(app_root, directory_flags)
+        opened = os.fstat(descriptor)
+        current = app_root.lstat()
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise DeploymentError("application root could not be opened safely") from None
+
+    identity = (opened.st_dev, opened.st_ino)
+    expected_owner = (os.geteuid(), os.getegid())
+    if (
+        resolved != app_root
+        or stat.S_ISLNK(listed.st_mode)
+        or not stat.S_ISDIR(listed.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or (listed.st_dev, listed.st_ino) != identity
+        or (current.st_dev, current.st_ino) != identity
+        or (listed.st_uid, listed.st_gid) != expected_owner
+        or (opened.st_uid, opened.st_gid) != expected_owner
+        or (current.st_uid, current.st_gid) != expected_owner
+        or stat.S_IMODE(listed.st_mode) != 0o700
+        or stat.S_IMODE(opened.st_mode) != 0o700
+        or stat.S_IMODE(current.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise DeploymentError(
+            "application root must be canonical, non-symlink, owned by the "
+            "current user and group, and have mode 0700"
+        )
+    return descriptor, identity, expected_owner
+
+
+def _create_candidate_data_directory(
+    runner: CommandRunner,
+    *,
+    app_root: Path,
+    identity: CandidateIdentity,
+) -> tuple[Path, DataDirectoryIdentity]:
+    candidate_path = app_root / identity.data_directory_name
+    root_descriptor, _root_identity, root_owner = _open_private_application_root(
+        app_root
+    )
+    os.close(root_descriptor)
+    result = runner.run(
+        [
+            SUDO_BINARY,
+            PYTHON_BINARY,
+            "-I",
+            "-c",
+            CANDIDATE_DATA_CREATE_HELPER,
+            str(app_root),
+            identity.data_directory_name,
+            str(root_owner[0]),
+            str(root_owner[1]),
+            str(RUNTIME_UID),
+            str(RUNTIME_GID),
+        ]
+    )
+    fields = result.stdout.strip().split("|")
+    if len(fields) != 4 or any(
+        not field or not field.isascii() or not field.isdigit() for field in fields
+    ):
+        raise DeploymentError("created candidate data identity is invalid")
+    values = tuple(int(field) for field in fields)
+    if (
+        any(str(value) != field for value, field in zip(values, fields, strict=True))
+        or values[0] < 0
+        or values[1] <= 0
+        or values[2:] != (RUNTIME_UID, RUNTIME_GID)
+    ):
+        raise DeploymentError("created candidate data identity is invalid")
+    return candidate_path, cast(DataDirectoryIdentity, values)
+
+
+def _assert_initial_candidate_state_absent(candidate_state_path: Path) -> None:
+    try:
+        os.lstat(candidate_state_path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise DeploymentError(
+            "candidate state path could not be inspected for initial preparation"
+        ) from None
+    raise DeploymentError(
+        "candidate state already exists; archive it before a fresh preparation"
     )
 
 
@@ -2637,6 +3056,517 @@ def _prepare_private_directory(directory: Path, *, label: str) -> Path:
     return _validate_private_directory(directory, label=label)
 
 
+def _safe_candidate_prepare_lock_metadata(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+        and metadata.st_nlink == 1
+    )
+
+
+@contextmanager
+def _candidate_prepare_lock(
+    source_sha: str,
+    *,
+    require_existing: bool = False,
+) -> Iterator[CandidatePrepareLock]:
+    identity = candidate_identity(source_sha)
+    directory = _validate_private_directory(
+        STATE_DIRECTORY,
+        label="candidate prepare lock directory",
+    )
+    lock_name = f"candidate-{identity.source_sha[:12]}.prepare.lock"
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    file_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_descriptor = -1
+    descriptor = -1
+    locked = False
+    try:
+        directory_descriptor = os.open(directory, directory_flags)
+        opened_directory = os.fstat(directory_descriptor)
+        current_directory = directory.lstat()
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or (
+                opened_directory.st_dev,
+                opened_directory.st_ino,
+            )
+            != (current_directory.st_dev, current_directory.st_ino)
+            or (
+                opened_directory.st_uid != os.geteuid()
+                or stat.S_IMODE(opened_directory.st_mode) != 0o700
+            )
+        ):
+            raise DeploymentError("candidate prepare lock directory changed")
+        created = False
+        if require_existing:
+            try:
+                existing = os.stat(
+                    lock_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                descriptor = os.open(
+                    lock_name,
+                    file_flags,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError:
+                raise DeploymentError("candidate prepare lock is unsafe") from None
+        else:
+            try:
+                descriptor = os.open(
+                    lock_name,
+                    file_flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except FileExistsError:
+                try:
+                    existing = os.stat(
+                        lock_name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                    descriptor = os.open(
+                        lock_name,
+                        file_flags,
+                        dir_fd=directory_descriptor,
+                    )
+                except OSError:
+                    raise DeploymentError("candidate prepare lock is unsafe") from None
+            else:
+                created = True
+        if not created:
+            opened = os.fstat(descriptor)
+            if (
+                not _safe_candidate_prepare_lock_metadata(existing)
+                or not _safe_candidate_prepare_lock_metadata(opened)
+                or (existing.st_dev, existing.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                raise DeploymentError("candidate prepare lock is unsafe")
+        else:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            os.fsync(directory_descriptor)
+            opened = os.fstat(descriptor)
+            if not _safe_candidate_prepare_lock_metadata(opened):
+                raise DeploymentError("candidate prepare lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise DeploymentError(
+                "candidate preparation is already in progress for this SOURCE_SHA"
+            ) from None
+        locked = True
+        current_lock = os.stat(
+            lock_name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        opened_lock = os.fstat(descriptor)
+        if (
+            not _safe_candidate_prepare_lock_metadata(current_lock)
+            or not _safe_candidate_prepare_lock_metadata(opened_lock)
+            or (current_lock.st_dev, current_lock.st_ino)
+            != (opened_lock.st_dev, opened_lock.st_ino)
+        ):
+            raise DeploymentError("candidate prepare lock changed while acquiring")
+        held_lock = CandidatePrepareLock(
+            state_directory_fd=directory_descriptor,
+            state_directory_path=directory,
+            state_directory_identity=(
+                opened_directory.st_dev,
+                opened_directory.st_ino,
+            ),
+            lock_fd=descriptor,
+            lock_name=lock_name,
+            lock_identity=(opened_lock.st_dev, opened_lock.st_ino),
+        )
+        body_error: BaseException | None = None
+        try:
+            yield held_lock
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            try:
+                held_lock.assert_current()
+            except DeploymentError:
+                if body_error is not None:
+                    raise DeploymentError(
+                        "candidate prepare lock changed while held after the "
+                        "candidate operation also failed"
+                    ) from body_error
+                raise
+    except DeploymentError:
+        raise
+    except OSError:
+        raise DeploymentError(
+            "candidate prepare lock could not be acquired safely"
+        ) from None
+    finally:
+        if locked and descriptor >= 0:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if descriptor >= 0:
+            os.close(descriptor)
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+
+
+def _open_quarantine_application_root() -> tuple[int, tuple[int, int]]:
+    if STATE_DIRECTORY != APP_ROOT / "deploy-state":
+        raise DeploymentError("state directory must be exactly APP_ROOT/deploy-state")
+    descriptor, identity, _owner = _open_private_application_root(APP_ROOT)
+    return descriptor, identity
+
+
+def _assert_quarantine_hierarchy_current(
+    app_root_fd: int,
+    app_root_identity: tuple[int, int],
+    lock: CandidatePrepareLock,
+) -> None:
+    lock.assert_current()
+    try:
+        opened_root = os.fstat(app_root_fd)
+        current_root = APP_ROOT.lstat()
+        linked_state = os.stat(
+            "deploy-state",
+            dir_fd=app_root_fd,
+            follow_symlinks=False,
+        )
+        opened_state = os.fstat(lock.state_directory_fd)
+    except OSError:
+        raise DeploymentError("candidate quarantine hierarchy changed") from None
+    if (
+        not stat.S_ISDIR(opened_root.st_mode)
+        or not stat.S_ISDIR(current_root.st_mode)
+        or (opened_root.st_dev, opened_root.st_ino) != app_root_identity
+        or (current_root.st_dev, current_root.st_ino) != app_root_identity
+        or opened_root.st_uid != os.geteuid()
+        or current_root.st_uid != os.geteuid()
+        or opened_root.st_gid != os.getegid()
+        or current_root.st_gid != os.getegid()
+        or stat.S_IMODE(opened_root.st_mode) != 0o700
+        or stat.S_IMODE(current_root.st_mode) != 0o700
+        or not stat.S_ISDIR(linked_state.st_mode)
+        or (linked_state.st_dev, linked_state.st_ino) != lock.state_directory_identity
+        or (opened_state.st_dev, opened_state.st_ino) != lock.state_directory_identity
+        or linked_state.st_uid != os.geteuid()
+        or opened_state.st_uid != os.geteuid()
+        or stat.S_IMODE(linked_state.st_mode) != 0o700
+        or stat.S_IMODE(opened_state.st_mode) != 0o700
+    ):
+        raise DeploymentError("candidate quarantine hierarchy changed")
+    if opened_root.st_dev != opened_state.st_dev:
+        raise DeploymentError(
+            "application root and state directory must use the same filesystem"
+        )
+
+
+def _candidate_input_metadata(
+    name: str,
+    *,
+    directory_fd: int,
+    label: str,
+) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise DeploymentError(f"{label} could not be inspected safely") from None
+
+
+def _validate_quarantine_data(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != RUNTIME_UID
+        or metadata.st_gid != RUNTIME_GID
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise DeploymentError(
+            "candidate data must be a non-symlink directory owned by "
+            f"{RUNTIME_UID}:{RUNTIME_GID} with mode 0700"
+        )
+
+
+def _validate_quarantine_state(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        raise DeploymentError(
+            "candidate state must be a non-symlink regular file owned by the "
+            "current user with mode 0600 and one hard link"
+        )
+
+
+def _create_quarantine_archive(
+    app_root_fd: int,
+    *,
+    source_sha: str,
+) -> tuple[str, int, tuple[int, int]]:
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    for _attempt in range(128):
+        name = f"quarantine-candidate-{source_sha[:12]}-{secrets.token_hex(8)}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=app_root_fd)
+        except FileExistsError:
+            continue
+        except OSError:
+            raise DeploymentError(
+                "candidate quarantine archive could not be created safely"
+            ) from None
+        archive_fd = -1
+        try:
+            archive_fd = os.open(name, directory_flags, dir_fd=app_root_fd)
+            os.fchmod(archive_fd, 0o700)
+            opened = os.fstat(archive_fd)
+            linked = os.stat(name, dir_fd=app_root_fd, follow_symlinks=False)
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(linked.st_mode)
+                or (linked.st_dev, linked.st_ino) != identity
+                or opened.st_uid != os.geteuid()
+                or linked.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o700
+                or stat.S_IMODE(linked.st_mode) != 0o700
+            ):
+                raise DeploymentError("candidate quarantine archive identity is unsafe")
+            os.fsync(archive_fd)
+            os.fsync(app_root_fd)
+            return name, archive_fd, identity
+        except DeploymentError:
+            if archive_fd >= 0:
+                os.close(archive_fd)
+            raise
+        except OSError:
+            if archive_fd >= 0:
+                os.close(archive_fd)
+            raise DeploymentError(
+                "candidate quarantine archive could not be bound safely"
+            ) from None
+    raise DeploymentError("candidate quarantine archive name could not be allocated")
+
+
+def _rename_candidate_input_noreplace(
+    source: str,
+    destination: str,
+    *,
+    src_dir_fd: int,
+    dst_dir_fd: int,
+) -> None:
+    """Atomically move one input without replacing a destination entry."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError:
+        raise OSError(
+            errno.ENOSYS,
+            "renameat2 is required for no-clobber candidate quarantine",
+        ) from None
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        src_dir_fd,
+        os.fsencode(source),
+        dst_dir_fd,
+        os.fsencode(destination),
+        1,  # RENAME_NOREPLACE from linux/fs.h.
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            destination,
+        )
+    raise OSError(error_number, os.strerror(error_number), source)
+
+
+def _move_candidate_input_to_quarantine(
+    *,
+    source_name: str,
+    source_directory_fd: int,
+    destination_name: str,
+    archive_fd: int,
+    expected: os.stat_result,
+    validate: Any,
+    label: str,
+    app_root_fd: int,
+    app_root_identity: tuple[int, int],
+    lock: CandidatePrepareLock,
+) -> None:
+    _assert_quarantine_hierarchy_current(app_root_fd, app_root_identity, lock)
+    current = _candidate_input_metadata(
+        source_name,
+        directory_fd=source_directory_fd,
+        label=label,
+    )
+    if current is None:
+        raise DeploymentError(f"{label} changed before quarantine")
+    validate(current)
+    if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+        raise DeploymentError(f"{label} changed before quarantine")
+    try:
+        _rename_candidate_input_noreplace(
+            source_name,
+            destination_name,
+            src_dir_fd=source_directory_fd,
+            dst_dir_fd=archive_fd,
+        )
+        moved = os.stat(
+            destination_name,
+            dir_fd=archive_fd,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise DeploymentError(f"{label} could not be quarantined safely") from None
+    validate(moved)
+    if (moved.st_dev, moved.st_ino) != (expected.st_dev, expected.st_ino):
+        raise DeploymentError(f"{label} changed while being quarantined")
+    if (
+        _candidate_input_metadata(
+            source_name,
+            directory_fd=source_directory_fd,
+            label=label,
+        )
+        is not None
+    ):
+        raise DeploymentError(f"{label} was replaced while being quarantined")
+    os.fsync(archive_fd)
+    os.fsync(source_directory_fd)
+    _assert_quarantine_hierarchy_current(app_root_fd, app_root_identity, lock)
+
+
+def quarantine_candidate_inputs(source_sha: str) -> Path:
+    """Move retained candidate inputs into a fresh, durable archive."""
+
+    identity = candidate_identity(source_sha)
+    app_root_fd = -1
+    archive_fd = -1
+    with _candidate_prepare_lock(
+        identity.source_sha,
+        require_existing=True,
+    ) as lock:
+        try:
+            app_root_fd, app_root_identity = _open_quarantine_application_root()
+            _assert_quarantine_hierarchy_current(
+                app_root_fd,
+                app_root_identity,
+                lock,
+            )
+            data_name = identity.data_directory_name
+            state_name = f"candidate-{identity.source_sha[:12]}.json"
+            data_metadata = _candidate_input_metadata(
+                data_name,
+                directory_fd=app_root_fd,
+                label="candidate data",
+            )
+            state_metadata = _candidate_input_metadata(
+                state_name,
+                directory_fd=lock.state_directory_fd,
+                label="candidate state",
+            )
+            if data_metadata is not None:
+                _validate_quarantine_data(data_metadata)
+            if state_metadata is not None:
+                _validate_quarantine_state(state_metadata)
+            if data_metadata is None and state_metadata is None:
+                raise DeploymentError(
+                    "no candidate data or state remains to quarantine"
+                )
+
+            archive_name, archive_fd, archive_identity = _create_quarantine_archive(
+                app_root_fd,
+                source_sha=identity.source_sha,
+            )
+            if data_metadata is not None:
+                _move_candidate_input_to_quarantine(
+                    source_name=data_name,
+                    source_directory_fd=app_root_fd,
+                    destination_name="data",
+                    archive_fd=archive_fd,
+                    expected=data_metadata,
+                    validate=_validate_quarantine_data,
+                    label="candidate data",
+                    app_root_fd=app_root_fd,
+                    app_root_identity=app_root_identity,
+                    lock=lock,
+                )
+            if state_metadata is not None:
+                _move_candidate_input_to_quarantine(
+                    source_name=state_name,
+                    source_directory_fd=lock.state_directory_fd,
+                    destination_name=state_name,
+                    archive_fd=archive_fd,
+                    expected=state_metadata,
+                    validate=_validate_quarantine_state,
+                    label="candidate state",
+                    app_root_fd=app_root_fd,
+                    app_root_identity=app_root_identity,
+                    lock=lock,
+                )
+            _assert_quarantine_hierarchy_current(
+                app_root_fd,
+                app_root_identity,
+                lock,
+            )
+            linked_archive = os.stat(
+                archive_name,
+                dir_fd=app_root_fd,
+                follow_symlinks=False,
+            )
+            opened_archive = os.fstat(archive_fd)
+            if (
+                not stat.S_ISDIR(linked_archive.st_mode)
+                or not stat.S_ISDIR(opened_archive.st_mode)
+                or (linked_archive.st_dev, linked_archive.st_ino) != archive_identity
+                or (opened_archive.st_dev, opened_archive.st_ino) != archive_identity
+                or linked_archive.st_uid != os.geteuid()
+                or opened_archive.st_uid != os.geteuid()
+                or stat.S_IMODE(linked_archive.st_mode) != 0o700
+                or stat.S_IMODE(opened_archive.st_mode) != 0o700
+            ):
+                raise DeploymentError(
+                    "candidate quarantine archive changed during recovery"
+                )
+            os.fsync(archive_fd)
+            os.fsync(lock.state_directory_fd)
+            os.fsync(app_root_fd)
+            return APP_ROOT / archive_name
+        except DeploymentError:
+            raise
+        except OSError:
+            raise DeploymentError(
+                "candidate inputs could not be quarantined safely"
+            ) from None
+        finally:
+            if archive_fd >= 0:
+                os.close(archive_fd)
+            if app_root_fd >= 0:
+                os.close(app_root_fd)
+
+
 def _read_private_text(path: Path, *, directory: Path, label: str) -> str:
     private_directory = _validate_private_directory(
         directory, label=f"{label} directory"
@@ -2854,13 +3784,47 @@ def _write_private_json(path: Path, payload: Mapping[str, object]) -> None:
     directory = _prepare_private_directory(
         path.parent, label="candidate state directory"
     )
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_descriptor = -1
     created = False
     try:
         try:
-            descriptor = os.open(temporary, flags, 0o600)
+            listed_directory = directory.lstat()
+            directory_descriptor = os.open(directory, directory_flags)
+            opened_directory = os.fstat(directory_descriptor)
+            current_directory = directory.lstat()
+        except OSError:
+            raise DeploymentError(
+                "candidate state directory could not be opened safely"
+            ) from None
+        directory_identity = (opened_directory.st_dev, opened_directory.st_ino)
+        if (
+            not stat.S_ISDIR(listed_directory.st_mode)
+            or not stat.S_ISDIR(opened_directory.st_mode)
+            or not stat.S_ISDIR(current_directory.st_mode)
+            or (listed_directory.st_dev, listed_directory.st_ino) != directory_identity
+            or (current_directory.st_dev, current_directory.st_ino)
+            != directory_identity
+            or listed_directory.st_uid != os.geteuid()
+            or opened_directory.st_uid != os.geteuid()
+            or current_directory.st_uid != os.geteuid()
+            or stat.S_IMODE(listed_directory.st_mode) != 0o700
+            or stat.S_IMODE(opened_directory.st_mode) != 0o700
+            or stat.S_IMODE(current_directory.st_mode) != 0o700
+        ):
+            raise DeploymentError("candidate state directory changed before write")
+        try:
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
             created = True
         except OSError:
             raise DeploymentError(
@@ -2871,42 +3835,144 @@ def _write_private_json(path: Path, payload: Mapping[str, object]) -> None:
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
+            written = os.fstat(output.fileno())
         try:
-            os.replace(temporary, path)
+            _rename_candidate_input_noreplace(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
             created = False
-            directory_descriptor = os.open(
-                directory,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_CLOEXEC", 0),
+            published = os.stat(
+                path.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(published.st_mode)
+                or (published.st_dev, published.st_ino)
+                != (written.st_dev, written.st_ino)
+                or published.st_uid != os.geteuid()
+                or stat.S_IMODE(published.st_mode) != 0o600
+                or published.st_nlink != 1
+            ):
+                raise DeploymentError("candidate state could not be published safely")
+            published_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            published_flags |= getattr(os, "O_NOFOLLOW", 0)
+            published_descriptor = os.open(
+                path.name,
+                published_flags,
+                dir_fd=directory_descriptor,
             )
             try:
-                os.fsync(directory_descriptor)
+                opened_published = os.fstat(published_descriptor)
+                if (
+                    not stat.S_ISREG(opened_published.st_mode)
+                    or (opened_published.st_dev, opened_published.st_ino)
+                    != (written.st_dev, written.st_ino)
+                    or opened_published.st_uid != os.geteuid()
+                    or stat.S_IMODE(opened_published.st_mode) != 0o600
+                    or opened_published.st_nlink != 1
+                ):
+                    raise DeploymentError(
+                        "candidate state could not be published safely"
+                    )
+                os.fsync(published_descriptor)
             finally:
-                os.close(directory_descriptor)
+                os.close(published_descriptor)
+            os.fsync(directory_descriptor)
+            current_directory = directory.lstat()
+            opened_directory = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(current_directory.st_mode)
+                or not stat.S_ISDIR(opened_directory.st_mode)
+                or (current_directory.st_dev, current_directory.st_ino)
+                != directory_identity
+                or (opened_directory.st_dev, opened_directory.st_ino)
+                != directory_identity
+                or current_directory.st_uid != os.geteuid()
+                or opened_directory.st_uid != os.geteuid()
+                or stat.S_IMODE(current_directory.st_mode) != 0o700
+                or stat.S_IMODE(opened_directory.st_mode) != 0o700
+            ):
+                raise DeploymentError(
+                    "candidate state directory changed during publication"
+                )
+            final = os.stat(
+                path.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(final.st_mode)
+                or (final.st_dev, final.st_ino) != (written.st_dev, written.st_ino)
+                or final.st_uid != os.geteuid()
+                or stat.S_IMODE(final.st_mode) != 0o600
+                or final.st_nlink != 1
+            ):
+                raise DeploymentError("candidate state could not be published safely")
+        except FileExistsError:
+            raise DeploymentError(
+                "candidate state already exists; refusing to overwrite it"
+            ) from None
+        except DeploymentError:
+            raise
         except OSError:
             raise DeploymentError(
-                "candidate state could not be written safely"
+                "candidate state could not be published safely"
             ) from None
     finally:
         if created:
             try:
-                temporary.unlink()
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
             except FileNotFoundError:
                 pass
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
 
 
 def prepare_candidate(arguments: argparse.Namespace, runner: CommandRunner) -> Path:
     build_manifest = _load_build_manifest(Path(arguments.build_manifest))
+    identity = candidate_identity(cast(str, build_manifest["source_sha"]))
+    with _candidate_prepare_lock(identity.source_sha):
+        return _prepare_candidate_locked(
+            arguments,
+            runner,
+            build_manifest=build_manifest,
+            identity=identity,
+        )
+
+
+def _prepare_candidate_locked(
+    arguments: argparse.Namespace,
+    runner: CommandRunner,
+    *,
+    build_manifest: Mapping[str, Any],
+    identity: CandidateIdentity,
+) -> Path:
     deployment_assets = _load_verified_deployment_assets(
         build_manifest["deployment_assets"]
     )
-    identity = candidate_identity(cast(str, build_manifest["source_sha"]))
     port = validate_candidate_port(arguments.candidate_port)
+    requested_candidate = _candidate_data_path_for_creation(
+        app_root=APP_ROOT,
+        requested_path=Path(arguments.candidate_data_dir),
+        source_sha=identity.source_sha,
+    )
+    state_path = STATE_DIRECTORY / f"candidate-{identity.source_sha[:12]}.json"
+    _assert_initial_candidate_state_absent(state_path)
+    candidate, candidate_data_identity = _create_candidate_data_directory(
+        runner,
+        app_root=APP_ROOT,
+        identity=identity,
+    )
+    if candidate != requested_candidate:
+        raise DeploymentError("created candidate data path is invalid")
     live, candidate = validate_data_directories(
         app_root=APP_ROOT,
         live_data_dir=Path(arguments.live_data_dir),
-        candidate_data_dir=Path(arguments.candidate_data_dir),
+        candidate_data_dir=candidate,
         source_sha=identity.source_sha,
     )
     validate_deployment_layout(
@@ -2917,7 +3983,12 @@ def prepare_candidate(arguments: argparse.Namespace, runner: CommandRunner) -> P
         candidate_data_dir=candidate,
     )
     live_data_identity = _data_directory_identity(live)
-    candidate_data_identity = _data_directory_identity(candidate)
+    _assert_data_directory_identity(
+        candidate,
+        candidate_data_identity,
+        label="candidate data directory",
+    )
+    _assert_initial_candidate_data(runner, candidate, candidate_data_identity)
     docker_daemon_id = cast(str, build_manifest["docker_daemon_id"])
     _assert_local_docker_daemon(runner, docker_daemon_id)
     expected_image_id = cast(str, build_manifest["image_id"])
@@ -3027,7 +4098,6 @@ def prepare_candidate(arguments: argparse.Namespace, runner: CommandRunner) -> P
     )
     _assert_local_docker_daemon(runner, docker_daemon_id)
 
-    state_path = STATE_DIRECTORY / f"candidate-{identity.source_sha[:12]}.json"
     _write_private_json(
         state_path,
         {
@@ -5761,8 +6831,8 @@ def rollback_site(arguments: argparse.Namespace, runner: CommandRunner) -> Path:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Prepare, switch, reconcile, or roll back the CommerceOps "
-            "workstation candidate."
+            "Prepare, quarantine, switch, reconcile, or roll back the "
+            "CommerceOps workstation candidate."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -5775,6 +6845,12 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--candidate-port", required=True)
     prepare.add_argument("--live-data-dir", required=True)
     prepare.add_argument("--candidate-data-dir", required=True)
+
+    quarantine = subparsers.add_parser(
+        "quarantine",
+        help="Recoverably archive interrupted candidate data and state.",
+    )
+    quarantine.add_argument("--source-sha", required=True)
 
     switch = subparsers.add_parser(
         "switch",
@@ -5803,6 +6879,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "prepare":
             state = prepare_candidate(arguments, runner)
             print(f"candidate healthy; state recorded at {state}")
+        elif arguments.command == "quarantine":
+            archive = quarantine_candidate_inputs(arguments.source_sha)
+            print(f"candidate inputs retained at {archive}")
         elif arguments.command == "switch":
             backup = switch_candidate(arguments, runner)
             print(f"Caddy switched and verified; rollback backup: {backup}")

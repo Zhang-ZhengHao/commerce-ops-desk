@@ -90,16 +90,34 @@ test.describe('I01 hosted foundation', () => {
     await expect(guideSteps.locator('strong')).toHaveText([...EVALUATOR_STEPS]);
     await expect(page.getByText(FICTIONAL_TEXT_RULE, { exact: true })).toBeVisible();
     await expect(page.getByText('Synthetic data only')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Enter as Manager' })).toBeEnabled();
-    await expect(page.getByRole('button', { name: 'Enter as Agent' })).toBeEnabled();
-
+    const managerEntry = page.getByRole('button', { name: 'Enter as Manager' });
+    const agentEntry = page.getByRole('button', { name: 'Enter as Agent' });
     const footer = page.getByRole('contentinfo');
-    await expect(footer.getByText('v0.2.1', { exact: true })).toBeVisible();
     const sourceLink = footer.getByRole('link', { name: EVALUATOR_SOURCE_SHA });
+    await expect(managerEntry).toBeEnabled();
+    await expect(agentEntry).toBeEnabled();
     await expect(sourceLink).toHaveAttribute(
       'href',
       `${PUBLIC_REPOSITORY_URL}/commit/${EVALUATOR_SOURCE_SHA}`,
     );
+    await expect(guide).not.toHaveAttribute('tabindex');
+
+    await page.keyboard.press('Tab');
+    await expect(
+      page.getByRole('link', { name: 'Skip to main content' }),
+    ).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(
+      page.getByRole('link', { name: 'CommerceOps Desk home' }),
+    ).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(managerEntry).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(agentEntry).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(sourceLink).toBeFocused();
+
+    await expect(footer.getByText('v0.2.1', { exact: true })).toBeVisible();
     await expect(
       footer.getByRole('link', { name: 'Public walkthrough · v0.2.0' }),
     ).toHaveAttribute(

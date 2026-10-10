@@ -9,25 +9,26 @@ const evaluatorSteps = [
   {
     title: 'Create an event',
     detail:
-      'Enter as Manager, open the synthetic provider panel, and deliver a fresh payment.failed event.',
+      'Use “Enter as Manager”, find “Synthetic provider”, then select “Deliver new failure” to create a payment.failed case.',
   },
   {
     title: 'Test the boundary',
     detail:
-      'Replay the exact event, then tamper with one signed byte to compare idempotent success with authentication rejection.',
+      'Select “Replay same event”, “Tamper after signing”, and “Send stale signature” to compare idempotent replay with authentication rejection.',
   },
   {
     title: 'Assign the case',
-    detail: 'Open the generated case and assign it to Demo Agent.',
+    detail:
+      'Open the generated case, choose Demo Agent under “Assign to agent”, then select “Update assignment”.',
   },
   {
     title: 'Work as Agent',
     detail:
-      'Switch role, add a fictional internal note, and resolve with an allowed reason.',
+      'Use “Switch to Agent”, enter fictional text in “Internal note”, and select “Add note”. Then choose a “Resolution reason” and select “Resolve case”.',
   },
   {
     title: 'Verify the trail',
-    detail: 'Inspect safe provenance and the ordered audit history.',
+    detail: 'Inspect “Event provenance” and the ordered “Accountable timeline”.',
   },
 ] as const;
 

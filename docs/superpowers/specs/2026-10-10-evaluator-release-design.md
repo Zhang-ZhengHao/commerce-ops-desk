@@ -1,18 +1,23 @@
 # CommerceOps Desk v0.2.1 evaluator release design
 
-Status: proposed for written-design approval
+Status: approved for execution
 
 Target release: `v0.2.1`
 
-Target demo: `https://commerce-ops-desk.srrsh.aig.rest`
+Target host: dedicated access-controlled CommerceOps route on the enterprise workstation; not promoted as a live-demo CTA at this checkpoint
 
 ## 1. Context and customer-trust problem
 
 CommerceOps Desk already has strong engineering evidence: a complete synthetic
 Manager/Agent workflow, signed webhook behavior, PostgreSQL 17 verification,
 browser tests, a hardened container, and a reviewable workstation deployment
-contract. A prospective client still has to trust screenshots, a video, or a
-local setup guide because the repository has no live product entry point.
+contract. The exact deployment hostname already exists in versioned engineering
+files and public Git history. A prospective client still has to trust
+screenshots, a video, or a local setup guide because this discoverable host has
+not been promoted as an approved live product entry point.
+
+This checkpoint does not add or promote a live-demo CTA, and it does not claim
+that the evaluator is deployed, released, or approved for external access.
 
 The next release will close that verification gap. A visitor with the
 enterprise access code should be able to open one stable HTTPS URL, follow a
@@ -33,8 +38,8 @@ Success means that a new evaluator can:
 
 Publish one access-code-protected evaluator deployment from an immutable,
 green commit on `main`. Add a compact five-step evaluation guide and
-server-reported build identity to the existing application, then publish the
-URL only after desktop and mobile acceptance succeeds.
+server-reported build identity to the existing application, then promote the
+live-demo CTA only after desktop and mobile acceptance succeeds.
 
 This approach reuses the product's real API, database, authorization, webhook,
 and audit paths. It does not create a scripted mock, a separate showcase
@@ -62,8 +67,8 @@ current-head rollback controls remain the only workstation deployment path.
 
 ## 3. Release and branch sequence
 
-The sequence is intentionally fail-closed. No public URL or release claim is
-updated before the deployment has passed external acceptance.
+The sequence is intentionally fail-closed. No live-demo CTA or release claim is
+added or promoted before the deployment has passed external acceptance.
 
 1. Approve this written design.
 2. Reconfirm that PR #9 still points to
@@ -85,8 +90,14 @@ updated before the deployment has passed external acceptance.
    Fetch the resulting remote `main`, require `refs/remotes/origin/main` and
    GitHub's `refs/heads/main` to equal the same full commit, and record it as
    `DEPLOY_SHA`. Because a merge or squash creates a new commit, wait again for
-   the `push`-to-`main` Verify and CodeQL runs whose `head_sha` equals
-   `DEPLOY_SHA`; require them green and record their immutable run URLs.
+   exactly one completed successful Verify `push` run and one completed
+   successful CodeQL Default Setup (`workflowName: CodeQL`) `dynamic` run.
+   Both must target `main`, carry the exact expected workflow name and database
+   ID, and report `headSha == DEPLOY_SHA`. Record each run attempt and its
+   attempt-specific immutable URL. The controller requests 1,000 records and
+   the selector accepts at most 999. Reaching the 1,000-result GitHub API cap
+   is a truncation sentinel that fails closed so uniqueness is never inferred
+   from an incomplete list.
 5. Build and deploy only `DEPLOY_SHA` through the versioned workstation tools.
    Keep the previous route, container, and data directory unchanged during the
    acceptance window.
@@ -126,14 +137,18 @@ evaluation path; `Enter as Agent` remains available as a secondary role-boundary
 check. The current four-item I03 card is replaced with a release-accurate
 five-step guide:
 
-1. **Create an event** — enter as Manager, open the synthetic provider panel,
-   and deliver a fresh `payment.failed` event.
-2. **Test the boundary** — replay the exact event, then tamper with one signed
-   byte and observe idempotent success versus authentication rejection.
-3. **Assign the case** — open the generated case and assign it to Demo Agent.
-4. **Work as Agent** — switch role, add a fictional internal note, and resolve
-   with an allowed reason.
-5. **Verify the trail** — inspect safe provenance and the ordered audit history.
+1. **Create an event** — use `Enter as Manager`, find `Synthetic provider`,
+   then select `Deliver new failure` to create a `payment.failed` case.
+2. **Test the boundary** — select `Replay same event`, `Tamper after signing`,
+   and `Send stale signature` to compare idempotent replay with authentication
+   rejection.
+3. **Assign the case** — open the generated case, choose Demo Agent under
+   `Assign to agent`, then select `Update assignment`.
+4. **Work as Agent** — select `Switch to Agent`, enter fictional text in
+   `Internal note`, and select `Add note`. Then choose a `Resolution reason`
+   and select `Resolve case`.
+5. **Verify the trail** — inspect `Event provenance` and the ordered
+   `Accountable timeline`.
 
 The guide describes this as a short five-step journey, uses fictional data,
 needs no account, and cannot affect a store or payment. It makes no unmeasured
@@ -236,28 +251,47 @@ repository or controlled acceptance flow.
 ## 7. Verified deployment and rollback flow
 
 The authoritative operational procedure remains
-`deploy/workstation/RUNBOOK.md`; implementation must update it only where the
-new build-identity acceptance check requires precision. The deployment uses
-only these scoped locations:
+`deploy/workstation/RUNBOOK.md`; implementation must keep it synchronized with
+the exact-SHA evidence, staged-code installation, build-identity, and
+interruption-safe recovery contracts in this design. Persistent filesystem
+mutation stays inside these scoped locations:
 
-- `~/apps/commerce-ops-desk/code`
-- `~/apps/commerce-ops-desk/deploy-state`
-- a new `~/apps/commerce-ops-desk/data-candidate-<12-char-sha>` directory
-- `/etc/caddy/sites/commerce-ops-desk.conf`
-- the root-owned CommerceOps transaction directory and active head
+- the private mode-`0700` `~/apps/commerce-ops-desk` application root;
+- `~/apps/commerce-ops-desk/code`;
+- private code-staging and retained code-quarantine siblings under that root;
+- `~/apps/commerce-ops-desk/deploy-state`, including manifests, candidate
+  state, and per-SHA lock files;
+- the existing live data directory, a new
+  `data-candidate-<12-char-sha>` directory, hidden pre-publication candidate
+  siblings, and retained candidate-quarantine archives under that root;
+- `/etc/caddy/sites/commerce-ops-desk.conf`; and
+- the root-owned CommerceOps transaction directory and active head.
 
 The deployment stages are:
 
-1. Fetch `origin/main` in the canonical checkout and require it to equal the
-   approved full `DEPLOY_SHA`.
-2. Run `build_verified_image.py` against that approved remote ref. Retain the
+1. In the trusted release controller, require the platform and public GitHub
+   `main` refs to equal the approved full `DEPLOY_SHA`, then select the required
+   exact-SHA CI evidence from the committed selector.
+2. On the workstation, create a fresh clone from the public GitHub repository
+   in a private staging directory. Require its `origin/main` to equal
+   `DEPLOY_SHA`, check out that commit detached and clean, verify each deployment
+   tool against its committed blob, retain any previous canonical code path in
+   quarantine, and only then install the verified clone at `code/`.
+3. Run `build_verified_image.py` against that approved remote ref. Retain the
    private schema-2 build manifest and require its source, immutable image,
    deployment-asset digests, and Docker daemon identity to validate.
-3. Create a fresh mode-`0700`, numeric `10001:10001` candidate data directory.
-   Do not reuse or copy live state.
 4. Run `deploy.py prepare` with the private build manifest, an unused canonical
-   loopback port, the unchanged live data directory, and the fresh candidate
-   directory. `prepare` must leave Caddy untouched.
+   loopback port, the unchanged live data directory, and the exact absent
+   candidate path derived from `DEPLOY_SHA`. While holding the per-SHA lock,
+   `prepare` configures and flushes a fresh mode-`0700`, numeric `10001:10001`
+   inode under a random hidden sibling before no-clobber publication at the
+   final candidate path. An interruption before publication cannot block the
+   final path. The operator must not create the candidate by hand, reuse it, or
+   copy live state. The flushed candidate state is likewise published from a
+   hidden file with a dirfd-bound `renameat2(RENAME_NOREPLACE)`, so interruption
+   leaves either the hidden file or one final link rather than an unrecoverable
+   two-link state. Application state and candidate quarantine storage must be on
+   the same filesystem. `prepare` must leave Caddy untouched.
 5. Verify candidate health, readiness, version, full SHA, and candidate logs
    through loopback with the required Host header. Do not weaken Secure cookies,
    alter Caddy, or start a second publication path to run the browser journey
@@ -340,8 +374,13 @@ At minimum, automated coverage includes:
   resolution, reset, and recovery journeys;
 - deployment helper/runtime-contract refusal when runtime source identity does
   not equal the verified image source;
-- release-evidence selection that accepts only GitHub Actions runs whose
-  `head_sha` equals `DEPLOY_SHA`, never a mutable latest-run link; and
+- release-evidence selection that accepts exactly one completed successful
+  Verify `push` run and one completed successful CodeQL Default Setup
+  (`workflowName: CodeQL`) `dynamic` run, both on `main` with the expected
+  workflow database ID and `headSha == DEPLOY_SHA`; it must record the attempt
+  and never emit a mutable latest-run or base-run link. The controller requests
+  1,000 records, the selector accepts at most 999, and reaching the
+  1,000-result GitHub API cap rejects potentially truncated run input; and
 - public-history scanning of every new commit.
 
 The final application pull request must pass `make verify`, the PostgreSQL 17
@@ -398,7 +437,9 @@ public entry point:
 
 1. the remote `v0.2.1` tag and GitHub release target equal `DEPLOY_SHA`;
 2. the live footer and running image identify the same `DEPLOY_SHA`;
-3. every linked GitHub Actions run reports `head_sha == DEPLOY_SHA`; and
+3. each attempt-specific GitHub Actions link identifies the expected workflow,
+   event, and attempt on `main`, with `status == completed`,
+   `conclusion == success`, and `headSha == DEPLOY_SHA`; and
 4. the non-prerelease release page is reachable without an access code and
    accurately labels the protected demo, SQLite runtime, PostgreSQL CI-only
    evidence, public fallback video, and explicit non-goals.

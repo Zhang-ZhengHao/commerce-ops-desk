@@ -228,6 +228,113 @@ describe('I03 exception operations workspace', () => {
     });
   });
 
+  it('orders one accountable timeline by time and case version', async () => {
+    const user = userEvent.setup();
+    const orderedTimelineDetail = {
+      ...caseDetail,
+      notes: [
+        {
+          ...caseDetail.notes[0],
+          created_at: '2026-10-07T16:05:00Z',
+        },
+      ],
+      audit_events: [
+        {
+          ...caseDetail.audit_events[0],
+          changes: { assignee_id: 'agent-membership', version: 2 },
+          created_at: '2026-10-07T16:00:00Z',
+        },
+        {
+          id: 'audit-note-1',
+          action: 'case.note_added',
+          object_type: 'exception_case',
+          object_id: caseDetail.id,
+          actor: {
+            membership_id: 'agent-membership',
+            display_name: 'Demo Agent',
+          },
+          changes: { note_id: 'note-1', version: 3 },
+          created_at: '2026-10-07T16:05:00Z',
+        },
+        {
+          id: 'audit-resolved-1',
+          action: 'case.resolved',
+          object_type: 'exception_case',
+          object_id: caseDetail.id,
+          actor: {
+            membership_id: 'agent-membership',
+            display_name: 'Demo Agent',
+          },
+          changes: { resolution_reason: 'payment_recovered', version: 4 },
+          created_at: '2026-10-07T16:05:00Z',
+        },
+      ],
+    };
+    installOperationsFetch((url) => {
+      if (url.pathname === '/api/cases/case-payment-1042') {
+        return jsonResponse(orderedTimelineDetail);
+      }
+      return undefined;
+    });
+
+    renderWorkspace(agentSession);
+    const queue = await screen.findByRole('region', { name: /exception queue/i });
+    await user.click(within(queue).getByRole('button', { name: /open demo-1042/i }));
+
+    const timeline = await screen.findByRole('region', { name: /accountable timeline/i });
+    const timelineItems = within(timeline).getAllByRole('listitem');
+    expect(timelineItems).toHaveLength(4);
+    expect(timelineItems.map((item) => item.textContent)).toEqual([
+      expect.stringContaining('Assigned by Demo Manager'),
+      expect.stringContaining('Fictional demo customer requested a retry'),
+      expect.stringContaining('Note added by Demo Agent'),
+      expect.stringContaining('Resolved by Demo Agent'),
+    ]);
+  });
+
+  it('orders equivalent timestamp encodings by case version', async () => {
+    const user = userEvent.setup();
+    const equivalentTimestampDetail = {
+      ...caseDetail,
+      notes: [],
+      audit_events: [
+        {
+          ...caseDetail.audit_events[0],
+          changes: { assignee_id: 'agent-membership', version: 3 },
+          created_at: '2026-10-07T16:05:00Z',
+        },
+        {
+          id: 'audit-resolved-1',
+          action: 'case.resolved',
+          object_type: 'exception_case',
+          object_id: caseDetail.id,
+          actor: {
+            membership_id: 'agent-membership',
+            display_name: 'Demo Agent',
+          },
+          changes: { resolution_reason: 'payment_recovered', version: 4 },
+          created_at: '2026-10-07T12:05:00-04:00',
+        },
+      ],
+    };
+    installOperationsFetch((url) => {
+      if (url.pathname === '/api/cases/case-payment-1042') {
+        return jsonResponse(equivalentTimestampDetail);
+      }
+      return undefined;
+    });
+
+    renderWorkspace(agentSession);
+    const queue = await screen.findByRole('region', { name: /exception queue/i });
+    await user.click(within(queue).getByRole('button', { name: /open demo-1042/i }));
+
+    const timeline = await screen.findByRole('region', { name: /accountable timeline/i });
+    expect(within(timeline).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      expect.stringContaining('Assigned by Demo Manager'),
+      expect.stringContaining('Resolved by Demo Agent'),
+    ]);
+  });
+
   it('lets a Manager assign a case with the current version and command protections', async () => {
     const user = userEvent.setup();
     let detailReads = 0;

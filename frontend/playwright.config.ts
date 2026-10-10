@@ -123,6 +123,7 @@ function hostedEnvironment(): Record<string, string> {
     ...inheritedEnvironment,
     COMMERCE_OPS_DATABASE_URL: `sqlite+pysqlite:///${databasePath}`,
     COMMERCE_OPS_DEMO_MODE: 'true',
+    COMMERCE_OPS_DEMO_SOURCE_HOURLY_LIMIT: '100',
     COMMERCE_OPS_ENVIRONMENT: 'test',
     COMMERCE_OPS_SESSION_SECRET: sessionSecretBytes.toString('base64url'),
     COMMERCE_OPS_SOURCE_SHA: evaluatorSourceSha,

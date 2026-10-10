@@ -9,8 +9,8 @@ A working full-stack operations desk for triaging ecommerce payment, refund, and
 All identities, orders, and outcomes are synthetic. The demo never connects to a store or performs a real payment, refund, or fulfillment action.
 
 The repository currently contains the `v0.2.1` evaluator candidate. This
-release-facing checkpoint does not publish a live evaluator URL or claim that
-the candidate has been deployed or released.
+checkpoint does not add or publish a live-demo CTA, and it does not claim that
+the evaluator is deployed, released, or approved for external access.
 
 ![CommerceOps Desk exception queue and case detail](docs/assets/exception-workflow.png)
 
@@ -59,9 +59,14 @@ For the internal-note field: `Use fictional text only. Do not enter personal, cu
 ### Evaluator boundary
 
 The `v0.2.1` candidate is designed for an access-controlled evaluator behind
-an enterprise gateway, not an unrestricted public sandbox. The gateway owns
-the access-code challenge; the application and repository do not collect,
-store, log, or publish that code. Access is shared separately with an invited
+an enterprise gateway, not an unrestricted public sandbox. The exact
+deployment hostname already exists in versioned engineering files and public
+Git history, so the presence or absence of a repository URL is not the release
+boundary. The actual publication gates are enterprise access-code distribution
+and promotion of the deployment as a live evaluator. The gateway owns the
+access-code challenge; CommerceOps has no access-code input, cookie, API, or
+repository setting. The enterprise access code must never be stored in or
+published through this repository. Access may be shared with an invited
 evaluator only after deployment acceptance and administrator confirmation.
 
 Live evaluator: single-node SQLite; PostgreSQL 17: CI-verified path only
