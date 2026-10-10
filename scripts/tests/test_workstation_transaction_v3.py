@@ -59,21 +59,28 @@ def make_route(
     *,
     marker: str,
     port: int,
+    profile: str | None = None,
 ) -> object:
     upstream = make_upstream(module, marker=marker, port=port)
-    assets_payload = {
-        "schema": 1,
-        "sha256": {path: marker * 64 for path in module.DEPLOYMENT_ASSET_PATHS},
-    }
-    revision = module._route_revision(
-        module.CADDY_PROFILE_HARDENED,
-        upstream,
-        assets_payload,
-    )
-    assets = MappingProxyType(module._validate_deployment_assets(assets_payload))
+    selected_profile = profile or module.CADDY_PROFILE_HARDENED
+    if selected_profile == module.CADDY_PROFILE_HARDENED:
+        assets_payload = {
+            "schema": 1,
+            "sha256": {path: marker * 64 for path in module.DEPLOYMENT_ASSET_PATHS},
+        }
+        revision = module._route_revision(
+            selected_profile,
+            upstream,
+            assets_payload,
+        )
+        assets = MappingProxyType(module._validate_deployment_assets(assets_payload))
+    else:
+        assert selected_profile == module.CADDY_PROFILE_LEGACY_V020
+        revision = None
+        assets = None
     return module.RouteState(
         fragment_sha256=hashlib.sha256(fragment.encode("utf-8")).hexdigest(),
-        profile=module.CADDY_PROFILE_HARDENED,
+        profile=selected_profile,
         route_revision=revision,
         upstream=upstream,
         deployment_assets=assets,
@@ -124,6 +131,11 @@ class TransactionV3Harness:
             self.old_fragment,
             marker="1",
             port=18_087,
+            profile=(
+                module.CADDY_PROFILE_HARDENED
+                if with_parent
+                else module.CADDY_PROFILE_LEGACY_V020
+            ),
         )
         self.installed_route = make_route(
             module,
@@ -161,6 +173,7 @@ class TransactionV3Harness:
         self.current_fragment = self.old_fragment
         self.active_head = self.parent
         self.events: list[str] = []
+        self.upstream_policies: list[tuple[str, str, bool]] = []
         self.fail_stage: str | None = None
         self.commit_outcome = "success"
 
@@ -262,7 +275,13 @@ class TransactionV3Harness:
         assert route is expected
         self._raise_at("smoke")
 
-    def assert_upstream(self, _runner: object, upstream: object) -> None:
+    def assert_upstream(
+        self,
+        _runner: object,
+        upstream: object,
+        *,
+        require_exclusive_network: bool,
+    ) -> None:
         stage = self._stage()
         target = "installed" if upstream == self.installed_route.upstream else "current"
         self.events.append(f"upstream:{target}:{stage}")
@@ -270,6 +289,10 @@ class TransactionV3Harness:
             self.installed_route if target == "installed" else self.current_route
         )
         assert upstream == expected_route.upstream
+        self.upstream_policies.append((target, stage, require_exclusive_network))
+        assert require_exclusive_network is (
+            expected_route.profile == self.module.CADDY_PROFILE_HARDENED
+        )
         if target == "installed" and stage == "new":
             self._raise_at("upstream")
 
@@ -467,6 +490,28 @@ def test_each_precommit_verification_failure_restores_the_route_and_keeps_the_he
     assert "commit" not in harness.events
 
 
+def test_bootstrap_failure_restores_legacy_with_route_aware_network_policies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    harness = TransactionV3Harness(module, tmp_path, with_parent=False)
+    harness.fail_stage = "upstream"
+    install_harness(module, harness, tmp_path, monkeypatch)
+
+    with pytest.raises(module.DeploymentError, match="upstream"):
+        invoke_install(module, harness)
+
+    assert harness.upstream_policies == [
+        ("installed", "old", True),
+        ("installed", "new", True),
+        ("current", "new", False),
+        ("current", "old", False),
+    ]
+    assert harness.current_fragment == harness.old_fragment
+    assert harness.active_head is None
+
+
 def test_unhealthy_rollback_target_is_refused_before_persist_or_site_install(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -504,7 +549,13 @@ def test_target_identity_is_verified_before_persist_or_site_install(
     harness = TransactionV3Harness(module, tmp_path, with_parent=True)
     install_harness(module, harness, tmp_path, monkeypatch)
 
-    def reject_changed_target(_runner: object, upstream: object) -> None:
+    def reject_changed_target(
+        _runner: object,
+        upstream: object,
+        *,
+        require_exclusive_network: bool,
+    ) -> None:
+        assert require_exclusive_network is True
         target = (
             "installed" if upstream == harness.installed_route.upstream else "current"
         )

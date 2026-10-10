@@ -592,6 +592,27 @@ the frozen live container/network/data/runtime fingerprint. A
 whitespace-equivalent fragment, an extra site, address, directive, different
 upstream, or different runtime identity is not a bootstrap input.
 
+A second read-only workstation attestation on 2026-10-10 reconstructed the
+complete live upstream identity and produced fingerprint
+`892810d70dc768db1db79f84276fd6df9b3e83085e34fe8089b604532db11e89`.
+The complete non-secret payload is versioned in
+`scripts/tests/test_workstation_upstream_verification.py`, where the production
+fingerprint function must reproduce that value. The older recorded fingerprint
+could not be reproduced from any versioned payload and is not accepted as an
+alternative.
+
+Host-port discovery means active ownership: it enumerates only running Docker
+containers with full IDs, then requires exactly one matching healthy container
+and revalidates its complete identity. Stopped evidence containers may retain a
+static `HostConfig.PortBindings` declaration, but they do not own a listener
+and are neither selected nor deleted. The frozen legacy container is a member
+of Docker's shared default `bridge`; legacy validation therefore requires exact
+agreement on that container's network ID, name, and endpoint ID while allowing
+unrelated bridge peers. Hardened routes still require their recorded private
+network to contain only the candidate container. Any drift in the selected
+legacy endpoint or any additional hardened-network endpoint remains a hard
+failure.
+
 Use the state path printed by `prepare`:
 
 ```bash

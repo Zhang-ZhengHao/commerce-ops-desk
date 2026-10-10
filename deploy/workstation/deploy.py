@@ -629,7 +629,7 @@ UPSTREAM_IDENTITY_SCHEMA = 1
 ACTIVE_STATE_SCHEMA = 1
 CADDY_TRANSACTION_SCHEMA = 3
 LEGACY_UPSTREAM_FINGERPRINT = (
-    "b443797953fc44f8acd0e8a353bec2853d4a100fdf113a48d2815754ce4c30ac"
+    "892810d70dc768db1db79f84276fd6df9b3e83085e34fe8089b604532db11e89"
 )
 REQUIRED_MASKED_PATHS = frozenset(
     {
@@ -2715,6 +2715,7 @@ def _upstream_identity_from_inspection(
     expected_container_id: str,
     expected_container_name: str,
     expected_host_port: int,
+    require_exclusive_network: bool = True,
 ) -> UpstreamIdentity:
     if (
         not isinstance(inspection, dict)
@@ -2822,13 +2823,16 @@ def _upstream_identity_from_inspection(
         if isinstance(network_containers, dict)
         else None
     )
+    if type(require_exclusive_network) is not bool:
+        raise DeploymentError("upstream network policy is invalid")
     if (
         not isinstance(network_containers, dict)
-        or set(network_containers) != {expected_container_id}
         or not isinstance(network_endpoint, dict)
         or network_endpoint.get("Name") != expected_container_name
         or network_endpoint.get("EndpointID") != endpoint_id
     ):
+        raise DeploymentError("upstream network endpoint identity is inconsistent")
+    if require_exclusive_network and set(network_containers) != {expected_container_id}:
         raise DeploymentError("upstream network endpoint identity is inconsistent")
 
     return _validate_upstream_identity_payload(
@@ -2855,6 +2859,8 @@ def _upstream_identity_from_inspection(
 def _assert_upstream_identity_current(
     runner: CommandRunner,
     expected: UpstreamIdentity,
+    *,
+    require_exclusive_network: bool = True,
 ) -> None:
     validated_expected = _validate_upstream_identity_payload(
         _upstream_identity_payload(expected)
@@ -2875,6 +2881,7 @@ def _assert_upstream_identity_current(
         expected_container_id=validated_expected.container_id,
         expected_container_name=validated_expected.container_name,
         expected_host_port=validated_expected.host_port,
+        require_exclusive_network=require_exclusive_network,
     )
     if current != validated_expected:
         raise DeploymentError("upstream identity changed after route verification")
@@ -2883,6 +2890,8 @@ def _assert_upstream_identity_current(
 def _assert_upstream_ready(
     runner: CommandRunner,
     expected: UpstreamIdentity,
+    *,
+    require_exclusive_network: bool = True,
 ) -> None:
     """Require a healthy, identity-bound target before exposing its route."""
 
@@ -2894,19 +2903,42 @@ def _assert_upstream_ready(
         validated_expected.container_name,
         timeout=15.0,
     )
-    _assert_upstream_identity_current(runner, validated_expected)
+    _assert_upstream_identity_current(
+        runner,
+        validated_expected,
+        require_exclusive_network=require_exclusive_network,
+    )
+
+
+def _assert_route_upstream_ready(
+    runner: CommandRunner,
+    route: RouteState,
+) -> None:
+    if route.profile == CADDY_PROFILE_HARDENED:
+        require_exclusive_network = True
+    elif route.profile == CADDY_PROFILE_LEGACY_V020:
+        require_exclusive_network = False
+    else:
+        raise DeploymentError("Caddy route profile has no upstream network policy")
+    _assert_upstream_ready(
+        runner,
+        route.upstream,
+        require_exclusive_network=require_exclusive_network,
+    )
 
 
 def _upstream_identity_for_host_port(
     runner: CommandRunner,
     host_port: int,
+    *,
+    require_exclusive_network: bool = True,
 ) -> UpstreamIdentity:
     validated_port = validate_candidate_port(str(host_port))
     expected_binding = {
         "8000/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(validated_port)}]
     }
     identifiers = runner.run(
-        [DOCKER_BINARY, "container", "ls", "--all", "--quiet", "--no-trunc"]
+        [DOCKER_BINARY, "container", "ls", "--quiet", "--no-trunc"]
     ).stdout.split()
     matches: list[UpstreamIdentity] = []
     for identifier in identifiers:
@@ -2942,6 +2974,7 @@ def _upstream_identity_for_host_port(
                 expected_container_id=identifier,
                 expected_container_name=raw_name[1:],
                 expected_host_port=validated_port,
+                require_exclusive_network=require_exclusive_network,
             )
         )
     if len(matches) != 1:
@@ -6706,7 +6739,11 @@ def _load_exact_legacy_bootstrap_route(
     ):
         raise DeploymentError("legacy Caddy fragment bootstrap identity is invalid")
     _assert_active_caddy_route(runner, fragment)
-    upstream = _upstream_identity_for_host_port(runner, LEGACY_CADDY_PORT)
+    upstream = _upstream_identity_for_host_port(
+        runner,
+        LEGACY_CADDY_PORT,
+        require_exclusive_network=False,
+    )
     if _upstream_identity_fingerprint(upstream) != LEGACY_UPSTREAM_FINGERPRINT:
         raise DeploymentError(
             "legacy upstream does not match the frozen bootstrap identity"
@@ -6719,7 +6756,7 @@ def _load_exact_legacy_bootstrap_route(
         deployment_assets=None,
     )
     _smoke_caddy(route)
-    _assert_upstream_ready(runner, upstream)
+    _assert_route_upstream_ready(runner, route)
     return route
 
 
@@ -6779,7 +6816,7 @@ def _install_caddy_fragment(
         or original_fragment.route_revision != current_route.route_revision
     ):
         raise DeploymentError("current Caddy fragment is not bound to its route state")
-    _assert_upstream_ready(runner, installed_route.upstream)
+    _assert_route_upstream_ready(runner, installed_route)
     _safe_fragment_name(label)
     transaction = _persist_caddy_transaction(
         runner,
@@ -6812,7 +6849,7 @@ def _install_caddy_fragment(
         _reload_caddy(runner)
         _assert_active_caddy_route(runner, fragment)
         _smoke_caddy(installed_route)
-        _assert_upstream_ready(runner, installed_route.upstream)
+        _assert_route_upstream_ready(runner, installed_route)
         commit_attempted = True
         _commit_active_caddy_state(
             runner,
@@ -6889,7 +6926,7 @@ def _install_caddy_fragment(
             # This reread catches already-stale state. The advisory lock is not
             # an atomic CAS against a privileged writer that ignores the lock.
             try:
-                _assert_upstream_ready(runner, current_route.upstream)
+                _assert_route_upstream_ready(runner, current_route)
                 _atomic_install_site(
                     runner,
                     original,
@@ -6900,7 +6937,7 @@ def _install_caddy_fragment(
                 _reload_caddy(runner)
                 _assert_active_caddy_route(runner, original)
                 _smoke_caddy(current_route)
-                _assert_upstream_ready(runner, current_route.upstream)
+                _assert_route_upstream_ready(runner, current_route)
             except Exception as restoration_error:
                 raise DeploymentError(
                     "Caddy switch failed and automatic restoration also failed; "
@@ -6948,7 +6985,7 @@ def _verify_loaded_caddy_route(
     _reload_caddy(runner)
     _assert_active_caddy_route(runner, fragment)
     _smoke_caddy(route)
-    _assert_upstream_ready(runner, route.upstream)
+    _assert_route_upstream_ready(runner, route)
 
 
 def _reverify_caddy_route(
@@ -6957,7 +6994,7 @@ def _reverify_caddy_route(
     route: RouteState,
 ) -> None:
     validated_route = _validate_caddy_route_fragment(runner, fragment, route)
-    _assert_upstream_ready(runner, validated_route.upstream)
+    _assert_route_upstream_ready(runner, validated_route)
     _verify_loaded_caddy_route(runner, fragment, route)
 
 
@@ -6984,7 +7021,7 @@ def _restore_reconcile_backup(
         backup_fragment,
         transaction.backup,
     )
-    _assert_upstream_ready(runner, validated_backup.upstream)
+    _assert_route_upstream_ready(runner, validated_backup)
     _atomic_install_site(
         runner,
         backup_fragment,
