@@ -35,10 +35,18 @@ test.describe('I01 hosted foundation', () => {
         name: 'Boundaries of this synthetic demo',
       }),
     ).toBeVisible();
+    const guide = page.getByRole('complementary', {
+      name: 'Five-step evaluator guide',
+    });
+    await expect(guide).toBeVisible();
+    await expect(guide.getByRole('listitem')).toHaveCount(5);
+    await expect(guide.getByText('Create an event')).toBeVisible();
+    await expect(guide.getByText('Verify the trail')).toBeVisible();
     await expect(
-      page.getByRole('heading', { level: 2, name: 'Operational workflow' }),
+      page.getByText(
+        'Use fictional text only. Do not enter personal, customer, credential, or confidential data.',
+      ),
     ).toBeVisible();
-    await expect(page.getByText(/available in the temporary I03 workspace/i)).toBeVisible();
     await expect(page.getByText('Synthetic data only')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Enter as Manager' })).toBeEnabled();
     await expect(page.getByRole('button', { name: 'Enter as Agent' })).toBeEnabled();

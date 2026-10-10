@@ -4,6 +4,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from './App';
 
+const fictionalTextRule =
+  'Use fictional text only. Do not enter personal, customer, credential, or confidential data.';
+
 const managerSession = {
   workspace: {
     id: '891a8728-df4b-4f54-b7f8-4afea330835c',
@@ -187,11 +190,24 @@ describe('CommerceOps Desk demo identity', () => {
     ).toBeVisible();
     expect(screen.queryByText(/safe public demo/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/compiled offline only/i)).not.toBeInTheDocument();
+    const evaluatorGuide = screen.getByRole('complementary', {
+      name: /five-step evaluator guide/i,
+    });
+    expect(within(evaluatorGuide).getAllByRole('listitem')).toHaveLength(5);
+    for (const title of [
+      'Create an event',
+      'Test the boundary',
+      'Assign the case',
+      'Work as Agent',
+      'Verify the trail',
+    ]) {
+      expect(within(evaluatorGuide).getByText(title)).toBeVisible();
+    }
+    expect(screen.getByText(fictionalTextRule)).toBeVisible();
     expect(
-      screen.getByRole('heading', { name: /operational workflow/i }),
-    ).toBeVisible();
-    expect(screen.getByText(/available in the temporary i03 workspace/i)).toBeVisible();
-    expect(screen.getByText('Synthetic exception queue')).toBeVisible();
+      screen.queryByRole('heading', { name: /operational workflow/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText('Synthetic exception queue')).not.toBeInTheDocument();
     expect(screen.queryByText(/signed commerce event/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/not implemented in i02/i)).not.toBeInTheDocument();
     expect(

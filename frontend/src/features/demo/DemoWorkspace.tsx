@@ -22,6 +22,7 @@ import {
   CaseSourceBadge,
 } from '../cases/CaseProvenance';
 import { SyntheticProviderPanel } from '../webhooks/SyntheticProviderPanel';
+import { EvaluatorGuide, FICTIONAL_TEXT_RULE } from './EvaluatorGuide';
 
 export type RoleOperation =
   | { kind: 'idle' }
@@ -404,6 +405,8 @@ export function DemoWorkspace({
         <span className="role-badge">{roleName(currentRole)} access</span>
       </div>
 
+      <EvaluatorGuide variant="compact" />
+
       {operations.kind === 'loading' && (
         <div className="operations-loading" role="status">
           <span className="loading-mark" aria-hidden="true" />
@@ -704,8 +707,15 @@ export function DemoWorkspace({
                       }}
                     >
                       <label htmlFor="case-note">Internal note</label>
+                      <p
+                        id="case-note-fictional-rule"
+                        className="fictional-data-rule fictional-data-rule-note"
+                      >
+                        {FICTIONAL_TEXT_RULE}
+                      </p>
                       <textarea
                         id="case-note"
+                        aria-describedby="case-note-fictional-rule"
                         value={noteBody}
                         rows={3}
                         maxLength={1000}

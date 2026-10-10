@@ -64,7 +64,7 @@ const detail = {
   notes: [
     {
       id: 'note-1',
-      body: 'Customer asked us to retry the card after 17:00 UTC.',
+      body: 'Fictional demo customer requested a retry after 17:00 UTC.',
       author: { membership_id: 'agent-membership', display_name: 'Demo Agent' },
       created_at: '2026-10-07T16:05:00Z',
     },

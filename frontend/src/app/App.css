@@ -251,9 +251,25 @@ h3 {
   text-underline-offset: 0.2em;
 }
 
-.workflow-card {
+.fictional-data-rule {
+  max-width: 42rem;
+  margin: var(--space-3) 0 0;
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--color-status);
+  color: var(--color-muted);
+  font-size: var(--font-size-xs);
+  line-height: 1.55;
+}
+
+.fictional-data-rule-note {
+  max-width: none;
+  margin: 0;
+}
+
+.evaluator-guide {
   position: relative;
   overflow: hidden;
+  min-width: 0;
   padding: var(--space-6);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
@@ -261,7 +277,7 @@ h3 {
   box-shadow: var(--shadow-md);
 }
 
-.workflow-card::before {
+.evaluator-guide::before {
   position: absolute;
   top: 0;
   left: 0;
@@ -271,12 +287,28 @@ h3 {
   content: '';
 }
 
-.workflow-card-header {
+.evaluator-guide-compact {
+  padding: var(--space-5);
+  background: var(--color-surface-muted);
+  box-shadow: var(--shadow-sm);
+}
+
+.evaluator-guide-header {
   display: grid;
   gap: var(--space-2);
 }
 
-.workflow-card-header p,
+.evaluator-guide-label {
+  margin: 0;
+  color: var(--color-status);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.evaluator-guide-intro,
 .section-heading p {
   max-width: 34rem;
   margin: 0;
@@ -285,7 +317,7 @@ h3 {
   line-height: 1.55;
 }
 
-.workflow-list,
+.evaluator-guide-list,
 .boundary-list,
 .protection-list {
   margin: 0;
@@ -293,22 +325,22 @@ h3 {
   list-style: none;
 }
 
-.workflow-list {
+.evaluator-guide-list {
   margin-top: var(--space-6);
 }
 
-.workflow-step {
+.evaluator-guide-step {
   display: grid;
   grid-template-columns: 2.25rem minmax(0, 1fr);
   gap: var(--space-4);
   padding-block: var(--space-4);
 }
 
-.workflow-step + .workflow-step {
+.evaluator-guide-step + .evaluator-guide-step {
   border-top: 1px solid var(--color-border);
 }
 
-.step-index {
+.evaluator-step-index {
   color: var(--color-status);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
@@ -316,19 +348,22 @@ h3 {
   letter-spacing: 0.05em;
 }
 
-.step-copy {
+.evaluator-step-copy {
   display: grid;
   gap: var(--space-1);
+  min-width: 0;
 }
 
-.step-copy strong {
+.evaluator-step-copy strong {
   color: var(--color-foreground);
   font-size: var(--font-size-base);
 }
 
-.step-copy span {
+.evaluator-step-copy span {
   color: var(--color-muted);
   font-size: var(--font-size-sm);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .boundaries {
@@ -1153,7 +1188,7 @@ textarea:disabled {
     justify-content: end;
   }
 
-  .workflow-card {
+  .evaluator-guide-entry {
     padding: var(--space-8);
   }
 
@@ -1203,21 +1238,21 @@ textarea:disabled {
     max-width: 62rem;
   }
 
-  .workflow-list {
+  .evaluator-guide-list {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 
-  .workflow-step {
+  .evaluator-guide-step {
     grid-template-columns: 2rem minmax(0, 1fr);
-    padding-inline: var(--space-5);
+    padding-inline: var(--space-4);
   }
 
-  .workflow-step:first-child {
+  .evaluator-guide-step:first-child {
     padding-left: 0;
   }
 
-  .workflow-step + .workflow-step {
+  .evaluator-guide-step + .evaluator-guide-step {
     border-top: 0;
     border-left: 1px solid var(--color-border);
   }
@@ -1311,13 +1346,13 @@ textarea:disabled {
 
 @media (forced-colors: active) {
   .environment-dot,
-  .workflow-card::before,
+  .evaluator-guide::before,
   .protection-list li::before {
     forced-color-adjust: none;
   }
 
   .button,
-  .workflow-card,
+  .evaluator-guide,
   .boundary-list,
   .identity-card,
   .role-card,
