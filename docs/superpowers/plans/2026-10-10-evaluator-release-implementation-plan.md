@@ -250,10 +250,13 @@ Implementation files:
 RED command:
 
 ```bash
-npm --prefix frontend exec -- vitest run \
-  src/features/demo/EvaluatorGuide.test.tsx \
-  src/features/demo/DemoWorkspace.i03.test.tsx \
-  src/app/App.test.tsx
+(
+  cd frontend
+  npm exec -- vitest run \
+    src/features/demo/EvaluatorGuide.test.tsx \
+    src/features/demo/DemoWorkspace.i03.test.tsx \
+    src/app/App.test.tsx
+)
 ```
 
 Implementation:
@@ -305,9 +308,12 @@ Implementation files:
 RED command:
 
 ```bash
-npm --prefix frontend exec -- vitest run \
-  src/api/build.test.ts \
-  src/app/App.test.tsx
+(
+  cd frontend
+  npm exec -- vitest run \
+    src/api/build.test.ts \
+    src/app/App.test.tsx
+)
 ```
 
 Implementation must route fetch mocks by pathname because build metadata and
@@ -360,15 +366,21 @@ Implementation/configuration files:
 Targeted GREEN commands:
 
 ```bash
-COMMERCE_OPS_VENV_DIR="$PWD/.venv" npm --prefix frontend exec -- \
-  playwright test e2e/foundation.spec.ts e2e/i03-workspace.spec.ts \
-  e2e/i03-workflow.spec.ts --project=desktop-chromium --workers=1
+(
+  cd frontend
+  COMMERCE_OPS_VENV_DIR="$PWD/../.venv" npm exec -- \
+    playwright test e2e/foundation.spec.ts e2e/i03-workspace.spec.ts \
+    e2e/i03-workflow.spec.ts --project=desktop-chromium --workers=1
+)
 ```
 
 ```bash
-COMMERCE_OPS_VENV_DIR="$PWD/.venv" npm --prefix frontend exec -- \
-  playwright test e2e/foundation.spec.ts e2e/i03-workspace.spec.ts \
-  e2e/i03-workflow.spec.ts --project=mobile-chromium --workers=1
+(
+  cd frontend
+  COMMERCE_OPS_VENV_DIR="$PWD/../.venv" npm exec -- \
+    playwright test e2e/foundation.spec.ts e2e/i03-workspace.spec.ts \
+    e2e/i03-workflow.spec.ts --project=mobile-chromium --workers=1
+)
 ```
 
 ## 9. P6 — release-facing repository evidence
