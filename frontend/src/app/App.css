@@ -419,12 +419,36 @@ h3 {
 
 .footer-copy {
   display: grid;
+  min-width: 0;
   gap: var(--space-1);
 }
 
 .site-footer .footer-label {
   color: var(--color-foreground);
   font-weight: 700;
+}
+
+.site-footer .build-identity {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  margin-top: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.build-version {
+  color: var(--color-foreground);
+  font-weight: 700;
+}
+
+.build-source-link {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-all;
 }
 
 .footer-links {

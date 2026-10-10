@@ -6,6 +6,12 @@ import { App } from './App';
 
 const fictionalTextRule =
   'Use fictional text only. Do not enter personal, customer, credential, or confidential data.';
+const validSourceSha = '0123456789abcdef0123456789abcdef01234567';
+const localBuildIdentity = {
+  service: 'commerce-ops-desk',
+  version: '0.2.1',
+  source_sha: null,
+} as const;
 
 const managerSession = {
   workspace: {
@@ -99,10 +105,19 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function installFetch(...responses: Array<Response | Error | Promise<Response>>) {
+type FetchResult = Response | Error | Promise<Response>;
+
+function installFetchWithBuild(
+  buildResult: FetchResult,
+  ...responses: FetchResult[]
+) {
   let responseIndex = 0;
   const fetchMock = vi.fn<typeof fetch>(async (input) => {
     const path = new URL(String(input), window.location.origin).pathname;
+    if (path === '/api/build') {
+      if (buildResult instanceof Error) throw buildResult;
+      return buildResult;
+    }
     if (path === '/api/dashboard') {
       return jsonResponse({
         generated_at: '2026-10-07T16:00:00Z',
@@ -122,6 +137,10 @@ function installFetch(...responses: Array<Response | Error | Promise<Response>>)
   });
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
+}
+
+function installFetch(...responses: FetchResult[]) {
+  return installFetchWithBuild(jsonResponse(localBuildIdentity), ...responses);
 }
 
 function deferred<T>() {
@@ -166,6 +185,89 @@ describe('CommerceOps Desk demo identity', () => {
       'href',
       'https://github.com/Zhang-ZhengHao/commerce-ops-desk/blob/main/docs/design-summary.md',
     );
+    expect(
+      within(footer).getByRole('link', { name: /public walkthrough.*v0\.2\.0/i }),
+    ).toHaveAttribute(
+      'href',
+      'https://github.com/Zhang-ZhengHao/commerce-ops-desk/releases/tag/v0.2.0',
+    );
+  });
+
+  it('renders the server version and full source SHA as a fixed commit link', async () => {
+    const sessionResponse = deferred<Response>();
+    const fetchMock = installFetchWithBuild(
+      jsonResponse({
+        service: 'commerce-ops-desk',
+        version: '0.2.1',
+        source_sha: validSourceSha,
+      }),
+      sessionResponse.promise,
+    );
+
+    render(<App />);
+
+    const footer = screen.getByRole('contentinfo');
+    expect(await within(footer).findByText('v0.2.1')).toBeVisible();
+    expect(within(footer).getByRole('link', { name: validSourceSha })).toHaveAttribute(
+      'href',
+      `https://github.com/Zhang-ZhengHao/commerce-ops-desk/commit/${validSourceSha}`,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent(/checking for an active demo/i);
+    const [input, request] = callsTo(fetchMock, '/api/build')[0];
+    expect(input).toBe('/api/build');
+    expect(request).toEqual({
+      cache: 'no-store',
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+      method: 'GET',
+    });
+
+    sessionResponse.resolve(jsonResponse({ detail: 'Not authenticated' }, 401));
+    expect(await screen.findByRole('button', { name: /enter as manager/i })).toBeEnabled();
+  });
+
+  it('labels a source run without a revision as an unverified local build', async () => {
+    installFetch(jsonResponse({ detail: 'Not authenticated' }, 401));
+
+    render(<App />);
+    await screen.findByRole('button', { name: /enter as manager/i });
+
+    const footer = screen.getByRole('contentinfo');
+    expect(within(footer).getByText('v0.2.1')).toBeVisible();
+    expect(within(footer).getByText('Unverified local build')).toBeVisible();
+    expect(within(footer).queryByRole('link', { name: validSourceSha })).not.toBeInTheDocument();
+  });
+
+  it('keeps entry usable while build identity is unavailable', async () => {
+    const fetchMock = installFetchWithBuild(
+      new Error('attacker-controlled upstream text'),
+      jsonResponse({ detail: 'Not authenticated' }, 401),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole('button', { name: /enter as manager/i })).toBeEnabled();
+    const footer = screen.getByRole('contentinfo');
+    expect(await within(footer).findByText('Build identity unavailable')).toBeVisible();
+    expect(footer).not.toHaveTextContent(/attacker-controlled upstream text/i);
+    expect(callsTo(fetchMock, '/api/build')).toHaveLength(1);
+  });
+
+  it('does not delay session entry while build identity is still loading', async () => {
+    const buildResponse = deferred<Response>();
+    installFetchWithBuild(
+      buildResponse.promise,
+      jsonResponse({ detail: 'Not authenticated' }, 401),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole('button', { name: /enter as manager/i })).toBeEnabled();
+    const footer = screen.getByRole('contentinfo');
+    expect(within(footer).getByText('Loading build identity…')).toBeVisible();
+
+    buildResponse.resolve(jsonResponse(localBuildIdentity));
+    expect(await within(footer).findByText('Unverified local build')).toBeVisible();
   });
 
   it('checks for a session before offering enabled Manager and Agent entry actions', async () => {

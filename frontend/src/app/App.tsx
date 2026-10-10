@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import {
+  getBuildIdentity,
+  PUBLIC_REPOSITORY_URL,
+  type BuildIdentity,
+} from '../api/build';
+import {
   createCommandKey,
   createDemoWorkspace,
   resetDemoWorkspace,
@@ -34,11 +39,46 @@ interface PendingResetRecovery {
   message: string;
 }
 
+type BuildState =
+  | { kind: 'loading' }
+  | { kind: 'ready'; identity: BuildIdentity }
+  | { kind: 'unavailable' };
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Please try again.';
 }
 
+function BuildIdentityStatus({ state }: { state: BuildState }) {
+  if (state.kind === 'loading') {
+    return <p className="build-identity" aria-live="polite">Loading build identity…</p>;
+  }
+  if (state.kind === 'unavailable') {
+    return <p className="build-identity" aria-live="polite">Build identity unavailable</p>;
+  }
+
+  const { identity } = state;
+  return (
+    <p className="build-identity" aria-live="polite">
+      <span className="build-version">v{identity.version}</span>
+      <span className="build-divider" aria-hidden="true">·</span>
+      {identity.source_sha === null ? (
+        <span>Unverified local build</span>
+      ) : (
+        <a
+          className="build-source-link"
+          href={`${PUBLIC_REPOSITORY_URL}/commit/${identity.source_sha}`}
+          target="_blank"
+          rel="noreferrer"
+        >
+          {identity.source_sha}
+        </a>
+      )}
+    </p>
+  );
+}
+
 export function App() {
+  const [buildState, setBuildState] = useState<BuildState>({ kind: 'loading' });
   const [entryState, setEntryState] = useState<EntryState>({ kind: 'checking' });
   const [session, setSession] = useState<DemoSession | null>(null);
   const [pendingCreate, setPendingCreate] = useState<PendingCommand | null>(null);
@@ -62,6 +102,21 @@ export function App() {
   useEffect(() => {
     void recoverSession();
   }, [recoverSession]);
+
+  useEffect(() => {
+    let active = true;
+    void getBuildIdentity().then(
+      (identity) => {
+        if (active) setBuildState({ kind: 'ready', identity });
+      },
+      () => {
+        if (active) setBuildState({ kind: 'unavailable' });
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const runCreate = useCallback(async (command: PendingCommand) => {
     setPendingCreate(command);
@@ -287,21 +342,29 @@ export function App() {
             All data and outcomes are fictional. This demo does not connect to a live
             merchant system.
           </p>
+          <BuildIdentityStatus state={buildState} />
         </div>
         <nav className="footer-links" aria-label="Project evidence">
           <a
-            href="https://github.com/Zhang-ZhengHao/commerce-ops-desk"
+            href={PUBLIC_REPOSITORY_URL}
             target="_blank"
             rel="noreferrer"
           >
             Source code
           </a>
           <a
-            href="https://github.com/Zhang-ZhengHao/commerce-ops-desk/blob/main/docs/design-summary.md"
+            href={`${PUBLIC_REPOSITORY_URL}/blob/main/docs/design-summary.md`}
             target="_blank"
             rel="noreferrer"
           >
             Engineering case study
+          </a>
+          <a
+            href={`${PUBLIC_REPOSITORY_URL}/releases/tag/v0.2.0`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            Public walkthrough · v0.2.0
           </a>
         </nav>
       </footer>
