@@ -66,6 +66,13 @@ DEPLOYMENT_ASSET_PATHS = frozenset(
         "deploy/workstation/commerce-ops-desk.v0.2.0.Caddyfile.template",
     }
 )
+ARCHIVE_ATTRIBUTE_PATHS = frozenset(
+    {
+        ".gitattributes",
+        "deploy/.gitattributes",
+        "deploy/workstation/.gitattributes",
+    }
+)
 SOURCE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
@@ -1016,6 +1023,17 @@ def _parse_fixed_blob_tree(raw: bytes, expected_path: str) -> TreeEntry:
     )
 
 
+def _parse_optional_fixed_blob_tree(
+    raw: bytes,
+    expected_path: str,
+) -> TreeEntry | None:
+    """Parse an optional exact blob whose absence is represented by no output."""
+
+    if raw == b"":
+        return None
+    return _parse_fixed_blob_tree(raw, expected_path)
+
+
 def _extract_validated_git_archive(raw: bytes, destination: Path) -> None:
     """Extract a previously validated regular-file/directory Git archive."""
 
@@ -1161,8 +1179,37 @@ def _export_revision_evidence_from_commit(
             raise ProvenanceError("Git tree output is invalid")
         all_entries[asset_path] = asset_entry
 
+    blob_identity_entries = dict(all_entries)
+    for attributes_path in sorted(
+        ARCHIVE_ATTRIBUTE_PATHS,
+        key=lambda value: value.encode(),
+    ):
+        attributes_raw = _run_git_bytes(
+            (
+                git_dir,
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                source_sha,
+                "--",
+                attributes_path,
+            ),
+            cwd=workspace,
+            environment=environment,
+            maximum_stdout_bytes=MAX_GIT_PATH_BYTES,
+        )
+        attributes_entry = _parse_optional_fixed_blob_tree(
+            attributes_raw,
+            attributes_path,
+        )
+        if attributes_entry is None:
+            continue
+        if attributes_path in blob_identity_entries:
+            raise ProvenanceError("Git tree output is invalid")
+        blob_identity_entries[attributes_path] = attributes_entry
+
     blobs = _collect_blob_bytes(
-        MappingProxyType(all_entries),
+        MappingProxyType(blob_identity_entries),
         git_dir=git_dir,
         workspace=workspace,
         environment=environment,
@@ -1184,7 +1231,13 @@ def _export_revision_evidence_from_commit(
         archive_raw,
         source_sha=source_sha,
         tree_entries=MappingProxyType(all_entries),
-        blob_bytes=MappingProxyType(blobs),
+        blob_bytes=MappingProxyType(
+            {
+                path: blobs[path]
+                for path, entry in all_entries.items()
+                if entry.object_type == "blob"
+            }
+        ),
     )
     runtime_inventory = _build_runtime_inventory(files)
     dockerfile = files.get("Dockerfile")

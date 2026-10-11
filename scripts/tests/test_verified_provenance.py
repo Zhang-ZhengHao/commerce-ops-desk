@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zlib
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -1563,7 +1564,7 @@ def test_export_revision_evidence_uses_only_the_approved_git_object(
         repository,
         "config",
         "user.email",
-        "provenance-test@users.noreply.github.com",
+        TEST_NOREPLY_EMAIL,
     )
     source_sha = (
         run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
@@ -1785,6 +1786,82 @@ def test_export_revision_evidence_verifies_deployment_asset_blob_identity(
         return real_run_git(arguments, **kwargs)
 
     monkeypatch.setattr(module, "_run_git_bytes", return_corrupt_asset_blob)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            module.export_revision_evidence(
+                checkout,
+                source_sha,
+                approved_ref,
+                workspace=workspace,
+            )
+
+    assert list(workspace.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("attributes_path", "attribute_rule"),
+    (
+        (
+            ".gitattributes",
+            "deploy/workstation/compose.yaml export-subst\n",
+        ),
+        (
+            "deploy/.gitattributes",
+            "workstation/compose.yaml export-subst\n",
+        ),
+        (
+            "deploy/workstation/.gitattributes",
+            "compose.yaml export-subst\n",
+        ),
+    ),
+)
+def test_export_revision_evidence_verifies_archive_attribute_blob_identity(
+    tmp_path: Path,
+    attributes_path: str,
+    attribute_rule: str,
+) -> None:
+    module = load_provenance_module()
+    repository, _source_sha, approved_ref = create_provenance_git_repository(tmp_path)
+    asset_path = "deploy/workstation/compose.yaml"
+    (repository / asset_path).write_text(
+        "services: {}\n# $Format:%H$\n",
+        encoding="utf-8",
+    )
+    attributes = repository / attributes_path
+    attributes.parent.mkdir(parents=True, exist_ok=True)
+    attributes.write_text("# benign attributes\n", encoding="utf-8")
+    run_test_git(repository, "add", attributes_path, asset_path)
+    run_test_git(repository, "commit", "--message", "benign archive attributes")
+    source_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    run_test_git(repository, "update-ref", approved_ref, source_sha)
+    attributes_object_id = (
+        run_test_git(repository, "rev-parse", f"{source_sha}:{attributes_path}")
+        .decode("ascii")
+        .removesuffix("\n")
+    )
+    injected_attributes = attribute_rule.encode("utf-8")
+    injected_object = (
+        f"blob {len(injected_attributes)}\0".encode("ascii") + injected_attributes
+    )
+    assert (
+        hashlib.sha1(injected_object, usedforsecurity=False).hexdigest()
+        != attributes_object_id
+    )
+    loose_object = (
+        repository
+        / ".git"
+        / "objects"
+        / attributes_object_id[:2]
+        / attributes_object_id[2:]
+    )
+    loose_object.chmod(0o600)
+    loose_object.write_bytes(zlib.compress(injected_object))
+    loose_object.chmod(0o400)
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
 
     with module.open_canonical_checkout_root(repository.resolve()) as checkout:
         with pytest.raises(module.ProvenanceError):
