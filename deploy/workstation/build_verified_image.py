@@ -8,7 +8,6 @@ remote supply-chain attestation.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
@@ -17,7 +16,6 @@ import secrets
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -34,12 +32,6 @@ DOCKER_BINARY = "/usr/bin/docker"
 SAFE_SYSTEM_PATH = "/usr/bin:/bin"
 BUILD_MANIFEST_SCHEMA = 2
 DEPLOYMENT_ASSET_SCHEMA = 1
-DEPLOYMENT_ASSET_PATHS = (
-    "deploy/workstation/compose.yaml",
-    "deploy/workstation/commerce-ops-desk.Caddyfile.template",
-    "deploy/workstation/commerce-ops-desk.v0.2.0.Caddyfile.template",
-)
-GIT_COMMAND = ("git", "--no-replace-objects")
 
 
 def _load_verified_provenance_module() -> ModuleType:
@@ -238,32 +230,6 @@ class CommandRunner:
         if result.returncode != 0:
             raise BuildError(failure_message)
 
-    def write_stdout(
-        self,
-        arguments: Sequence[str],
-        *,
-        cwd: Path,
-        destination: Path,
-        failure_message: str,
-        environment: Mapping[str, str] | None = None,
-        timeout: float = COMMAND_TIMEOUT_SECONDS,
-    ) -> None:
-        try:
-            with destination.open("xb") as output:
-                result = subprocess.run(
-                    list(arguments),
-                    cwd=cwd,
-                    env=None if environment is None else dict(environment),
-                    stdout=output,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=timeout,
-                )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise BuildError(failure_message) from error
-        if result.returncode != 0:
-            raise BuildError(failure_message)
-
 
 def validate_source_sha(value: str) -> str:
     if SOURCE_SHA_PATTERN.fullmatch(value) is None:
@@ -279,34 +245,6 @@ def validate_approved_remote_ref(value: str) -> str:
     return value
 
 
-def _isolated_git_environment() -> dict[str, str]:
-    environment = os.environ.copy()
-    for name in tuple(environment):
-        if name.startswith("GIT_"):
-            environment.pop(name, None)
-    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
-    return environment
-
-
-def _isolated_archive_environment(temporary_directory: Path) -> dict[str, str]:
-    home = temporary_directory / "git-home"
-    xdg_config = temporary_directory / "git-xdg-config"
-    home.mkdir(mode=0o700)
-    xdg_config.mkdir(mode=0o700)
-    environment = _isolated_git_environment()
-    environment.update(
-        {
-            "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_SYSTEM": os.devnull,
-            "HOME": str(home),
-            "XDG_CONFIG_HOME": str(xdg_config),
-        }
-    )
-    return environment
-
-
 def _validated_repository(path: Path) -> Path:
     try:
         repository = path.resolve(strict=True)
@@ -315,164 +253,6 @@ def _validated_repository(path: Path) -> Path:
     if not repository.is_dir():
         raise BuildError("repository must be a directory")
     return repository
-
-
-def _assert_repository_toplevel(
-    runner: CommandRunner,
-    repository: Path,
-) -> None:
-    raw_toplevel = runner.query(
-        [*GIT_COMMAND, "rev-parse", "--show-toplevel"],
-        cwd=repository,
-        environment=_isolated_git_environment(),
-        failure_message="repository is not a Git worktree",
-    )
-    try:
-        toplevel = Path(raw_toplevel).resolve(strict=True)
-    except (FileNotFoundError, OSError):
-        raise BuildError("Git repository top level is unavailable") from None
-    if toplevel != repository:
-        raise BuildError("repository must be the exact Git repository top level")
-
-
-def assert_approved_commit(
-    runner: CommandRunner,
-    *,
-    repository: Path,
-    source_sha: str,
-    approved_remote_ref: str,
-) -> None:
-    git_environment = _isolated_git_environment()
-    runner.query(
-        [*GIT_COMMAND, "check-ref-format", approved_remote_ref],
-        cwd=repository,
-        failure_message="approved remote ref is not a valid Git ref",
-        environment=git_environment,
-    )
-    object_type = runner.query(
-        [*GIT_COMMAND, "cat-file", "-t", source_sha],
-        cwd=repository,
-        failure_message="SOURCE_SHA is not an available Git object",
-        environment=git_environment,
-    )
-    if object_type != "commit":
-        raise BuildError("SOURCE_SHA must name a commit object directly")
-    approved_sha = runner.query(
-        [*GIT_COMMAND, "show-ref", "--verify", "--hash", approved_remote_ref],
-        cwd=repository,
-        failure_message="approved remote ref is unavailable",
-        environment=git_environment,
-    )
-    if approved_sha != source_sha:
-        raise BuildError("SOURCE_SHA does not match the approved remote ref")
-
-
-def _export_context(
-    runner: CommandRunner,
-    *,
-    repository: Path,
-    source_sha: str,
-    temporary_directory: Path,
-) -> Path:
-    archive = temporary_directory / "source.tar"
-    context = temporary_directory / "context"
-    context.mkdir(mode=0o700)
-    archive_environment = _isolated_archive_environment(temporary_directory)
-    raw_object_directory = runner.query(
-        [
-            *GIT_COMMAND,
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            "objects",
-        ],
-        cwd=repository,
-        failure_message="repository object database is unavailable",
-        environment=_isolated_git_environment(),
-    )
-    try:
-        object_directory = Path(raw_object_directory).resolve(strict=True)
-    except (FileNotFoundError, OSError):
-        raise BuildError("repository object database is unavailable") from None
-    if not object_directory.is_dir():
-        raise BuildError("repository object database is unavailable")
-
-    object_view = temporary_directory / "source.git"
-    runner.query(
-        [
-            *GIT_COMMAND,
-            "-c",
-            "init.templateDir=",
-            "init",
-            "--bare",
-            str(object_view),
-        ],
-        cwd=temporary_directory,
-        failure_message="isolated Git object view could not be prepared",
-        environment=archive_environment,
-    )
-    alternates = object_view / "objects" / "info" / "alternates"
-    try:
-        alternates.write_text(f"{object_directory}\n", encoding="utf-8")
-    except OSError:
-        raise BuildError("isolated Git object view could not be prepared") from None
-
-    runner.write_stdout(
-        [
-            *GIT_COMMAND,
-            f"--git-dir={object_view}",
-            "-c",
-            f"core.attributesFile={os.devnull}",
-            "archive",
-            "--format=tar",
-            source_sha,
-        ],
-        cwd=temporary_directory,
-        destination=archive,
-        failure_message="git archive failed",
-        environment=archive_environment,
-    )
-    try:
-        with tarfile.open(archive, mode="r:") as source:
-            source.extractall(context, filter="data")
-    except (OSError, tarfile.TarError, tarfile.FilterError):
-        raise BuildError("approved Git archive could not be extracted safely") from None
-    finally:
-        try:
-            archive.unlink()
-        except FileNotFoundError:
-            pass
-    if not (context / "Dockerfile").is_file():
-        raise BuildError("approved Git archive does not contain Dockerfile")
-    return context
-
-
-def _hash_approved_deployment_assets(context: Path) -> dict[str, str]:
-    try:
-        context_root = context.resolve(strict=True)
-    except (FileNotFoundError, OSError):
-        raise BuildError("approved deployment assets are unavailable") from None
-    digests: dict[str, str] = {}
-    for relative_path in DEPLOYMENT_ASSET_PATHS:
-        path = context / relative_path
-        try:
-            metadata = path.lstat()
-            resolved = path.resolve(strict=True)
-            content = path.read_bytes()
-        except (FileNotFoundError, OSError):
-            raise BuildError(
-                f"approved deployment asset is unavailable: {relative_path}"
-            ) from None
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or resolved != path
-            or not resolved.is_relative_to(context_root)
-        ):
-            raise BuildError(
-                f"approved deployment asset is not a regular file: {relative_path}"
-            )
-        digests[relative_path] = hashlib.sha256(content).hexdigest()
-    return digests
 
 
 def _inspect_built_image(
@@ -558,29 +338,31 @@ def build_verified_image(
 ) -> BuiltImage:
     command_runner = runner or CommandRunner()
     validated_repository = _validated_repository(repository)
-    _assert_repository_toplevel(command_runner, validated_repository)
     validated_sha = validate_source_sha(source_sha)
     validated_ref = validate_approved_remote_ref(approved_remote_ref)
-    assert_approved_commit(
-        command_runner,
-        repository=validated_repository,
-        source_sha=validated_sha,
-        approved_remote_ref=validated_ref,
-    )
     image = f"{IMAGE_REPOSITORY}:{validated_sha}"
-    docker_daemon_id = _docker_daemon_id(
-        command_runner,
-        repository=validated_repository,
-    )
 
     with tempfile.TemporaryDirectory(prefix="commerce-ops-build-") as temporary:
-        context = _export_context(
+        temporary_directory = Path(temporary)
+        context = temporary_directory / "context"
+        try:
+            with _PROVENANCE.open_canonical_checkout_root(
+                validated_repository
+            ) as checkout:
+                revision = _PROVENANCE.export_revision_evidence(
+                    checkout,
+                    validated_sha,
+                    validated_ref,
+                    workspace=temporary_directory,
+                    extract_to=context,
+                )
+        except _PROVENANCE.ProvenanceError as error:
+            raise BuildError(str(error)) from None
+        deployment_asset_hashes = dict(revision.deployment_assets.sha256)
+        docker_daemon_id = _docker_daemon_id(
             command_runner,
             repository=validated_repository,
-            source_sha=validated_sha,
-            temporary_directory=Path(temporary),
         )
-        deployment_asset_hashes = _hash_approved_deployment_assets(context)
         command_runner.run_quietly(
             [
                 DOCKER_BINARY,

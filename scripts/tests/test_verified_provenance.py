@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -14,7 +16,9 @@ import socket
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -30,6 +34,7 @@ TARGET_SHA = "0123456789abcdef0123456789abcdef01234567"
 DONOR_SHA = "fedcba9876543210fedcba9876543210fedcba98"
 TARGET_IMAGE_ID = f"sha256:{'1' * 64}"
 DONOR_IMAGE_ID = f"sha256:{'2' * 64}"
+TEST_NOREPLY_EMAIL = "123456+provenance-test" + "@users." + "noreply.github.com"
 RUNTIME_COMPONENT_DIGESTS = {
     "backend": "a" * 64,
     "dockerignore": "b" * 64,
@@ -151,6 +156,2155 @@ def load_provenance_module() -> ModuleType:
         PROVENANCE_MODULE,
         "commerce_ops_verified_provenance_contract_test",
     )
+
+
+def run_test_git(repository: Path, *arguments: str) -> bytes:
+    environment = {
+        name: value for name, value in os.environ.items() if not name.startswith("GIT_")
+    }
+    result = subprocess.run(
+        ["/usr/bin/git", *arguments],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
+
+
+def create_provenance_git_repository(tmp_path: Path) -> tuple[Path, str, str]:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    run_test_git(repository, "init", "--initial-branch=main")
+    run_test_git(repository, "config", "user.name", "Provenance Test")
+    run_test_git(
+        repository,
+        "config",
+        "user.email",
+        TEST_NOREPLY_EMAIL,
+    )
+    (repository / "tracked.txt").write_text("approved bytes\n", encoding="utf-8")
+    (repository / ".dockerignore").write_text(".git\n", encoding="utf-8")
+    repository_files = {
+        "Dockerfile": "FROM scratch\n",
+        "backend/requirements.lock": "locked-backend==1.0\n",
+        "frontend/package.json": "{}\n",
+        "frontend/package-lock.json": '{"lockfileVersion":3}\n',
+        "scripts/start-hosted.sh": "#!/bin/sh\nexec true\n",
+        "deploy/workstation/compose.yaml": "services: {}\n",
+        "deploy/workstation/commerce-ops-desk.Caddyfile.template": (
+            "http://example.invalid { respond 200 }\n"
+        ),
+        "deploy/workstation/commerce-ops-desk.v0.2.0.Caddyfile.template": (
+            "http://example.invalid { respond 200 }\n"
+        ),
+    }
+    for relative_path, content in repository_files.items():
+        path = repository / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    (repository / "scripts" / "start-hosted.sh").chmod(0o755)
+    run_test_git(repository, "add", ".")
+    run_test_git(repository, "commit", "--message", "approved")
+    source_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    approved_ref = "refs/remotes/origin/main"
+    run_test_git(repository, "update-ref", approved_ref, source_sha)
+    return repository, source_sha, approved_ref
+
+
+def build_test_git_archive(
+    source_sha: str,
+    members: tuple[tuple[str, bytes | None, int], ...],
+) -> bytes:
+    tar_members: list[tuple[tarfile.TarInfo, bytes | None]] = []
+    for name, content, mode in members:
+        member = tarfile.TarInfo(name)
+        member.mode = mode
+        if content is None:
+            member.type = tarfile.DIRTYPE
+            member.size = 0
+        else:
+            member.type = tarfile.REGTYPE
+            member.size = len(content)
+        tar_members.append((member, content))
+    return build_test_git_archive_from_infos(source_sha, tuple(tar_members))
+
+
+def build_test_git_archive_from_infos(
+    source_sha: str,
+    members: tuple[tuple[tarfile.TarInfo, bytes | None], ...],
+) -> bytes:
+    output = io.BytesIO()
+    with tarfile.open(
+        fileobj=output,
+        mode="w:",
+        format=tarfile.PAX_FORMAT,
+        pax_headers={"comment": source_sha},
+    ) as archive:
+        for member, content in members:
+            archive.addfile(
+                member,
+                None if content is None else io.BytesIO(content),
+            )
+    return output.getvalue()
+
+
+def build_test_gnu_longname_archive(
+    source_sha: str,
+    *,
+    name: str,
+    content: bytes,
+    mode: int,
+) -> bytes:
+    global_pax_blocks = build_test_git_archive(source_sha, ())[:1024]
+    gnu_output = io.BytesIO()
+    with tarfile.open(
+        fileobj=gnu_output,
+        mode="w:",
+        format=tarfile.GNU_FORMAT,
+    ) as archive:
+        member = tarfile.TarInfo(name)
+        member.mode = mode
+        member.size = len(content)
+        archive.addfile(member, io.BytesIO(content))
+    return global_pax_blocks + gnu_output.getvalue()
+
+
+def truncate_tar_to_end_blocks(raw: bytes, end_blocks: int) -> bytes:
+    offset = 0
+    while raw[offset : offset + tarfile.BLOCKSIZE] != b"\0" * tarfile.BLOCKSIZE:
+        header = raw[offset : offset + tarfile.BLOCKSIZE]
+        size_field = header[124:136].rstrip(b"\0 ").lstrip(b" ") or b"0"
+        size = int(size_field, 8)
+        offset += tarfile.BLOCKSIZE + (
+            ((size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+        )
+    return raw[: offset + (end_blocks * tarfile.BLOCKSIZE)]
+
+
+def tar_header_offsets(raw: bytes) -> list[int]:
+    offsets: list[int] = []
+    offset = 0
+    zero_block = b"\0" * tarfile.BLOCKSIZE
+    while raw[offset : offset + tarfile.BLOCKSIZE] != zero_block:
+        offsets.append(offset)
+        header = raw[offset : offset + tarfile.BLOCKSIZE]
+        size_field = header[124:136].rstrip(b"\0 ").lstrip(b" ") or b"0"
+        size = int(size_field, 8)
+        offset += tarfile.BLOCKSIZE + (
+            ((size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+        )
+    return offsets
+
+
+def rewrite_test_tar_checksum(raw: bytearray, offset: int) -> None:
+    raw[offset + 148 : offset + 156] = b"        "
+    checksum = sum(raw[offset : offset + tarfile.BLOCKSIZE])
+    raw[offset + 148 : offset + 156] = f"{checksum:06o}\0 ".encode("ascii")
+
+
+def make_policy_revision(
+    module: ModuleType,
+    source_sha: str,
+    *,
+    dockerfile_mode: str,
+    dockerfile_blob_sha: str,
+    dockerfile_sha256: str,
+    component_suffix: bytes = b"",
+) -> object:
+    components = {
+        name: module.CanonicalDigest(
+            canonical_bytes=f"canonical {name}".encode() + component_suffix,
+            sha256=module.length_framed_sha256(
+                module.RUNTIME_COMPONENT_DOMAIN,
+                f"canonical {name}".encode() + component_suffix,
+            ),
+        )
+        for name in ("backend", "dockerignore", "frontend", "scripts")
+    }
+    combined = module._canonical_combined_runtime_inventory(
+        {name: evidence.sha256 for name, evidence in components.items()}
+    )
+    return module.RevisionEvidence(
+        source_sha=source_sha,
+        deployment_assets=module.DeploymentAssets(schema=1, sha256={}),
+        runtime_inventory=module.RuntimeInventory(
+            components=components,
+            combined=combined,
+        ),
+        dockerfile_mode=dockerfile_mode,
+        dockerfile_blob_sha=dockerfile_blob_sha,
+        dockerfile_sha256=dockerfile_sha256,
+    )
+
+
+def test_isolated_git_environment_replaces_every_ambient_trust_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_provenance_module()
+    hostile = {
+        "PATH": str(tmp_path / "attacker-bin"),
+        "HOME": str(tmp_path / "attacker-home"),
+        "XDG_CONFIG_HOME": str(tmp_path / "attacker-xdg"),
+        "GIT_DIR": str(tmp_path / "attacker.git"),
+        "GIT_WORK_TREE": str(tmp_path / "attacker-tree"),
+        "GIT_OBJECT_DIRECTORY": str(tmp_path / "attacker-objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(tmp_path / "attacker-alternates"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.attributesFile",
+        "GIT_CONFIG_VALUE_0": str(tmp_path / "attacker-attributes"),
+        "GIT_REPLACE_REF_BASE": "refs/attacker/replace/",
+        "GIT_INDEX_FILE": str(tmp_path / "attacker-index"),
+        "GIT_CEILING_DIRECTORIES": str(tmp_path),
+    }
+    for name, value in hostile.items():
+        monkeypatch.setenv(name, value)
+
+    environment = module._isolated_git_environment(tmp_path)
+
+    assert environment == {
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": environment["HOME"],
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": str(tmp_path),
+        "XDG_CONFIG_HOME": environment["XDG_CONFIG_HOME"],
+    }
+    for name in ("HOME", "XDG_CONFIG_HOME"):
+        directory = Path(environment[name])
+        assert directory.parent == tmp_path
+        assert directory.is_dir()
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        assert environment[name] != hostile[name]
+    for name, value in hostile.items():
+        assert environment.get(name) != value
+
+
+def test_git_bytes_runner_uses_fixed_binary_despite_hostile_path(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    attacker_bin = tmp_path / "attacker-bin"
+    attacker_bin.mkdir()
+    marker = tmp_path / "attacker-ran"
+    fake_git = attacker_bin / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\nprintf attacked > '{marker}'\nexit 93\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    environment = module._isolated_git_environment(tmp_path)
+    environment["PATH"] = f"{attacker_bin}:/usr/bin:/bin"
+
+    output = module._run_git_bytes(
+        ("version",),
+        cwd=tmp_path,
+        environment=environment,
+    )
+
+    assert output.startswith(b"git version ")
+    assert not marker.exists()
+
+
+def test_git_bytes_runner_rejects_oversize_output_without_leaking_it(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(
+        ["/usr/bin/git", "init", "--bare", str(repository)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    canary = b"SECRET-GIT-OUTPUT-CANARY"
+    object_id = (
+        subprocess.run(
+            ["/usr/bin/git", "hash-object", "-w", "--stdin"],
+            cwd=repository,
+            input=canary,
+            check=True,
+            capture_output=True,
+        )
+        .stdout.decode("ascii")
+        .removesuffix("\n")
+    )
+    environment = module._isolated_git_environment(tmp_path)
+
+    with pytest.raises(module.ProvenanceError) as captured:
+        module._run_git_bytes(
+            (f"--git-dir={repository}", "cat-file", "blob", object_id),
+            cwd=tmp_path,
+            environment=environment,
+            maximum_stdout_bytes=len(canary) - 1,
+        )
+
+    assert canary.decode("ascii") not in str(captured.value)
+
+
+def test_approved_git_revision_requires_exact_root_commit_and_remote_ref(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    repository, source_sha, approved_ref = create_provenance_git_repository(tmp_path)
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        module._assert_approved_git_revision(
+            checkout,
+            source_sha,
+            approved_ref,
+            temporary_directory=workspace,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_sha", "approved_ref"),
+    (
+        ("a" * 39, "refs/remotes/origin/main"),
+        ("A" * 40, "refs/remotes/origin/main"),
+        ("a" * 40, "refs/heads/main"),
+        ("a" * 40, "refs/remotes/origin/main\nrefs/heads/attack"),
+    ),
+)
+def test_approved_git_revision_rejects_noncanonical_identity_inputs(
+    tmp_path: Path,
+    source_sha: str,
+    approved_ref: str,
+) -> None:
+    module = load_provenance_module()
+    repository, _actual_sha, _actual_ref = create_provenance_git_repository(tmp_path)
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            module._assert_approved_git_revision(
+                checkout,
+                source_sha,
+                approved_ref,
+                temporary_directory=workspace,
+            )
+
+
+def test_approved_git_revision_rejects_nested_checkout_and_ref_drift(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    repository, source_sha, approved_ref = create_provenance_git_repository(tmp_path)
+    (repository / "nested").mkdir()
+    (repository / "tracked.txt").write_text("later bytes\n", encoding="utf-8")
+    run_test_git(repository, "add", "tracked.txt")
+    run_test_git(repository, "commit", "--message", "later")
+    later_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            module._assert_approved_git_revision(
+                checkout,
+                later_sha,
+                approved_ref,
+                temporary_directory=workspace,
+            )
+    with module.open_canonical_checkout_root(
+        (repository / "nested").resolve()
+    ) as nested_checkout:
+        with pytest.raises(module.ProvenanceError):
+            module._assert_approved_git_revision(
+                nested_checkout,
+                source_sha,
+                approved_ref,
+                temporary_directory=workspace,
+            )
+
+
+def test_isolated_object_view_reads_only_the_validated_object_database(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    source_parent = tmp_path / "source"
+    source_parent.mkdir()
+    source, source_sha, _approved_ref = create_provenance_git_repository(source_parent)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    clone = tmp_path / "shared-clone"
+    run_test_git(shared, "clone", "--shared", str(source), str(clone))
+    assert (clone / ".git" / "objects" / "info" / "alternates").is_file()
+    assert not any((clone / ".git" / "objects").glob("[0-9a-f][0-9a-f]/*"))
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+    environment = module._isolated_git_environment(workspace)
+
+    with module.open_canonical_checkout_root(clone.resolve()) as checkout:
+        object_view = module._prepare_isolated_object_view(
+            checkout,
+            temporary_directory=workspace,
+            environment=environment,
+        )
+        object_type = module._run_git_bytes(
+            (f"--git-dir={object_view}", "cat-file", "-t", source_sha),
+            cwd=workspace,
+            environment=environment,
+        )
+
+    assert object_type == b"commit\n"
+    alternates = object_view / "objects" / "info" / "alternates"
+    alternate_bytes = alternates.read_bytes()
+    assert alternate_bytes.endswith(b"\n")
+    assert alternate_bytes.count(b"\n") == 1
+    assert Path(os.fsdecode(alternate_bytes[:-1])).is_absolute()
+
+
+def test_isolated_object_view_rejects_newline_in_object_path_without_leaking_it(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    canary = "SECRET-ALTERNATE-PATH-CANARY"
+    hostile_parent = tmp_path / f"repository\n{canary}"
+    hostile_parent.mkdir()
+    repository, _source_sha, _approved_ref = create_provenance_git_repository(
+        hostile_parent
+    )
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+    environment = module._isolated_git_environment(workspace)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError) as captured:
+            module._prepare_isolated_object_view(
+                checkout,
+                temporary_directory=workspace,
+                environment=environment,
+            )
+
+    assert canary not in str(captured.value)
+    assert not any(workspace.glob(".source-object-view-*"))
+
+
+def test_scoped_tree_parser_preserves_nul_delimited_git_identity() -> None:
+    module = load_provenance_module()
+    raw = (
+        b"040000 tree "
+        + b"1" * 40
+        + b"\tbackend\0"
+        + b"100644 blob "
+        + b"2" * 40
+        + b"\tbackend/requirements.lock\0"
+        + b"040000 tree "
+        + b"3" * 40
+        + b"\tfrontend\0"
+        + b"100755 blob "
+        + b"4" * 40
+        + "\tfrontend/界面.ts\0".encode()
+        + b"040000 tree "
+        + b"5" * 40
+        + b"\tscripts\0"
+        + b"100755 blob "
+        + b"6" * 40
+        + b"\tscripts/start-hosted.sh\0"
+        + b"100644 blob "
+        + b"7" * 40
+        + b"\t.dockerignore\0"
+        + b"100644 blob "
+        + b"8" * 40
+        + b"\tDockerfile\0"
+    )
+
+    entries = module._parse_scoped_tree(raw)
+
+    assert tuple(entries) == (
+        "backend",
+        "backend/requirements.lock",
+        "frontend",
+        "frontend/界面.ts",
+        "scripts",
+        "scripts/start-hosted.sh",
+        ".dockerignore",
+        "Dockerfile",
+    )
+    assert entries["backend"].mode == "040000"
+    assert entries["backend"].object_type == "tree"
+    assert entries["frontend/界面.ts"].mode == "100755"
+    assert entries["frontend/界面.ts"].object_id == "4" * 40
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b"100644 blob " + b"1" * 40 + b"\tDockerfile",
+        b"\0",
+        b"100644 blob " + b"1" * 40 + b"Dockerfile\0",
+        b"100644  blob " + b"1" * 40 + b"\tDockerfile\0",
+        b"100644 blob " + b"A" * 40 + b"\tDockerfile\0",
+        b"100644 blob " + b"1" * 39 + b"\tDockerfile\0",
+        b"100644 tree " + b"1" * 40 + b"\tDockerfile\0",
+        b"040000 blob " + b"1" * 40 + b"\tbackend\0",
+        b"120000 blob " + b"1" * 40 + b"\tbackend/link\0",
+        b"160000 commit " + b"1" * 40 + b"\tfrontend/module\0",
+        b"100644 blob " + b"1" * 40 + b"\tbackend/\xff.py\0",
+        b"100644 blob " + b"1" * 40 + b"\tbackend/control\x1f.py\0",
+        b"100644 blob " + b"1" * 40 + "\tbackend/control\u0085.py\0".encode(),
+        b"100644 blob " + b"1" * 40 + "\tbackend/override\u202e.py\0".encode(),
+        b"100644 blob " + b"1" * 40 + b"\t/backend/file.py\0",
+        b"100644 blob " + b"1" * 40 + b"\tbackend/../Dockerfile\0",
+        b"100644 blob " + b"1" * 40 + b"\tbackend//file.py\0",
+        b"100644 blob " + b"1" * 40 + b"\tbackend\\file.py\0",
+        b"100644 blob " + b"1" * 40 + b"\tdocs/file.md\0",
+        (
+            b"100644 blob "
+            + b"1" * 40
+            + b"\tDockerfile\0"
+            + b"100644 blob "
+            + b"2" * 40
+            + b"\tDockerfile\0"
+        ),
+    ),
+)
+def test_scoped_tree_parser_rejects_ambiguous_or_unsafe_records(raw: bytes) -> None:
+    module = load_provenance_module()
+
+    with pytest.raises(module.ProvenanceError):
+        module._parse_scoped_tree(raw)
+
+
+def test_scoped_tree_parser_enforces_member_count_before_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_provenance_module()
+    monkeypatch.setattr(module, "MAX_SCOPED_TREE_ENTRIES", 1, raising=False)
+    raw = (
+        b"040000 tree "
+        + b"1" * 40
+        + b"\tbackend\0"
+        + b"100644 blob "
+        + b"2" * 40
+        + b"\tbackend/requirements.lock\0"
+    )
+
+    with pytest.raises(module.ProvenanceError):
+        module._parse_scoped_tree(raw)
+
+
+def test_blob_collection_enforces_cumulative_bytes_before_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_provenance_module()
+    blob_object_id = hashlib.sha1(b"blob 2\0aa").hexdigest()
+    entries = {
+        "Dockerfile": module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id=blob_object_id,
+            path="Dockerfile",
+        ),
+        ".dockerignore": module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id=blob_object_id,
+            path=".dockerignore",
+        ),
+    }
+    monkeypatch.setattr(module, "MAX_TOTAL_PROTECTED_BLOB_BYTES", 3, raising=False)
+    observed_limits: list[int] = []
+
+    def return_blob(*args: object, **kwargs: object) -> bytes:
+        maximum = kwargs["maximum_stdout_bytes"]
+        assert isinstance(maximum, int)
+        observed_limits.append(maximum)
+        return b"aa"
+
+    monkeypatch.setattr(module, "_run_git_bytes", return_blob)
+
+    with pytest.raises(module.ProvenanceError):
+        module._collect_blob_bytes(
+            entries,
+            git_dir="--git-dir=/trusted/object-view",
+            workspace=tmp_path,
+            environment={},
+        )
+
+    assert observed_limits == [3, 1]
+
+
+def test_blob_collection_rejects_bytes_that_do_not_match_the_tree_object_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_provenance_module()
+    entry = module.TreeEntry(
+        mode="100644",
+        object_type="blob",
+        object_id=hashlib.sha1(b"blob 8\0approved").hexdigest(),
+        path="Dockerfile",
+    )
+    monkeypatch.setattr(module, "_run_git_bytes", lambda *args, **kwargs: b"replaced")
+
+    with pytest.raises(module.ProvenanceError):
+        module._collect_blob_bytes(
+            {"Dockerfile": entry},
+            git_dir="--git-dir=/trusted/object-view",
+            workspace=tmp_path,
+            environment={},
+        )
+
+
+def test_git_archive_binds_every_scoped_member_to_tree_mode_and_blob_bytes() -> None:
+    module = load_provenance_module()
+    source_sha = "9" * 40
+    backend_bytes = b"locked dependency bytes\n"
+    dockerfile_bytes = b"FROM scratch\n"
+    raw_tree = (
+        b"040000 tree "
+        + b"1" * 40
+        + b"\tbackend\0"
+        + b"100644 blob "
+        + b"2" * 40
+        + b"\tbackend/requirements.lock\0"
+        + b"100644 blob "
+        + b"3" * 40
+        + b"\tDockerfile\0"
+    )
+    tree = module._parse_scoped_tree(raw_tree)
+    archive = build_test_git_archive(
+        source_sha,
+        (
+            ("backend", None, 0o775),
+            ("backend/requirements.lock", backend_bytes, 0o664),
+            ("Dockerfile", dockerfile_bytes, 0o664),
+            ("docs/readme.md", b"outside protected projection\n", 0o664),
+        ),
+    )
+
+    files = module._validate_git_archive(
+        archive,
+        source_sha=source_sha,
+        tree_entries=tree,
+        blob_bytes={
+            "backend/requirements.lock": backend_bytes,
+            "Dockerfile": dockerfile_bytes,
+        },
+    )
+
+    assert tuple(files) == ("backend/requirements.lock", "Dockerfile")
+    assert files["backend/requirements.lock"].mode == "100644"
+    assert files["backend/requirements.lock"].data == backend_bytes
+    assert files["Dockerfile"].sha256 == hashlib.sha256(dockerfile_bytes).hexdigest()
+
+
+def test_archive_extraction_preserves_a_preexisting_destination(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    destination = tmp_path / "existing-context"
+    destination.mkdir()
+    sentinel = destination / "customer-owned.txt"
+    sentinel.write_bytes(b"preserve these bytes\n")
+    archive = build_test_git_archive(
+        "9" * 40,
+        (("Dockerfile", b"FROM scratch\n", 0o664),),
+    )
+
+    with pytest.raises(module.ProvenanceError):
+        module._extract_validated_git_archive(archive, destination)
+
+    assert destination.is_dir()
+    assert sentinel.read_bytes() == b"preserve these bytes\n"
+
+
+def test_git_archive_accepts_an_exact_canonical_pax_path() -> None:
+    module = load_provenance_module()
+    source_sha = "9" * 40
+    path = f"backend/{'a' * 120}.py"
+    content = b"approved long-path bytes\n"
+    tree = {
+        "backend": module.TreeEntry(
+            mode="040000",
+            object_type="tree",
+            object_id="1" * 40,
+            path="backend",
+        ),
+        path: module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id=hashlib.sha1(
+                f"blob {len(content)}\0".encode("ascii") + content
+            ).hexdigest(),
+            path=path,
+        ),
+    }
+    archive = build_test_git_archive(
+        source_sha,
+        (("backend", None, 0o775), (path, content, 0o664)),
+    )
+
+    files = module._validate_git_archive(
+        archive,
+        source_sha=source_sha,
+        tree_entries=tree,
+        blob_bytes={path: content},
+    )
+
+    assert files[path].data == content
+
+
+def test_git_archive_rejects_a_hidden_gnu_longname_rewrite() -> None:
+    module = load_provenance_module()
+    source_sha = "9" * 40
+    path = f"backend/{'a' * 120}.py"
+    content = b"approved long-path bytes\n"
+    tree = {
+        path: module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id=hashlib.sha1(
+                f"blob {len(content)}\0".encode("ascii") + content
+            ).hexdigest(),
+            path=path,
+        )
+    }
+    archive = build_test_gnu_longname_archive(
+        source_sha,
+        name=path,
+        content=content,
+        mode=0o664,
+    )
+
+    with pytest.raises(module.ProvenanceError):
+        module._validate_git_archive(
+            archive,
+            source_sha=source_sha,
+            tree_entries=tree,
+            blob_bytes={path: content},
+        )
+
+
+@pytest.mark.parametrize("end_blocks", (0, 1))
+def test_git_archive_rejects_missing_end_of_archive_blocks(
+    end_blocks: int,
+) -> None:
+    module = load_provenance_module()
+    source_sha = "9" * 40
+    content = b"FROM scratch\n"
+    tree = {
+        "Dockerfile": module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id=hashlib.sha1(
+                f"blob {len(content)}\0".encode("ascii") + content
+            ).hexdigest(),
+            path="Dockerfile",
+        )
+    }
+    complete = build_test_git_archive(
+        source_sha,
+        (("Dockerfile", content, 0o664),),
+    )
+    truncated = truncate_tar_to_end_blocks(complete, end_blocks)
+
+    with pytest.raises(module.ProvenanceError):
+        module._validate_git_archive(
+            truncated,
+            source_sha=source_sha,
+            tree_entries=tree,
+            blob_bytes={"Dockerfile": content},
+        )
+
+
+def test_git_archive_accepts_exactly_two_end_blocks() -> None:
+    module = load_provenance_module()
+    source_sha = "9" * 40
+    content = b"FROM scratch\n"
+    tree = {
+        "Dockerfile": module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id=hashlib.sha1(
+                f"blob {len(content)}\0".encode("ascii") + content
+            ).hexdigest(),
+            path="Dockerfile",
+        )
+    }
+    complete = build_test_git_archive(
+        source_sha,
+        (("Dockerfile", content, 0o664),),
+    )
+    minimal = truncate_tar_to_end_blocks(complete, 2)
+
+    files = module._validate_git_archive(
+        minimal,
+        source_sha=source_sha,
+        tree_entries=tree,
+        blob_bytes={"Dockerfile": content},
+    )
+
+    assert files["Dockerfile"].data == content
+
+
+def test_git_archive_rejects_nonzero_bytes_after_the_end_markers() -> None:
+    module = load_provenance_module()
+    source_sha = "9" * 40
+    content = b"FROM scratch\n"
+    tree = {
+        "Dockerfile": module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id=hashlib.sha1(
+                f"blob {len(content)}\0".encode("ascii") + content
+            ).hexdigest(),
+            path="Dockerfile",
+        )
+    }
+    archive = build_test_git_archive(
+        source_sha,
+        (("Dockerfile", content, 0o664),),
+    )
+    archive += b"attacker".ljust(512, b"\0")
+
+    with pytest.raises(module.ProvenanceError):
+        module._validate_git_archive(
+            archive,
+            source_sha=source_sha,
+            tree_entries=tree,
+            blob_bytes={"Dockerfile": content},
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "duplicate",
+        "missing",
+        "extra-protected",
+        "file-as-directory",
+        "directory-as-file",
+        "executable-mode",
+        "content",
+    ),
+)
+def test_git_archive_rejects_every_scoped_tree_disagreement(
+    mutation: str,
+) -> None:
+    module = load_provenance_module()
+    source_sha = "9" * 40
+    path = "backend/app.py"
+    content = b"approved bytes\n"
+    tree = {
+        "backend": module.TreeEntry(
+            mode="040000",
+            object_type="tree",
+            object_id="1" * 40,
+            path="backend",
+        ),
+        path: module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id="2" * 40,
+            path=path,
+        ),
+    }
+    members: list[tuple[str, bytes | None, int]] = [
+        ("backend", None, 0o775),
+        (path, content, 0o664),
+    ]
+    if mutation == "duplicate":
+        members.append((path, content, 0o664))
+    elif mutation == "missing":
+        members.pop()
+    elif mutation == "extra-protected":
+        members.append(("backend/extra.py", b"extra\n", 0o664))
+    elif mutation == "file-as-directory":
+        members[-1] = (path, None, 0o775)
+    elif mutation == "directory-as-file":
+        members[0] = ("backend", b"not a directory\n", 0o664)
+    elif mutation == "executable-mode":
+        members[-1] = (path, content, 0o775)
+    elif mutation == "content":
+        members[-1] = (path, b"attacker bytes\n", 0o664)
+    archive = build_test_git_archive(source_sha, tuple(members))
+
+    with pytest.raises(module.ProvenanceError):
+        module._validate_git_archive(
+            archive,
+            source_sha=source_sha,
+            tree_entries=tree,
+            blob_bytes={path: content},
+        )
+
+
+@pytest.mark.parametrize(
+    "member_type",
+    (
+        tarfile.SYMTYPE,
+        tarfile.LNKTYPE,
+        tarfile.FIFOTYPE,
+        tarfile.CHRTYPE,
+        tarfile.BLKTYPE,
+        tarfile.GNUTYPE_SPARSE,
+    ),
+)
+def test_git_archive_rejects_nonregular_member_types(member_type: bytes) -> None:
+    module = load_provenance_module()
+    source_sha = "9" * 40
+    path = "backend/app.py"
+    member = tarfile.TarInfo(path)
+    member.mode = 0o664
+    member.type = member_type
+    member.size = 0
+    member.linkname = "backend/approved.py"
+    member.devmajor = 1
+    member.devminor = 3
+    archive = build_test_git_archive_from_infos(
+        source_sha,
+        ((member, None),),
+    )
+    tree = {
+        path: module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id="2" * 40,
+            path=path,
+        )
+    }
+
+    with pytest.raises(module.ProvenanceError):
+        module._validate_git_archive(
+            archive,
+            source_sha=source_sha,
+            tree_entries=tree,
+            blob_bytes={path: b""},
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "checksum",
+        "magic",
+        "base256-size",
+        "base256-mtime",
+        "nul-type",
+        "padding",
+    ),
+)
+def test_git_archive_rejects_malformed_raw_headers(mutation: str) -> None:
+    module = load_provenance_module()
+    source_sha = "9" * 40
+    path = "Dockerfile"
+    content = b"FROM scratch\n"
+    archive = bytearray(
+        build_test_git_archive(
+            source_sha,
+            ((path, content, 0o664),),
+        )
+    )
+    member_offset = tar_header_offsets(bytes(archive))[-1]
+    if mutation == "checksum":
+        archive[member_offset] ^= 1
+    elif mutation == "magic":
+        archive[member_offset + 257 : member_offset + 263] = b"broken"
+        rewrite_test_tar_checksum(archive, member_offset)
+    elif mutation == "base256-size":
+        archive[member_offset + 124 : member_offset + 136] = b"\x80" + (b"\0" * 11)
+        rewrite_test_tar_checksum(archive, member_offset)
+    elif mutation == "base256-mtime":
+        archive[member_offset + 136 : member_offset + 148] = (
+            b"\x80" + (b"\0" * 10) + b"\1"
+        )
+        rewrite_test_tar_checksum(archive, member_offset)
+    elif mutation == "nul-type":
+        archive[member_offset + 156] = 0
+        rewrite_test_tar_checksum(archive, member_offset)
+    elif mutation == "padding":
+        archive[member_offset + tarfile.BLOCKSIZE + len(content)] = 1
+    tree = {
+        path: module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id="2" * 40,
+            path=path,
+        )
+    }
+
+    with pytest.raises(module.ProvenanceError):
+        module._validate_git_archive(
+            bytes(archive),
+            source_sha=source_sha,
+            tree_entries=tree,
+            blob_bytes={path: content},
+        )
+
+
+@pytest.mark.parametrize("pax_mutation", ("unknown-key", "mismatched-path"))
+def test_git_archive_rejects_unapproved_local_pax_metadata(
+    pax_mutation: str,
+) -> None:
+    module = load_provenance_module()
+    source_sha = "9" * 40
+    path = "backend/app.py"
+    member = tarfile.TarInfo(path)
+    member.mode = 0o664
+    member.size = len(b"approved\n")
+    if pax_mutation == "unknown-key":
+        member.pax_headers = {"path": path, "attacker": "value"}
+    else:
+        member.pax_headers = {"path": "backend/other.py"}
+    archive = build_test_git_archive_from_infos(
+        source_sha,
+        ((member, b"approved\n"),),
+    )
+    tree = {
+        path: module.TreeEntry(
+            mode="100644",
+            object_type="blob",
+            object_id="2" * 40,
+            path=path,
+        )
+    }
+
+    with pytest.raises(module.ProvenanceError):
+        module._validate_git_archive(
+            archive,
+            source_sha=source_sha,
+            tree_entries=tree,
+            blob_bytes={path: b"approved\n"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("component", "entries", "expected_bytes", "expected_digest"),
+    (
+        (
+            "backend",
+            (),
+            b'{"component":"backend","entries":[],"schema":1}',
+            "ebb741d633cd371d7ea4820fd535860f3f45b896a3704d71472546e9c68abd16",
+        ),
+        (
+            "backend",
+            (("backend/app.py", "100644", "1" * 64),),
+            (
+                b'{"component":"backend","entries":[{"mode":"100644",'
+                b'"path":"backend/app.py","sha256":"' + b"1" * 64 + b'"}],"schema":1}'
+            ),
+            "788d9f08481b50466f4d2dcaad836f5cbdf09c92e719a9c31f3c2d1eb99f98d0",
+        ),
+        (
+            "frontend",
+            (
+                ("frontend/界面.ts", "100755", "3" * 64),
+                ("frontend/a.ts", "100644", "2" * 64),
+            ),
+            (
+                b'{"component":"frontend","entries":[{"mode":"100644",'
+                b'"path":"frontend/a.ts","sha256":"'
+                + b"2"
+                * 64
+                + b'"},{"mode":"100755","path":"frontend/\\u754c\\u9762.ts",'
+                b'"sha256":"' + b"3" * 64 + b'"}],"schema":1}'
+            ),
+            "37954085eb1b8eb44898638ddfb176c328973ed43656bb95702159bd66a6e4fd",
+        ),
+    ),
+)
+def test_runtime_component_inventory_has_pinned_canonical_bytes_and_digest(
+    component: str,
+    entries: tuple[tuple[str, str, str], ...],
+    expected_bytes: bytes,
+    expected_digest: str,
+) -> None:
+    module = load_provenance_module()
+    inventory_entries = tuple(
+        module.RuntimeInventoryEntry(path=path, mode=mode, sha256=digest)
+        for path, mode, digest in entries
+    )
+
+    evidence = module._canonical_runtime_component(component, inventory_entries)
+
+    assert evidence.canonical_bytes == expected_bytes
+    assert evidence.sha256 == expected_digest
+
+
+def test_dockerignore_and_combined_inventory_have_pinned_domains() -> None:
+    module = load_provenance_module()
+
+    dockerignore = module._canonical_dockerignore_component(b"node_modules\n")
+    combined = module._canonical_combined_runtime_inventory(
+        {
+            "backend": "a" * 64,
+            "dockerignore": "b" * 64,
+            "frontend": "c" * 64,
+            "scripts": "d" * 64,
+        }
+    )
+
+    assert dockerignore.canonical_bytes == (
+        b'{"component":"dockerignore","schema":1,"sha256":'
+        b'"16d30e4462189fb14dd611bdb708c510630c576a1f35b9383e89a4352da36c97"}'
+    )
+    assert (
+        dockerignore.sha256
+        == "77f4e26a0044097d09e7f4b40c06b26f4cfcf7e6549f7505386569a1050e8e81"
+    )
+    assert combined.canonical_bytes == (
+        b'{"components":{"backend":"'
+        + b"a" * 64
+        + b'","dockerignore":"'
+        + b"b" * 64
+        + b'","frontend":"'
+        + b"c" * 64
+        + b'","scripts":"'
+        + b"d" * 64
+        + b'"},"policy":"runtime-copy-inputs-v1","schema":1}'
+    )
+    assert (
+        combined.sha256
+        == "b3b1f9868a0e8ca6fb608f7752d057a280e381d45925e831b2c00f70d0b5713a"
+    )
+
+
+def test_runtime_inventory_applies_only_the_fixed_exclusions_and_requires_anchors() -> (
+    None
+):
+    module = load_provenance_module()
+
+    def archived(path: str, content: bytes, mode: str = "100644") -> object:
+        return module.ArchiveFile(
+            path=path,
+            mode=mode,
+            data=content,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+    files = {
+        ".dockerignore": archived(".dockerignore", b"locked ignore policy\n"),
+        "Dockerfile": archived("Dockerfile", b"FROM scratch\n"),
+        "backend/requirements.lock": archived(
+            "backend/requirements.lock", b"backend lock\n"
+        ),
+        "frontend/package.json": archived("frontend/package.json", b"{}\n"),
+        "frontend/package-lock.json": archived(
+            "frontend/package-lock.json", b'{"lockfileVersion":3}\n'
+        ),
+        "scripts/start-hosted.sh": archived(
+            "scripts/start-hosted.sh", b"#!/bin/sh\n", "100755"
+        ),
+    }
+    excluded_prefixes = (
+        "backend/.mypy_cache/",
+        "backend/.pytest_cache/",
+        "backend/.ruff_cache/",
+        "backend/__pycache__/",
+        "backend/wheelhouse/",
+        "backend/postgres_tests/",
+        "backend/tests/",
+        "frontend/coverage/",
+        "frontend/dist/",
+        "frontend/node_modules/",
+        "frontend/playwright-report/",
+        "frontend/test-results/",
+        "scripts/tests/",
+    )
+    for index, prefix in enumerate(excluded_prefixes):
+        path = f"{prefix}excluded-{index}.txt"
+        files[path] = archived(path, b"excluded\n")
+    for suffix in (".db", ".db-shm", ".db-wal", ".sqlite", ".sqlite3", ".pyc"):
+        path = f"backend/live/excluded{suffix}"
+        files[path] = archived(path, b"excluded by basename\n")
+    included_paths = {
+        "backend/tests-near-miss/keep.py",
+        "backend/live/data.DB",
+        "backend/live/data.db.keep",
+        "frontend/distinct/keep.ts",
+        "scripts/tests-near-miss/keep.sh",
+    }
+    for path in included_paths:
+        files[path] = archived(path, f"included {path}\n".encode())
+
+    inventory = module._build_runtime_inventory(files)
+
+    observed_paths: set[str] = set()
+    for component in ("backend", "frontend", "scripts"):
+        payload = json.loads(inventory.components[component].canonical_bytes)
+        observed_paths.update(entry["path"] for entry in payload["entries"])
+    assert included_paths <= observed_paths
+    assert all(
+        not any(path.startswith(prefix) for prefix in excluded_prefixes)
+        for path in observed_paths
+    )
+    assert not any(
+        path.endswith((".db", ".db-shm", ".db-wal", ".sqlite", ".sqlite3", ".pyc"))
+        for path in observed_paths
+    )
+    assert inventory.components["dockerignore"].canonical_bytes.startswith(
+        b'{"component":"dockerignore"'
+    )
+    assert (
+        inventory.combined.sha256
+        == module._canonical_combined_runtime_inventory(
+            {name: component.sha256 for name, component in inventory.components.items()}
+        ).sha256
+    )
+
+
+@pytest.mark.parametrize(
+    "missing_anchor",
+    (
+        "backend/requirements.lock",
+        "frontend/package.json",
+        "frontend/package-lock.json",
+        "scripts/start-hosted.sh",
+        ".dockerignore",
+    ),
+)
+def test_runtime_inventory_rejects_a_missing_required_anchor(
+    missing_anchor: str,
+) -> None:
+    module = load_provenance_module()
+
+    def archived(path: str) -> object:
+        content = f"{path}\n".encode()
+        return module.ArchiveFile(
+            path=path,
+            mode="100755" if path == "scripts/start-hosted.sh" else "100644",
+            data=content,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+    paths = {
+        ".dockerignore",
+        "backend/requirements.lock",
+        "frontend/package.json",
+        "frontend/package-lock.json",
+        "scripts/start-hosted.sh",
+    }
+    paths.remove(missing_anchor)
+
+    with pytest.raises(module.ProvenanceError):
+        module._build_runtime_inventory({path: archived(path) for path in paths})
+
+
+@pytest.mark.parametrize(
+    ("mutation", "changed_component"),
+    (
+        ("add", "backend"),
+        ("delete", "backend"),
+        ("rename", "backend"),
+        ("content", "backend"),
+        ("mode", "backend"),
+        ("requirements-lock", "backend"),
+        ("package-json", "frontend"),
+        ("package-lock", "frontend"),
+        ("included-script", "scripts"),
+        ("dockerignore", "dockerignore"),
+    ),
+)
+def test_runtime_inventory_binds_every_included_copy_input_mutation(
+    mutation: str,
+    changed_component: str,
+) -> None:
+    module = load_provenance_module()
+
+    def archived(path: str, content: bytes, mode: str = "100644") -> object:
+        return module.ArchiveFile(
+            path=path,
+            mode=mode,
+            data=content,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+    files = {
+        ".dockerignore": archived(".dockerignore", b"locked ignore policy\n"),
+        "backend/requirements.lock": archived(
+            "backend/requirements.lock", b"backend==1\n"
+        ),
+        "backend/app.py": archived("backend/app.py", b"print('approved')\n"),
+        "frontend/package.json": archived("frontend/package.json", b"{}\n"),
+        "frontend/package-lock.json": archived(
+            "frontend/package-lock.json", b'{"lockfileVersion":3}\n'
+        ),
+        "frontend/src/app.ts": archived(
+            "frontend/src/app.ts", b"export const approved = true;\n"
+        ),
+        "scripts/start-hosted.sh": archived(
+            "scripts/start-hosted.sh", b"#!/bin/sh\n", "100755"
+        ),
+        "scripts/reconcile.py": archived(
+            "scripts/reconcile.py", b"print('approved')\n"
+        ),
+    }
+    baseline = module._build_runtime_inventory(files)
+    changed = dict(files)
+    if mutation == "add":
+        changed["backend/new.py"] = archived("backend/new.py", b"new\n")
+    elif mutation == "delete":
+        del changed["backend/app.py"]
+    elif mutation == "rename":
+        changed["backend/renamed.py"] = replace(
+            changed.pop("backend/app.py"),
+            path="backend/renamed.py",
+        )
+    elif mutation == "content":
+        changed["backend/app.py"] = archived("backend/app.py", b"print('changed')\n")
+    elif mutation == "mode":
+        changed["backend/app.py"] = archived(
+            "backend/app.py", b"print('approved')\n", "100755"
+        )
+    elif mutation == "requirements-lock":
+        changed["backend/requirements.lock"] = archived(
+            "backend/requirements.lock", b"backend==2\n"
+        )
+    elif mutation == "package-json":
+        changed["frontend/package.json"] = archived(
+            "frontend/package.json", b'{"changed":true}\n'
+        )
+    elif mutation == "package-lock":
+        changed["frontend/package-lock.json"] = archived(
+            "frontend/package-lock.json", b'{"lockfileVersion":4}\n'
+        )
+    elif mutation == "included-script":
+        changed["scripts/reconcile.py"] = archived(
+            "scripts/reconcile.py", b"print('changed')\n"
+        )
+    elif mutation == "dockerignore":
+        changed[".dockerignore"] = archived(".dockerignore", b"changed ignore policy\n")
+
+    candidate = module._build_runtime_inventory(changed)
+
+    assert (
+        candidate.components[changed_component].sha256
+        != baseline.components[changed_component].sha256
+    )
+    assert candidate.combined.sha256 != baseline.combined.sha256
+
+
+@pytest.mark.parametrize(
+    "excluded_path",
+    (
+        "docs/readme.md",
+        "deploy/workstation/tool.py",
+        "backend/tests/test_app.py",
+        "backend/.mypy_cache/state.json",
+        "frontend/dist/bundle.js",
+        "scripts/tests/test_tool.py",
+        "backend/live/cache.pyc",
+    ),
+)
+def test_runtime_inventory_ignores_only_documented_nonruntime_changes(
+    excluded_path: str,
+) -> None:
+    module = load_provenance_module()
+
+    def archived(path: str, content: bytes, mode: str = "100644") -> object:
+        return module.ArchiveFile(
+            path=path,
+            mode=mode,
+            data=content,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+    files = {
+        ".dockerignore": archived(".dockerignore", b"locked ignore policy\n"),
+        "backend/requirements.lock": archived(
+            "backend/requirements.lock", b"backend==1\n"
+        ),
+        "frontend/package.json": archived("frontend/package.json", b"{}\n"),
+        "frontend/package-lock.json": archived(
+            "frontend/package-lock.json", b'{"lockfileVersion":3}\n'
+        ),
+        "scripts/start-hosted.sh": archived(
+            "scripts/start-hosted.sh", b"#!/bin/sh\n", "100755"
+        ),
+        excluded_path: archived(excluded_path, b"before\n"),
+    }
+    baseline = module._build_runtime_inventory(files)
+    files[excluded_path] = archived(excluded_path, b"after\n", "100755")
+
+    candidate = module._build_runtime_inventory(files)
+
+    assert candidate == baseline
+
+
+def test_export_revision_evidence_uses_only_the_approved_git_object(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_provenance_module()
+    clone_parent = tmp_path / "clone-parent"
+    clone_parent.mkdir()
+    repository = tmp_path / "repository"
+    run_test_git(
+        clone_parent,
+        "clone",
+        "--shared",
+        str(PRODUCT_ROOT),
+        str(repository),
+    )
+    run_test_git(repository, "config", "user.name", "Provenance Test")
+    run_test_git(
+        repository,
+        "config",
+        "user.email",
+        "provenance-test@users.noreply.github.com",
+    )
+    source_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    approved_ref = "refs/remotes/origin/approved"
+    run_test_git(repository, "update-ref", approved_ref, source_sha)
+    approved_backend = run_test_git(
+        repository, "show", f"{source_sha}:backend/app/main.py"
+    )
+    (repository / "backend" / "app" / "main.py").write_text(
+        "SECRET-DIRTY-WORKTREE\n",
+        encoding="utf-8",
+    )
+    run_test_git(repository, "add", "backend/app/main.py")
+    run_test_git(repository, "commit", "--message", "hostile replacement")
+    replacement_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    run_test_git(repository, "replace", source_sha, replacement_sha)
+    (repository / ".git" / "info" / "attributes").write_text(
+        "backend/requirements.lock export-ignore\n",
+        encoding="utf-8",
+    )
+    attacker_bin = tmp_path / "attacker-bin"
+    attacker_bin.mkdir()
+    marker = tmp_path / "attacker-git-ran"
+    fake_git = attacker_bin / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\nprintf attacked > '{marker}'\nexit 91\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{attacker_bin}:/usr/bin:/bin")
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "attacker.git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "attacker-tree"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.attributesFile")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(repository / ".git/info/attributes"))
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+    context = tmp_path / "context"
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        evidence = module.export_revision_evidence(
+            checkout,
+            source_sha,
+            approved_ref,
+            workspace=workspace,
+            extract_to=context,
+        )
+
+    assert evidence.source_sha == source_sha
+    assert (
+        evidence.dockerfile_blob_sha
+        == run_test_git(repository, "ls-tree", source_sha, "--", "Dockerfile")
+        .decode("ascii")
+        .split()[2]
+    )
+    approved_dockerfile = run_test_git(repository, "show", f"{source_sha}:Dockerfile")
+    assert evidence.dockerfile_sha256 == hashlib.sha256(approved_dockerfile).hexdigest()
+    assert set(evidence.runtime_inventory.components) == {
+        "backend",
+        "dockerignore",
+        "frontend",
+        "scripts",
+    }
+    assert evidence.runtime_inventory.combined.sha256
+    for asset in DEPLOYMENT_ASSET_DIGESTS:
+        approved_asset = run_test_git(repository, "show", f"{source_sha}:{asset}")
+        assert (
+            evidence.deployment_assets.sha256[asset]
+            == hashlib.sha256(approved_asset).hexdigest()
+        )
+    assert (context / "backend" / "app" / "main.py").read_bytes() == approved_backend
+    assert not marker.exists()
+    assert list(workspace.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("attribute_rule", "mutate_dockerfile"),
+    (
+        ("backend/requirements.lock export-ignore\n", False),
+        ("Dockerfile export-subst\n", True),
+    ),
+)
+def test_export_revision_evidence_rejects_protected_archive_transformations(
+    tmp_path: Path,
+    attribute_rule: str,
+    mutate_dockerfile: bool,
+) -> None:
+    module = load_provenance_module()
+    repository, _source_sha, approved_ref = create_provenance_git_repository(tmp_path)
+    if mutate_dockerfile:
+        (repository / "Dockerfile").write_text(
+            "FROM scratch\n# $Format:%H$\n",
+            encoding="utf-8",
+        )
+    (repository / ".gitattributes").write_text(attribute_rule, encoding="utf-8")
+    run_test_git(repository, "add", ".gitattributes", "Dockerfile")
+    run_test_git(repository, "commit", "--message", "hostile export policy")
+    source_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    run_test_git(repository, "update-ref", approved_ref, source_sha)
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            module.export_revision_evidence(
+                checkout,
+                source_sha,
+                approved_ref,
+                workspace=workspace,
+            )
+
+    assert list(workspace.iterdir()) == []
+
+
+def test_export_revision_rejects_runtime_symlink_before_archive_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_provenance_module()
+    repository, _source_sha, approved_ref = create_provenance_git_repository(tmp_path)
+    (repository / "backend" / "link.py").symlink_to("requirements.lock")
+    run_test_git(repository, "add", "backend/link.py")
+    run_test_git(repository, "commit", "--message", "runtime symlink")
+    source_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    run_test_git(repository, "update-ref", approved_ref, source_sha)
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+    real_run_git = module._run_git_bytes
+    observed_arguments: list[tuple[str, ...]] = []
+
+    def record_git(arguments: tuple[str, ...], **kwargs: object) -> bytes:
+        observed_arguments.append(arguments)
+        return real_run_git(arguments, **kwargs)
+
+    monkeypatch.setattr(module, "_run_git_bytes", record_git)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            module.export_revision_evidence(
+                checkout,
+                source_sha,
+                approved_ref,
+                workspace=workspace,
+            )
+
+    assert not any("archive" in arguments for arguments in observed_arguments)
+    assert list(workspace.iterdir()) == []
+
+
+def test_export_revision_evidence_hashes_exported_deployment_asset_bytes(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    repository, _source_sha, approved_ref = create_provenance_git_repository(tmp_path)
+    asset_path = "deploy/workstation/compose.yaml"
+    raw_asset = b"services: {}\n# $Format:%H$\n"
+    (repository / asset_path).write_bytes(raw_asset)
+    (repository / ".gitattributes").write_text(
+        f"{asset_path} export-subst\n",
+        encoding="utf-8",
+    )
+    run_test_git(repository, "add", ".gitattributes", asset_path)
+    run_test_git(repository, "commit", "--message", "export deployment identity")
+    source_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    run_test_git(repository, "update-ref", approved_ref, source_sha)
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        evidence = module.export_revision_evidence(
+            checkout,
+            source_sha,
+            approved_ref,
+            workspace=workspace,
+        )
+
+    exported_asset = f"services: {{}}\n# {source_sha}\n".encode()
+    assert (
+        evidence.deployment_assets.sha256[asset_path]
+        == hashlib.sha256(exported_asset).hexdigest()
+    )
+    assert (
+        evidence.deployment_assets.sha256[asset_path]
+        != hashlib.sha256(raw_asset).hexdigest()
+    )
+
+
+def test_export_revision_evidence_verifies_deployment_asset_blob_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_provenance_module()
+    repository, source_sha, approved_ref = create_provenance_git_repository(tmp_path)
+    asset_path = "deploy/workstation/compose.yaml"
+    asset_object_id = (
+        run_test_git(repository, "rev-parse", f"{source_sha}:{asset_path}")
+        .decode("ascii")
+        .removesuffix("\n")
+    )
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+    real_run_git = module._run_git_bytes
+
+    def return_corrupt_asset_blob(
+        arguments: tuple[str, ...],
+        **kwargs: object,
+    ) -> bytes:
+        if arguments[-3:] == ("cat-file", "blob", asset_object_id):
+            return b"content whose Git object ID does not match the tree\n"
+        return real_run_git(arguments, **kwargs)
+
+    monkeypatch.setattr(module, "_run_git_bytes", return_corrupt_asset_blob)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            module.export_revision_evidence(
+                checkout,
+                source_sha,
+                approved_ref,
+                workspace=workspace,
+            )
+
+    assert list(workspace.iterdir()) == []
+
+
+@pytest.mark.parametrize("operation", ("export", "equivalence"))
+@pytest.mark.parametrize("workspace_shape", ("missing", "symlink-loop"))
+def test_git_evidence_apis_sanitize_an_unresolvable_workspace(
+    tmp_path: Path,
+    operation: str,
+    workspace_shape: str,
+) -> None:
+    module = load_provenance_module()
+    repository, source_sha, approved_ref = create_provenance_git_repository(tmp_path)
+    workspace = tmp_path / "unresolvable-workspace"
+    if workspace_shape == "symlink-loop":
+        workspace.symlink_to(workspace.name)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            if operation == "export":
+                module.export_revision_evidence(
+                    checkout,
+                    source_sha,
+                    approved_ref,
+                    workspace=workspace,
+                )
+            else:
+                module.recompute_runtime_equivalence(
+                    checkout,
+                    donor_sha=source_sha,
+                    target_sha=source_sha,
+                    approved_remote_ref=approved_ref,
+                    workspace=workspace,
+                )
+
+
+def test_export_revision_evidence_removes_its_context_if_final_ref_check_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_provenance_module()
+    repository, source_sha, approved_ref = create_provenance_git_repository(tmp_path)
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+    context = tmp_path / "context"
+    real_export = module._export_revision_evidence_from_commit
+
+    def export_then_move_ref(*args: object, **kwargs: object) -> object:
+        result = real_export(*args, **kwargs)
+        run_test_git(repository, "update-ref", "-d", approved_ref)
+        return result
+
+    monkeypatch.setattr(
+        module,
+        "_export_revision_evidence_from_commit",
+        export_then_move_ref,
+    )
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            module.export_revision_evidence(
+                checkout,
+                source_sha,
+                approved_ref,
+                workspace=workspace,
+                extract_to=context,
+            )
+
+    assert not context.exists()
+    assert list(workspace.iterdir()) == []
+
+
+def test_recompute_runtime_equivalence_accepts_the_reviewed_real_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_provenance_module()
+    clone_parent = tmp_path / "clone-parent"
+    clone_parent.mkdir()
+    repository = tmp_path / "repository"
+    run_test_git(
+        clone_parent,
+        "clone",
+        "--shared",
+        str(PRODUCT_ROOT),
+        str(repository),
+    )
+    target_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    approved_ref = "refs/remotes/origin/approved"
+    run_test_git(repository, "update-ref", approved_ref, target_sha)
+    attacker_bin = tmp_path / "attacker-bin"
+    attacker_bin.mkdir()
+    marker = tmp_path / "attacker-git-ran"
+    fake_git = attacker_bin / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\nprintf attacked > '{marker}'\nexit 91\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{attacker_bin}:/usr/bin:/bin")
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "attacker.git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "attacker-tree"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.attributesFile")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(tmp_path / "attacker-attributes"))
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        evidence = module.recompute_runtime_equivalence(
+            checkout,
+            donor_sha="bf78fe34d120e305baa151a97fb351235a0d37c4",
+            target_sha=target_sha,
+            approved_remote_ref=approved_ref,
+            workspace=workspace,
+        )
+
+    assert evidence.donor.source_sha == ("bf78fe34d120e305baa151a97fb351235a0d37c4")
+    assert evidence.target.source_sha == target_sha
+    equivalence = evidence.runtime_equivalence
+    expected_components = {
+        "backend": "a270018406818c487bba6ef73a69852116f7d2cba25474d65660d73b1a8116c7",
+        "dockerignore": (
+            "3fa6f8405268fac4ca288ebc6288f2baf7e242fe1220b4e6aa3d47c267d22623"
+        ),
+        "frontend": "614988fc815418e919e4cab8615603701069804d2501329761118c60f5811419",
+        "scripts": "0acec4901754662ccd41f3afbf0e0914948398ef5b5a3d3e390a49dbe4053b1f",
+    }
+    expected_combined = (
+        "1968df4c02956a99e9e2328d7707a69988861efe1296317ad874e3a3cfa51d6a"
+    )
+    assert {
+        name: component.sha256
+        for name, component in evidence.donor.runtime_inventory.components.items()
+    } == expected_components
+    assert {
+        name: component.sha256
+        for name, component in evidence.target.runtime_inventory.components.items()
+    } == expected_components
+    assert evidence.donor.runtime_inventory.combined.sha256 == expected_combined
+    assert evidence.target.runtime_inventory.combined.sha256 == expected_combined
+    assert not marker.exists()
+    assert list(workspace.iterdir()) == []
+    assert equivalence.schema == 1
+    assert equivalence.policy == "runtime-copy-inputs-v1+pip-timeout-300-v1"
+    assert equivalence.donor_copy_inputs_sha256 == equivalence.target_copy_inputs_sha256
+    assert all(
+        pair.donor_sha256 == pair.target_sha256
+        for pair in equivalence.components.values()
+    )
+    assert equivalence.dockerfile_transition == module.DockerfileTransition(
+        policy="pip-timeout-300-v1",
+        from_sha256=(
+            "3315d609f482d6f76a3702ab328805efa8cd8b4692810047df912f89a640a42a"
+        ),
+        to_sha256=("35258f0647df1dd08e0da3a17749eb1b77a4b6086475c18e5c11a954c3c6a69d"),
+    )
+    with pytest.raises(FrozenInstanceError):
+        evidence.donor.source_sha = "0" * 40
+    with pytest.raises(TypeError):
+        evidence.donor.deployment_assets.sha256["attacker"] = "0" * 64
+    with pytest.raises(TypeError):
+        evidence.donor.runtime_inventory.components["backend"] = (
+            evidence.donor.runtime_inventory.components["frontend"]
+        )
+    with pytest.raises(TypeError):
+        equivalence.components["backend"] = equivalence.components["frontend"]
+
+
+def test_runtime_equivalence_rejects_a_digest_with_tampered_canonical_bytes() -> None:
+    module = load_provenance_module()
+    donor = make_policy_revision(
+        module,
+        "1" * 40,
+        dockerfile_mode="100644",
+        dockerfile_blob_sha="1d697b8fe13af6b0f787fe5639568b97aa3973de",
+        dockerfile_sha256=(
+            "3315d609f482d6f76a3702ab328805efa8cd8b4692810047df912f89a640a42a"
+        ),
+    )
+    target = make_policy_revision(
+        module,
+        "2" * 40,
+        dockerfile_mode="100644",
+        dockerfile_blob_sha="b0e67ee8e9ffbb1453cdc2a2bf4a0081510bfcaa",
+        dockerfile_sha256=(
+            "35258f0647df1dd08e0da3a17749eb1b77a4b6086475c18e5c11a954c3c6a69d"
+        ),
+    )
+    target_components = dict(target.runtime_inventory.components)
+    original = target_components["backend"]
+    target_components["backend"] = replace(
+        original,
+        canonical_bytes=b"tampered canonical bytes",
+    )
+    tampered_target = replace(
+        target,
+        runtime_inventory=replace(
+            target.runtime_inventory,
+            components=target_components,
+        ),
+    )
+
+    with pytest.raises(module.ProvenanceError):
+        module._runtime_equivalence_from_revisions(donor, tampered_target)
+
+
+def test_runtime_equivalence_rejects_malformed_nested_evidence_cleanly() -> None:
+    module = load_provenance_module()
+    donor = make_policy_revision(
+        module,
+        "1" * 40,
+        dockerfile_mode="100644",
+        dockerfile_blob_sha="1d697b8fe13af6b0f787fe5639568b97aa3973de",
+        dockerfile_sha256=(
+            "3315d609f482d6f76a3702ab328805efa8cd8b4692810047df912f89a640a42a"
+        ),
+    )
+    target = make_policy_revision(
+        module,
+        "2" * 40,
+        dockerfile_mode="100644",
+        dockerfile_blob_sha="b0e67ee8e9ffbb1453cdc2a2bf4a0081510bfcaa",
+        dockerfile_sha256=(
+            "35258f0647df1dd08e0da3a17749eb1b77a4b6086475c18e5c11a954c3c6a69d"
+        ),
+    )
+    malformed = replace(donor, runtime_inventory=object())
+
+    with pytest.raises(module.ProvenanceError):
+        module._runtime_equivalence_from_revisions(malformed, target)
+
+
+def test_runtime_equivalence_rejects_runtime_drift_and_every_other_recipe_pair() -> (
+    None
+):
+    module = load_provenance_module()
+    donor = make_policy_revision(
+        module,
+        "1" * 40,
+        dockerfile_mode="100644",
+        dockerfile_blob_sha="1d697b8fe13af6b0f787fe5639568b97aa3973de",
+        dockerfile_sha256=(
+            "3315d609f482d6f76a3702ab328805efa8cd8b4692810047df912f89a640a42a"
+        ),
+    )
+    target = make_policy_revision(
+        module,
+        "2" * 40,
+        dockerfile_mode="100644",
+        dockerfile_blob_sha="b0e67ee8e9ffbb1453cdc2a2bf4a0081510bfcaa",
+        dockerfile_sha256=(
+            "35258f0647df1dd08e0da3a17749eb1b77a4b6086475c18e5c11a954c3c6a69d"
+        ),
+    )
+
+    accepted = module._runtime_equivalence_from_revisions(donor, target)
+
+    assert accepted.donor_copy_inputs_sha256 == accepted.target_copy_inputs_sha256
+    drifted_target = make_policy_revision(
+        module,
+        "2" * 40,
+        dockerfile_mode="100644",
+        dockerfile_blob_sha="b0e67ee8e9ffbb1453cdc2a2bf4a0081510bfcaa",
+        dockerfile_sha256=(
+            "35258f0647df1dd08e0da3a17749eb1b77a4b6086475c18e5c11a954c3c6a69d"
+        ),
+        component_suffix=b"runtime drift",
+    )
+    donor_with_target_recipe = replace(
+        donor,
+        dockerfile_blob_sha="b0e67ee8e9ffbb1453cdc2a2bf4a0081510bfcaa",
+        dockerfile_sha256=(
+            "35258f0647df1dd08e0da3a17749eb1b77a4b6086475c18e5c11a954c3c6a69d"
+        ),
+    )
+    target_with_donor_recipe = replace(
+        target,
+        dockerfile_blob_sha="1d697b8fe13af6b0f787fe5639568b97aa3973de",
+        dockerfile_sha256=(
+            "3315d609f482d6f76a3702ab328805efa8cd8b4692810047df912f89a640a42a"
+        ),
+    )
+    third_recipe_donor = replace(
+        donor,
+        dockerfile_blob_sha="c" * 40,
+        dockerfile_sha256="d" * 64,
+    )
+    third_recipe_target = replace(
+        target,
+        dockerfile_blob_sha="e" * 40,
+        dockerfile_sha256="f" * 64,
+    )
+    rejected_pairs = (
+        (donor, drifted_target),
+        (donor, replace(target, dockerfile_mode="100755")),
+        (donor, replace(target, dockerfile_blob_sha="f" * 40)),
+        (donor, replace(target, dockerfile_sha256="f" * 64)),
+        (replace(donor, dockerfile_mode="100755"), target),
+        (replace(donor, dockerfile_blob_sha="e" * 40), target),
+        (replace(donor, dockerfile_sha256="e" * 64), target),
+        (donor_with_target_recipe, target),
+        (donor, target_with_donor_recipe),
+        (donor_with_target_recipe, target_with_donor_recipe),
+        (third_recipe_donor, third_recipe_target),
+    )
+    for candidate_donor, candidate_target in rejected_pairs:
+        with pytest.raises(module.ProvenanceError):
+            module._runtime_equivalence_from_revisions(
+                candidate_donor,
+                candidate_target,
+            )
+
+
+def test_recompute_runtime_equivalence_requires_strict_baseline_descent(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    clone_parent = tmp_path / "clone-parent"
+    clone_parent.mkdir()
+    repository = tmp_path / "repository"
+    run_test_git(
+        clone_parent,
+        "clone",
+        "--shared",
+        str(PRODUCT_ROOT),
+        str(repository),
+    )
+    baseline = "1a333c8a3ae5172f4b025e4543386debec826cbf"
+    approved_ref = "refs/remotes/origin/approved"
+    run_test_git(repository, "update-ref", approved_ref, baseline)
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            module.recompute_runtime_equivalence(
+                checkout,
+                donor_sha="bf78fe34d120e305baa151a97fb351235a0d37c4",
+                target_sha=baseline,
+                approved_remote_ref=approved_ref,
+                workspace=workspace,
+            )
+
+
+def test_recompute_runtime_equivalence_rejects_unapproved_ancestry_shapes(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    clone_parent = tmp_path / "clone-parent"
+    clone_parent.mkdir()
+    repository = tmp_path / "repository"
+    run_test_git(
+        clone_parent,
+        "clone",
+        "--shared",
+        str(PRODUCT_ROOT),
+        str(repository),
+    )
+    run_test_git(repository, "config", "user.name", "Provenance Test")
+    run_test_git(repository, "config", "user.email", TEST_NOREPLY_EMAIL)
+    target_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    baseline = "1a333c8a3ae5172f4b025e4543386debec826cbf"
+    before_baseline = (
+        run_test_git(repository, "rev-parse", f"{baseline}^")
+        .decode("ascii")
+        .removesuffix("\n")
+    )
+    tree_object = (
+        run_test_git(repository, "rev-parse", f"{target_sha}^{{tree}}")
+        .decode("ascii")
+        .removesuffix("\n")
+    )
+    sibling = (
+        run_test_git(repository, "commit-tree", tree_object, "-m", "sibling")
+        .decode("ascii")
+        .removesuffix("\n")
+    )
+    noncommit = (
+        run_test_git(repository, "rev-parse", f"{target_sha}:.dockerignore")
+        .decode("ascii")
+        .removesuffix("\n")
+    )
+    donor = "bf78fe34d120e305baa151a97fb351235a0d37c4"
+    approved_ref = "refs/remotes/origin/approved"
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+    cases = (
+        ("0" * 40, target_sha),
+        (noncommit, target_sha),
+        (target_sha, target_sha),
+        (sibling, target_sha),
+        (donor, before_baseline),
+        (donor, sibling),
+    )
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        for candidate_donor, candidate_target in cases:
+            run_test_git(repository, "update-ref", approved_ref, candidate_target)
+            with pytest.raises(module.ProvenanceError):
+                module.recompute_runtime_equivalence(
+                    checkout,
+                    donor_sha=candidate_donor,
+                    target_sha=candidate_target,
+                    approved_remote_ref=approved_ref,
+                    workspace=workspace,
+                )
+            assert list(workspace.iterdir()) == []
+
+
+def test_recompute_runtime_equivalence_ignores_legacy_grafts(
+    tmp_path: Path,
+) -> None:
+    module = load_provenance_module()
+    clone_parent = tmp_path / "clone-parent"
+    clone_parent.mkdir()
+    repository = tmp_path / "repository"
+    run_test_git(
+        clone_parent,
+        "clone",
+        "--shared",
+        str(PRODUCT_ROOT),
+        str(repository),
+    )
+    run_test_git(repository, "config", "user.name", "Provenance Test")
+    run_test_git(repository, "config", "user.email", TEST_NOREPLY_EMAIL)
+    tree_object = (
+        run_test_git(repository, "rev-parse", "HEAD^{tree}")
+        .decode("ascii")
+        .removesuffix("\n")
+    )
+    unrelated_target = (
+        run_test_git(repository, "commit-tree", tree_object, "-m", "unrelated target")
+        .decode("ascii")
+        .removesuffix("\n")
+    )
+    donor = "bf78fe34d120e305baa151a97fb351235a0d37c4"
+    baseline = "1a333c8a3ae5172f4b025e4543386debec826cbf"
+    (repository / ".git" / "info" / "grafts").write_text(
+        f"{unrelated_target} {donor} {baseline}\n",
+        encoding="ascii",
+    )
+    approved_ref = "refs/remotes/origin/approved"
+    run_test_git(repository, "update-ref", approved_ref, unrelated_target)
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            module.recompute_runtime_equivalence(
+                checkout,
+                donor_sha=donor,
+                target_sha=unrelated_target,
+                approved_remote_ref=approved_ref,
+                workspace=workspace,
+            )
+
+    assert list(workspace.iterdir()) == []
+
+
+def test_recompute_runtime_equivalence_rejects_final_approved_ref_movement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_provenance_module()
+    clone_parent = tmp_path / "clone-parent"
+    clone_parent.mkdir()
+    repository = tmp_path / "repository"
+    run_test_git(
+        clone_parent,
+        "clone",
+        "--shared",
+        str(PRODUCT_ROOT),
+        str(repository),
+    )
+    target_sha = (
+        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
+    )
+    approved_ref = "refs/remotes/origin/approved"
+    run_test_git(repository, "update-ref", approved_ref, target_sha)
+    workspace = tmp_path / "git-workspace"
+    workspace.mkdir(mode=0o700)
+    real_export = module.export_revision_evidence
+
+    def export_then_move_ref(*args: object, **kwargs: object) -> object:
+        result = real_export(*args, **kwargs)
+        run_test_git(
+            repository,
+            "update-ref",
+            approved_ref,
+            "1a333c8a3ae5172f4b025e4543386debec826cbf",
+        )
+        return result
+
+    monkeypatch.setattr(module, "export_revision_evidence", export_then_move_ref)
+
+    with module.open_canonical_checkout_root(repository.resolve()) as checkout:
+        with pytest.raises(module.ProvenanceError):
+            module.recompute_runtime_equivalence(
+                checkout,
+                donor_sha="bf78fe34d120e305baa151a97fb351235a0d37c4",
+                target_sha=target_sha,
+                approved_remote_ref=approved_ref,
+                workspace=workspace,
+            )
+
+    assert list(workspace.iterdir()) == []
 
 
 @pytest.mark.parametrize("entrypoint", ENTRYPOINTS, ids=lambda path: path.name)

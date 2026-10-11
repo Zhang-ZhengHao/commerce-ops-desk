@@ -83,11 +83,34 @@ def _create_repository(tmp_path: Path) -> tuple[Path, str]:
         encoding="utf-8",
     )
     (repository / "tracked.txt").write_text("approved bytes\n", encoding="utf-8")
+    (repository / ".dockerignore").write_text(".git\n", encoding="utf-8")
+    runtime_files = {
+        "backend/requirements.lock": "locked-backend==1.0\n",
+        "backend/app/main.py": "print('approved runtime')\n",
+        "frontend/package.json": '{"scripts":{"build":"true"}}\n',
+        "frontend/package-lock.json": '{"lockfileVersion":3}\n',
+        "scripts/start-hosted.sh": "#!/bin/sh\nexec true\n",
+    }
+    for relative_path, content in runtime_files.items():
+        runtime_path = repository / relative_path
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.write_text(content, encoding="utf-8")
+    (repository / "scripts" / "start-hosted.sh").chmod(0o755)
     for relative_path, content in DEPLOYMENT_ASSET_CONTENTS.items():
         asset = repository / relative_path
         asset.parent.mkdir(parents=True, exist_ok=True)
         asset.write_text(content, encoding="utf-8")
-    _git(repository, "add", "Dockerfile", "tracked.txt", "deploy")
+    _git(
+        repository,
+        "add",
+        ".dockerignore",
+        "Dockerfile",
+        "backend",
+        "deploy",
+        "frontend",
+        "scripts",
+        "tracked.txt",
+    )
     _git(repository, "commit", "--message", "approved source")
     source_sha = _git(repository, "rev-parse", "HEAD")
     _git(repository, "update-ref", APPROVED_REF, source_sha)
@@ -254,6 +277,25 @@ def test_dirty_worktree_builds_the_approved_committed_bytes(tmp_path: Path) -> N
     payload = json.loads(capture.read_text(encoding="utf-8"))
     assert payload["tracked"] == "approved bytes\n"
     assert not Path(payload["context"]).exists()
+
+
+def test_builder_uses_fixed_git_binary_despite_hostile_path(tmp_path: Path) -> None:
+    repository, source_sha = _create_repository(tmp_path)
+    capture = tmp_path / "capture.json"
+    environment = _tool_environment(tmp_path, source_sha, capture)
+    fake_directory = Path(environment["FAKE_DOCKER_BINARY"]).parent
+    marker = tmp_path / "attacker-git-ran"
+    fake_git = fake_directory / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\nprintf attacked > '{marker}'\nexit 90\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+
+    result = _build(repository, source_sha, environment)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not marker.exists()
 
 
 def test_replace_ref_cannot_substitute_the_approved_commit_tree(
