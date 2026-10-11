@@ -42,6 +42,15 @@ LEGACY_MANIFEST_FIELDS = frozenset(
 SCHEMA3_MANIFEST_FIELDS = LEGACY_MANIFEST_FIELDS | {"build"}
 SOURCE_BUILD_FIELDS = frozenset({"kind", "schema"})
 REUSE_BUILD_FIELDS = frozenset({"kind", "reused_from", "runtime_equivalence", "schema"})
+CANDIDATE_SOURCE_PROVENANCE_FIELDS = frozenset(
+    {
+        "kind",
+        "schema",
+        "source_manifest_schema",
+        "source_manifest_sha256",
+    }
+)
+CANDIDATE_REUSE_PROVENANCE_FIELDS = REUSE_BUILD_FIELDS | {"source_manifest_sha256"}
 REUSED_FROM_FIELDS = frozenset(
     {"image_id", "image_reference", "manifest_sha256", "source_sha"}
 )
@@ -80,6 +89,12 @@ MANIFEST_NAME_PATTERN = re.compile(r"build-([0-9a-f]{40})\.json\Z")
 RUNTIME_EQUIVALENCE_POLICY = "runtime-copy-inputs-v1+pip-timeout-300-v1"
 RUNTIME_COPY_INPUTS_POLICY = "runtime-copy-inputs-v1"
 DOCKERFILE_TRANSITION_POLICY = "pip-timeout-300-v1"
+CANDIDATE_BUILD_PROVENANCE_DOMAIN = b"commerce-ops-desk:candidate-build-provenance:v1\0"
+RESERVED_PROVENANCE_LABEL_PREFIX = "io.github.zhang-zhenghao.commerce-ops."
+BUILD_KIND_LABEL = f"{RESERVED_PROVENANCE_LABEL_PREFIX}build-kind"
+REUSED_FROM_SOURCE_LABEL = f"{RESERVED_PROVENANCE_LABEL_PREFIX}reused-from-source"
+REUSED_FROM_IMAGE_ID_LABEL = f"{RESERVED_PROVENANCE_LABEL_PREFIX}reused-from-image-id"
+RUNTIME_INPUTS_SHA256_LABEL = f"{RESERVED_PROVENANCE_LABEL_PREFIX}runtime-inputs-sha256"
 DONOR_DOCKERFILE_SHA256 = (
     "3315d609f482d6f76a3702ab328805efa8cd8b4692810047df912f89a640a42a"
 )
@@ -1732,6 +1747,28 @@ class LoadedBuildManifest:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateSourceBuildProvenance:
+    schema: int
+    kind: str
+    source_manifest_schema: int
+    source_manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateReuseBuildProvenance:
+    schema: int
+    kind: str
+    source_manifest_sha256: str
+    reused_from: ReusedFrom
+    runtime_equivalence: RuntimeEquivalence
+
+
+CandidateBuildProvenance = (
+    CandidateSourceBuildProvenance | CandidateReuseBuildProvenance
+)
+
+
+@dataclass(frozen=True, slots=True)
 class PublishedManifest:
     source_sha: str
     canonical_bytes: bytes
@@ -3017,7 +3054,7 @@ def _validate_manifest_identity(payload: Mapping[str, object]) -> None:
 def _parse_reuse_build(
     value: Mapping[str, object],
     *,
-    target_source_sha: str,
+    target_source_sha: str | None,
 ) -> VerifiedRuntimeReuse:
     try:
         reused_value = value["reused_from"]
@@ -3046,7 +3083,7 @@ def _parse_reuse_build(
         if (
             not isinstance(donor_source_sha, str)
             or SOURCE_SHA_PATTERN.fullmatch(donor_source_sha) is None
-            or donor_source_sha == target_source_sha
+            or (target_source_sha is not None and donor_source_sha == target_source_sha)
             or donor_image_reference != f"commerce-ops-desk:{donor_source_sha}"
             or not isinstance(donor_image_id, str)
             or IMAGE_ID_PATTERN.fullmatch(donor_image_id) is None
@@ -3167,6 +3204,11 @@ def parse_build_manifest_bytes(raw: bytes) -> LoadedBuildManifest:
         else:
             raise ProvenanceError("build manifest schema is invalid")
     _validate_manifest_identity(payload)
+    if (
+        isinstance(build_identity, VerifiedRuntimeReuse)
+        and build_identity.reused_from.image_id == payload["image_id"]
+    ):
+        raise ProvenanceError("build manifest identity is invalid")
     try:
         deployment_assets = _parse_deployment_assets(payload["deployment_assets"])
     except (KeyError, TypeError, ValueError):
@@ -3188,6 +3230,298 @@ def parse_build_manifest_bytes(raw: bytes) -> LoadedBuildManifest:
         )
     except (KeyError, TypeError, ValueError):
         raise ProvenanceError("build manifest schema is invalid") from None
+
+
+def _reused_from_payload(value: ReusedFrom) -> dict[str, object]:
+    if not isinstance(value, ReusedFrom):
+        raise ProvenanceError("candidate build provenance is invalid")
+    return {
+        "source_sha": value.source_sha,
+        "image_reference": value.image_reference,
+        "image_id": value.image_id,
+        "manifest_sha256": value.manifest_sha256,
+    }
+
+
+def _snapshot_mapping(value: object, *, error: str) -> dict[object, object]:
+    if not isinstance(value, Mapping):
+        raise ProvenanceError(error)
+    try:
+        return dict(value.items())
+    except Exception:  # noqa: BLE001 - custom Mapping methods may raise anything.
+        raise ProvenanceError(error) from None
+
+
+def _runtime_equivalence_payload(value: RuntimeEquivalence) -> dict[str, object]:
+    if not isinstance(value, RuntimeEquivalence):
+        raise ProvenanceError("candidate build provenance is invalid")
+    components_value = _snapshot_mapping(
+        value.components,
+        error="candidate build provenance is invalid",
+    )
+    if set(components_value) != RUNTIME_COMPONENTS or not isinstance(
+        value.dockerfile_transition, DockerfileTransition
+    ):
+        raise ProvenanceError("candidate build provenance is invalid")
+    components: dict[str, object] = {}
+    for name in sorted(RUNTIME_COMPONENTS):
+        pair = components_value[name]
+        if not isinstance(pair, DigestPair):
+            raise ProvenanceError("candidate build provenance is invalid")
+        components[name] = {
+            "donor_sha256": pair.donor_sha256,
+            "target_sha256": pair.target_sha256,
+        }
+    return {
+        "schema": value.schema,
+        "policy": value.policy,
+        "donor_copy_inputs_sha256": value.donor_copy_inputs_sha256,
+        "target_copy_inputs_sha256": value.target_copy_inputs_sha256,
+        "components": components,
+        "dockerfile_transition": {
+            "policy": value.dockerfile_transition.policy,
+            "from_sha256": value.dockerfile_transition.from_sha256,
+            "to_sha256": value.dockerfile_transition.to_sha256,
+        },
+    }
+
+
+def _candidate_build_provenance_payload_unchecked(
+    value: CandidateBuildProvenance,
+) -> dict[str, object]:
+    if isinstance(value, CandidateSourceBuildProvenance):
+        return {
+            "schema": value.schema,
+            "kind": value.kind,
+            "source_manifest_schema": value.source_manifest_schema,
+            "source_manifest_sha256": value.source_manifest_sha256,
+        }
+    if isinstance(value, CandidateReuseBuildProvenance):
+        return {
+            "schema": value.schema,
+            "kind": value.kind,
+            "source_manifest_sha256": value.source_manifest_sha256,
+            "reused_from": _reused_from_payload(value.reused_from),
+            "runtime_equivalence": _runtime_equivalence_payload(
+                value.runtime_equivalence
+            ),
+        }
+    raise ProvenanceError("candidate build provenance is invalid")
+
+
+def parse_candidate_build_provenance(value: object) -> CandidateBuildProvenance:
+    """Parse one exact candidate-state provenance arm into an immutable value."""
+
+    if not isinstance(value, dict):
+        raise ProvenanceError("candidate build provenance is invalid")
+    try:
+        kind = value.get("kind")
+        if kind == "source-build":
+            if set(value) != CANDIDATE_SOURCE_PROVENANCE_FIELDS:
+                raise ProvenanceError("candidate build provenance is invalid")
+            schema = value.get("schema")
+            manifest_schema = value.get("source_manifest_schema")
+            manifest_sha256 = value.get("source_manifest_sha256")
+            if (
+                type(schema) is not int
+                or schema != 1
+                or type(manifest_schema) is not int
+                or manifest_schema not in (2, 3)
+                or not isinstance(manifest_sha256, str)
+                or SHA256_PATTERN.fullmatch(manifest_sha256) is None
+            ):
+                raise ProvenanceError("candidate build provenance is invalid")
+            return CandidateSourceBuildProvenance(
+                schema=schema,
+                kind="source-build",
+                source_manifest_schema=manifest_schema,
+                source_manifest_sha256=manifest_sha256,
+            )
+        if kind == "verified-runtime-reuse":
+            if set(value) != CANDIDATE_REUSE_PROVENANCE_FIELDS:
+                raise ProvenanceError("candidate build provenance is invalid")
+            manifest_sha256 = value.get("source_manifest_sha256")
+            if (
+                not isinstance(manifest_sha256, str)
+                or SHA256_PATTERN.fullmatch(manifest_sha256) is None
+            ):
+                raise ProvenanceError("candidate build provenance is invalid")
+            build_payload = dict(value)
+            del build_payload["source_manifest_sha256"]
+            try:
+                build = _parse_reuse_build(
+                    build_payload,
+                    target_source_sha=None,
+                )
+            except ProvenanceError:
+                raise ProvenanceError("candidate build provenance is invalid") from None
+            return CandidateReuseBuildProvenance(
+                schema=build.schema,
+                kind=build.kind,
+                source_manifest_sha256=manifest_sha256,
+                reused_from=build.reused_from,
+                runtime_equivalence=build.runtime_equivalence,
+            )
+    except ProvenanceError:
+        raise
+    except (KeyError, TypeError, ValueError):
+        pass
+    raise ProvenanceError("candidate build provenance is invalid")
+
+
+def _require_loaded_build_manifest(value: object) -> LoadedBuildManifest:
+    """Rebind a typed manifest value to its exact validated raw bytes."""
+
+    if not isinstance(value, LoadedBuildManifest):
+        raise ProvenanceError("loaded build manifest is invalid")
+    try:
+        reparsed = parse_build_manifest_bytes(value.raw_bytes)
+    except ProvenanceError:
+        raise ProvenanceError("loaded build manifest is invalid") from None
+    if reparsed != value:
+        raise ProvenanceError("loaded build manifest is invalid")
+    return reparsed
+
+
+def candidate_build_provenance(
+    manifest: LoadedBuildManifest,
+) -> CandidateBuildProvenance:
+    """Derive candidate provenance only from one strictly loaded manifest."""
+
+    try:
+        manifest = _require_loaded_build_manifest(manifest)
+    except ProvenanceError:
+        raise ProvenanceError(
+            "candidate build provenance requires a loaded manifest"
+        ) from None
+    if isinstance(manifest.build, SourceBuild):
+        value: CandidateBuildProvenance = CandidateSourceBuildProvenance(
+            schema=1,
+            kind="source-build",
+            source_manifest_schema=manifest.schema,
+            source_manifest_sha256=manifest.raw_sha256,
+        )
+    elif isinstance(manifest.build, VerifiedRuntimeReuse):
+        value = CandidateReuseBuildProvenance(
+            schema=manifest.build.schema,
+            kind=manifest.build.kind,
+            source_manifest_sha256=manifest.raw_sha256,
+            reused_from=manifest.build.reused_from,
+            runtime_equivalence=manifest.build.runtime_equivalence,
+        )
+    else:  # pragma: no cover - LoadedBuildManifest constructor invariant.
+        raise ProvenanceError("candidate build provenance is invalid")
+    return parse_candidate_build_provenance(
+        _candidate_build_provenance_payload_unchecked(value)
+    )
+
+
+def candidate_build_provenance_payload(
+    value: CandidateBuildProvenance,
+) -> dict[str, object]:
+    """Return the exact JSON-native representation of typed provenance."""
+
+    payload = _candidate_build_provenance_payload_unchecked(value)
+    if parse_candidate_build_provenance(payload) != value:
+        raise ProvenanceError("candidate build provenance is invalid")
+    return payload
+
+
+def candidate_build_provenance_digest(
+    value: CandidateBuildProvenance,
+) -> CanonicalDigest:
+    """Canonicalize and hash candidate provenance with its fixed domain."""
+
+    canonical = canonical_json_bytes(candidate_build_provenance_payload(value))
+    return CanonicalDigest(
+        canonical_bytes=canonical,
+        sha256=length_framed_sha256(
+            CANDIDATE_BUILD_PROVENANCE_DOMAIN,
+            canonical,
+        ),
+    )
+
+
+def expected_reserved_provenance_labels(
+    manifest: LoadedBuildManifest,
+) -> Mapping[str, str]:
+    """Return the complete reserved label set for one manifest arm."""
+
+    try:
+        manifest = _require_loaded_build_manifest(manifest)
+    except ProvenanceError:
+        raise ProvenanceError("provenance label manifest is invalid")
+    if isinstance(manifest.build, SourceBuild):
+        expected = {} if manifest.schema == 2 else {BUILD_KIND_LABEL: "source-build"}
+    elif isinstance(manifest.build, VerifiedRuntimeReuse):
+        expected = {
+            BUILD_KIND_LABEL: "verified-runtime-reuse",
+            REUSED_FROM_SOURCE_LABEL: manifest.build.reused_from.source_sha,
+            REUSED_FROM_IMAGE_ID_LABEL: manifest.build.reused_from.image_id,
+            RUNTIME_INPUTS_SHA256_LABEL: (
+                manifest.build.runtime_equivalence.target_copy_inputs_sha256
+            ),
+        }
+    else:  # pragma: no cover - LoadedBuildManifest constructor invariant.
+        raise ProvenanceError("provenance label manifest is invalid")
+    return MappingProxyType(expected)
+
+
+def validate_reserved_provenance_labels(
+    manifest: LoadedBuildManifest,
+    labels: object,
+) -> None:
+    """Require the exact schema-specific subset of reserved image labels."""
+
+    label_values = _snapshot_mapping(labels, error="provenance labels are invalid")
+    if any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in label_values.items()
+    ):
+        raise ProvenanceError("provenance labels are invalid") from None
+    validated_labels = cast(dict[str, str], label_values)
+    reserved = {
+        key: value
+        for key, value in validated_labels.items()
+        if key.startswith(RESERVED_PROVENANCE_LABEL_PREFIX)
+    }
+    if reserved != dict(expected_reserved_provenance_labels(manifest)):
+        raise ProvenanceError("provenance labels do not match the build manifest")
+
+
+def validate_candidate_manifest_chain(
+    target: LoadedBuildManifest,
+    donor: LoadedBuildManifest | None,
+) -> None:
+    """Bind a target arm to no donor or to its exact source-build donor."""
+
+    try:
+        target = _require_loaded_build_manifest(target)
+    except ProvenanceError:
+        raise ProvenanceError("candidate manifest chain is invalid")
+    if isinstance(target.build, SourceBuild):
+        if donor is not None:
+            raise ProvenanceError("source build must not have a donor manifest")
+        return
+    if not isinstance(target.build, VerifiedRuntimeReuse):
+        raise ProvenanceError("candidate manifest chain is invalid")
+    try:
+        donor = _require_loaded_build_manifest(donor)
+    except ProvenanceError:
+        raise ProvenanceError(
+            "reuse requires one source-build donor manifest"
+        ) from None
+    if not isinstance(donor.build, SourceBuild):
+        raise ProvenanceError("reuse requires one source-build donor manifest")
+    reused = target.build.reused_from
+    if (
+        donor.source_sha != reused.source_sha
+        or donor.image_reference != reused.image_reference
+        or donor.image_id != reused.image_id
+        or donor.raw_sha256 != reused.manifest_sha256
+        or donor.docker_daemon_id != target.docker_daemon_id
+    ):
+        raise ProvenanceError("donor manifest does not match reuse provenance")
 
 
 def _fsync_retry(descriptor: int) -> None:

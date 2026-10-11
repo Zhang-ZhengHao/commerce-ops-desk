@@ -620,6 +620,7 @@ if fence_bytes != (fence_token + "\\n").encode("ascii"):
     raise SystemExit("Caddy mutation fence token changed")
 """
 SOURCE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
+CANDIDATE_STATE_NAME_PATTERN = re.compile(r"candidate-([0-9a-f]{12})\.json\Z")
 IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 CONTAINER_ID_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 TRANSACTION_ID_PATTERN = re.compile(r"(?P<transaction_id>\d{8}T\d{6}Z-[0-9a-f]{32})\Z")
@@ -630,7 +631,7 @@ BACKUP_NAME_PATTERN = re.compile(
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 COMPOSE_SERVICE = "commerce-ops-desk"
 BUILD_MANIFEST_SCHEMA = 2
-CANDIDATE_STATE_SCHEMA = 2
+CANDIDATE_STATE_SCHEMA = 3
 DEPLOYMENT_ASSET_SCHEMA = 1
 DEPLOYMENT_ASSET_PATHS = (
     "deploy/workstation/compose.yaml",
@@ -3981,7 +3982,7 @@ def quarantine_candidate_inputs(
                 os.close(app_root_fd)
 
 
-def _read_private_text(path: Path, *, directory: Path, label: str) -> str:
+def _read_private_bytes(path: Path, *, directory: Path, label: str) -> bytes:
     private_directory = _validate_private_directory(
         directory, label=f"{label} directory"
     )
@@ -4003,8 +4004,8 @@ def _read_private_text(path: Path, *, directory: Path, label: str) -> str:
     if metadata.st_nlink != 1:
         raise DeploymentError(f"{label} must have exactly one hard link")
     try:
-        return resolved.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        return resolved.read_bytes()
+    except OSError:
         raise DeploymentError(f"{label} could not be read safely") from None
 
 
@@ -4149,49 +4150,26 @@ def _deployment_asset_identity_payload(
     }
 
 
-def _load_build_manifest(path: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(
-            _read_private_text(
-                path,
-                directory=STATE_DIRECTORY,
-                label="verified build manifest",
-            )
-        )
-    except json.JSONDecodeError:
-        raise DeploymentError("verified build manifest is invalid") from None
-    expected_fields = {
-        "approved_remote_ref",
-        "deployment_assets",
-        "docker_daemon_id",
-        "image_id",
-        "image_reference",
-        "schema",
-        "source_sha",
-    }
-    if not isinstance(payload, dict) or set(payload) != expected_fields:
-        raise DeploymentError("verified build manifest schema is invalid")
-    if (
-        type(payload.get("schema")) is not int
-        or payload["schema"] != BUILD_MANIFEST_SCHEMA
-    ):
-        raise DeploymentError("verified build manifest schema is unsupported")
-    source_sha = payload.get("source_sha")
-    if not isinstance(source_sha, str):
-        raise DeploymentError("verified build manifest is missing SOURCE_SHA")
-    identity = candidate_identity(source_sha)
-    if payload.get("image_reference") != identity.image:
-        raise DeploymentError("verified build manifest has an invalid image reference")
-    image_id = payload.get("image_id")
-    if not isinstance(image_id, str) or IMAGE_ID_PATTERN.fullmatch(image_id) is None:
-        raise DeploymentError("verified build manifest has an invalid image ID")
-    _validate_manifest_remote_ref(payload.get("approved_remote_ref"))
-    _validate_deployment_assets(payload.get("deployment_assets"))
-    _validate_docker_daemon_id(
-        payload.get("docker_daemon_id"),
+def _load_build_manifest(path: Path) -> Any:
+    raw = _read_private_bytes(
+        path,
+        directory=STATE_DIRECTORY,
         label="verified build manifest",
     )
-    return cast(dict[str, Any], payload)
+    try:
+        return _PROVENANCE.parse_build_manifest_bytes(raw)
+    except _PROVENANCE.ProvenanceError:
+        raise DeploymentError("verified build manifest is invalid") from None
+
+
+def _typed_deployment_asset_payload(manifest: Any) -> dict[str, object]:
+    if not isinstance(manifest, _PROVENANCE.LoadedBuildManifest):
+        raise DeploymentError("verified build manifest is invalid")
+    assets = manifest.deployment_assets
+    return {
+        "schema": assets.schema,
+        "sha256": dict(assets.sha256),
+    }
 
 
 def _write_private_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -4348,7 +4326,9 @@ def _write_private_json(path: Path, payload: Mapping[str, object]) -> None:
 
 def prepare_candidate(arguments: argparse.Namespace, runner: CommandRunner) -> Path:
     build_manifest = _load_build_manifest(Path(arguments.build_manifest))
-    identity = candidate_identity(cast(str, build_manifest["source_sha"]))
+    if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
+        raise DeploymentError("verified build manifest is invalid")
+    identity = candidate_identity(build_manifest.source_sha)
     with _candidate_prepare_lock(identity.source_sha):
         return _prepare_candidate_locked(
             arguments,
@@ -4362,11 +4342,20 @@ def _prepare_candidate_locked(
     arguments: argparse.Namespace,
     runner: CommandRunner,
     *,
-    build_manifest: Mapping[str, Any],
+    build_manifest: Any,
     identity: CandidateIdentity,
 ) -> Path:
+    if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
+        raise DeploymentError("verified build manifest is invalid")
+    build_provenance = _PROVENANCE.candidate_build_provenance(build_manifest)
+    build_provenance_payload = _PROVENANCE.candidate_build_provenance_payload(
+        build_provenance
+    )
+    build_provenance_digest = _PROVENANCE.candidate_build_provenance_digest(
+        build_provenance
+    )
     deployment_assets = _load_verified_deployment_assets(
-        build_manifest["deployment_assets"]
+        _typed_deployment_asset_payload(build_manifest)
     )
     port = validate_candidate_port(arguments.candidate_port)
     requested_candidate = _candidate_data_path_for_creation(
@@ -4403,9 +4392,9 @@ def _prepare_candidate_locked(
         label="candidate data directory",
     )
     _assert_initial_candidate_data(runner, candidate, candidate_data_identity)
-    docker_daemon_id = cast(str, build_manifest["docker_daemon_id"])
+    docker_daemon_id = build_manifest.docker_daemon_id
     _assert_local_docker_daemon(runner, docker_daemon_id)
-    expected_image_id = cast(str, build_manifest["image_id"])
+    expected_image_id = build_manifest.image_id
     _assert_image_revision(
         runner,
         identity,
@@ -4511,7 +4500,7 @@ def _prepare_candidate_locked(
     )
     _assert_local_docker_daemon(runner, docker_daemon_id)
 
-    _write_private_json(
+    _write_candidate_state(
         state_path,
         {
             "schema": CANDIDATE_STATE_SCHEMA,
@@ -4535,21 +4524,23 @@ def _prepare_candidate_locked(
             "runtime_sha256": runtime_sha256,
             "trusted_proxy_cidrs": json.loads(trusted_proxy_json),
             "deployment_assets": _deployment_asset_identity_payload(deployment_assets),
+            "build_provenance": build_provenance_payload,
+            "build_provenance_sha256": build_provenance_digest.sha256,
         },
     )
     return state_path
 
 
-def _load_candidate_state(path: Path) -> dict[str, Any]:
+def _parse_candidate_state_bytes(
+    raw: bytes,
+    *,
+    filename: str,
+) -> dict[str, Any]:
+    """Strictly parse one schema-3 candidate state without performing I/O."""
+
     try:
-        payload = json.loads(
-            _read_private_text(
-                path,
-                directory=STATE_DIRECTORY,
-                label="candidate state file",
-            )
-        )
-    except json.JSONDecodeError:
+        payload = _PROVENANCE.strict_json_loads(raw)
+    except _PROVENANCE.ProvenanceError:
         raise DeploymentError("candidate state file is invalid") from None
     expected_fields = {
         "schema",
@@ -4573,6 +4564,8 @@ def _load_candidate_state(path: Path) -> dict[str, Any]:
         "runtime_sha256",
         "trusted_proxy_cidrs",
         "deployment_assets",
+        "build_provenance",
+        "build_provenance_sha256",
     }
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise DeploymentError("candidate state schema is invalid")
@@ -4585,6 +4578,13 @@ def _load_candidate_state(path: Path) -> dict[str, Any]:
     if not isinstance(source_sha, str):
         raise DeploymentError("candidate state is missing SOURCE_SHA")
     identity = candidate_identity(source_sha)
+    filename_match = (
+        CANDIDATE_STATE_NAME_PATTERN.fullmatch(filename)
+        if isinstance(filename, str)
+        else None
+    )
+    if filename_match is None or filename_match.group(1) != source_sha[:12]:
+        raise DeploymentError("candidate state filename is invalid")
     expected = {
         "project_name": identity.project_name,
         "container_name": identity.container_name,
@@ -4651,7 +4651,61 @@ def _load_candidate_state(path: Path) -> dict[str, Any]:
     trusted_proxy_cidrs = payload.get("trusted_proxy_cidrs")
     if not isinstance(trusted_proxy_cidrs, list) or len(trusted_proxy_cidrs) != 1:
         raise DeploymentError("candidate state has invalid trusted proxy CIDRs")
+    try:
+        provenance = _PROVENANCE.parse_candidate_build_provenance(
+            payload.get("build_provenance")
+        )
+        provenance_digest = _PROVENANCE.candidate_build_provenance_digest(provenance)
+    except _PROVENANCE.ProvenanceError:
+        raise DeploymentError("candidate state build provenance is invalid") from None
+    persisted_digest = payload.get("build_provenance_sha256")
+    if (
+        not isinstance(persisted_digest, str)
+        or SHA256_PATTERN.fullmatch(persisted_digest) is None
+        or persisted_digest != provenance_digest.sha256
+    ):
+        raise DeploymentError("candidate state build provenance digest is invalid")
+    if isinstance(provenance, _PROVENANCE.CandidateReuseBuildProvenance) and (
+        provenance.reused_from.source_sha == source_sha
+        or provenance.reused_from.image_id == image_id
+    ):
+        raise DeploymentError("candidate state build provenance is invalid")
     return cast(dict[str, Any], payload)
+
+
+def _write_candidate_state(
+    path: Path,
+    payload: Mapping[str, object],
+) -> None:
+    """Validate candidate semantics before invoking durable private I/O."""
+
+    try:
+        raw = (
+            json.dumps(
+                payload,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (OverflowError, RecursionError, TypeError, ValueError):
+        raise DeploymentError("candidate state is not serializable") from None
+    validated = _parse_candidate_state_bytes(raw, filename=path.name)
+    _write_private_json(path, validated)
+
+
+def _load_candidate_state(path: Path) -> dict[str, Any]:
+    raw = _read_private_bytes(
+        path,
+        directory=STATE_DIRECTORY,
+        label="candidate state file",
+    )
+    return _parse_candidate_state_bytes(
+        raw,
+        filename=path.name,
+    )
 
 
 def _assert_state_candidate_ready(

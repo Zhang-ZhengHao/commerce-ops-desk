@@ -48,6 +48,7 @@ DEPLOYMENT_ASSET_PATHS = (
     "deploy/workstation/commerce-ops-desk.Caddyfile.template",
     "deploy/workstation/commerce-ops-desk.v0.2.0.Caddyfile.template",
 )
+CANDIDATE_PROVENANCE_DOMAIN = b"commerce-ops-desk:candidate-build-provenance:v1\0"
 
 
 def create_candidate_prepare_lock(app_root: Path) -> Path:
@@ -172,6 +173,29 @@ def deployment_asset_payload(root: Path = PRODUCT_ROOT) -> dict[str, object]:
     }
 
 
+def legacy_build_manifest_payload(root: Path = PRODUCT_ROOT) -> dict[str, object]:
+    return {
+        "approved_remote_ref": "refs/remotes/origin/main",
+        "deployment_assets": deployment_asset_payload(root),
+        "docker_daemon_id": DOCKER_DAEMON_ID,
+        "image_id": "sha256:" + "1" * 64,
+        "image_reference": f"commerce-ops-desk:{VALID_SHA}",
+        "schema": 2,
+        "source_sha": VALID_SHA,
+    }
+
+
+def loaded_legacy_build_manifest(
+    module: ModuleType,
+    root: Path = PRODUCT_ROOT,
+) -> object:
+    raw = json.dumps(
+        legacy_build_manifest_payload(root),
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return module._PROVENANCE.parse_build_manifest_bytes(raw)
+
+
 def write_deployment_assets(root: Path) -> dict[str, str]:
     contents = {
         DEPLOYMENT_ASSET_PATHS[0]: "services:\n  commerce-ops-desk:\n    image: demo\n",
@@ -193,6 +217,28 @@ def write_deployment_assets(root: Path) -> dict[str, str]:
     return contents
 
 
+def legacy_source_candidate_provenance() -> tuple[dict[str, object], str]:
+    provenance: dict[str, object] = {
+        "schema": 1,
+        "kind": "source-build",
+        "source_manifest_schema": 2,
+        "source_manifest_sha256": "5" * 64,
+    }
+    canonical = json.dumps(
+        provenance,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    framed = (
+        CANDIDATE_PROVENANCE_DOMAIN
+        + len(canonical).to_bytes(8, byteorder="big", signed=False)
+        + canonical
+    )
+    return provenance, hashlib.sha256(framed).hexdigest()
+
+
 def candidate_state_payload(
     module: ModuleType,
     *,
@@ -200,8 +246,9 @@ def candidate_state_payload(
     temporary_root: Path,
 ) -> dict[str, object]:
     identity = module.candidate_identity(VALID_SHA)
+    build_provenance, build_provenance_sha256 = legacy_source_candidate_provenance()
     return {
-        "schema": 2,
+        "schema": 3,
         "source_sha": VALID_SHA,
         "project_name": identity.project_name,
         "container_name": identity.container_name,
@@ -222,6 +269,8 @@ def candidate_state_payload(
         "runtime_sha256": "4" * 64,
         "trusted_proxy_cidrs": ["192.0.2.1/32"],
         "deployment_assets": deployment_asset_payload(product_root),
+        "build_provenance": build_provenance,
+        "build_provenance_sha256": build_provenance_sha256,
     }
 
 
@@ -1489,20 +1538,69 @@ def test_build_manifest_loads_only_a_private_strict_identity(
     state_directory = tmp_path / "deploy-state"
     state_directory.mkdir(mode=0o700)
     manifest_path = state_directory / "verified-build.json"
-    payload = {
-        "approved_remote_ref": "refs/remotes/origin/main",
-        "deployment_assets": deployment_asset_payload(),
-        "docker_daemon_id": DOCKER_DAEMON_ID,
-        "image_id": "sha256:" + "1" * 64,
-        "image_reference": f"commerce-ops-desk:{VALID_SHA}",
-        "schema": 2,
-        "source_sha": VALID_SHA,
-    }
-    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    payload = legacy_build_manifest_payload()
+    raw = json.dumps(payload).encode("utf-8")
+    manifest_path.write_bytes(raw)
     manifest_path.chmod(0o600)
     monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
 
-    assert module._load_build_manifest(manifest_path) == payload
+    loaded = module._load_build_manifest(manifest_path)
+    assert isinstance(loaded, module._PROVENANCE.LoadedBuildManifest)
+    assert loaded.schema == 2
+    assert loaded.source_sha == VALID_SHA
+    assert loaded.image_reference == f"commerce-ops-desk:{VALID_SHA}"
+    assert loaded.image_id == "sha256:" + "1" * 64
+    assert loaded.raw_bytes == raw
+
+
+def test_schema3_build_manifest_load_rejects_crlf_noncanonical_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_deploy_tool()
+    state_directory = tmp_path / "deploy-state"
+    state_directory.mkdir(mode=0o700)
+    manifest_path = state_directory / "verified-build.json"
+    payload = legacy_build_manifest_payload()
+    payload["schema"] = 3
+    payload["build"] = {"schema": 1, "kind": "source-build"}
+    canonical = (
+        json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    manifest_path.write_bytes(canonical.replace(b"\n", b"\r\n"))
+    manifest_path.chmod(0o600)
+    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+
+    with pytest.raises(module.DeploymentError, match="invalid"):
+        module._load_build_manifest(manifest_path)
+
+
+def test_legacy_build_manifest_load_preserves_exact_crlf_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_deploy_tool()
+    state_directory = tmp_path / "deploy-state"
+    state_directory.mkdir(mode=0o700)
+    manifest_path = state_directory / "verified-build.json"
+    raw = (
+        (json.dumps(legacy_build_manifest_payload(), indent=2) + "\n")
+        .replace("\n", "\r\n")
+        .encode("utf-8")
+    )
+    manifest_path.write_bytes(raw)
+    manifest_path.chmod(0o600)
+    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+
+    loaded = module._load_build_manifest(manifest_path)
+
+    assert loaded.raw_bytes == raw
+    assert loaded.raw_sha256 == hashlib.sha256(raw).hexdigest()
 
 
 def test_verified_deployment_assets_are_read_once_into_memory(
@@ -1533,7 +1631,7 @@ def test_prepare_rejects_post_build_compose_sidecar_before_any_docker_call(
     state_directory = tmp_path / "deploy-state"
     state_directory.mkdir(mode=0o700)
     write_deployment_assets(product_root)
-    asset_identity = deployment_asset_payload(product_root)
+    manifest = loaded_legacy_build_manifest(module, product_root)
     (product_root / DEPLOYMENT_ASSET_PATHS[0]).write_text(
         "services:\n"
         "  commerce-ops-desk:\n"
@@ -1543,15 +1641,6 @@ def test_prepare_rejects_post_build_compose_sidecar_before_any_docker_call(
         "    privileged: true\n",
         encoding="utf-8",
     )
-    manifest = {
-        "schema": 2,
-        "source_sha": VALID_SHA,
-        "approved_remote_ref": "refs/remotes/origin/main",
-        "image_reference": f"commerce-ops-desk:{VALID_SHA}",
-        "image_id": "sha256:" + "1" * 64,
-        "docker_daemon_id": DOCKER_DAEMON_ID,
-        "deployment_assets": asset_identity,
-    }
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
     monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
     monkeypatch.setattr(module, "_load_build_manifest", lambda _path: manifest)
@@ -1591,15 +1680,7 @@ def test_prepare_rejects_a_historical_empty_candidate_directory_before_sudo_or_d
     write_deployment_assets(product_root)
     for directory in (state_directory, live, candidate):
         directory.mkdir(mode=0o700, parents=True)
-    manifest = {
-        "schema": 2,
-        "source_sha": VALID_SHA,
-        "approved_remote_ref": "refs/remotes/origin/main",
-        "image_reference": f"commerce-ops-desk:{VALID_SHA}",
-        "image_id": "sha256:" + "1" * 64,
-        "docker_daemon_id": DOCKER_DAEMON_ID,
-        "deployment_assets": deployment_asset_payload(product_root),
-    }
+    manifest = loaded_legacy_build_manifest(module, product_root)
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
     monkeypatch.setattr(module, "APP_ROOT", app_root)
     monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
@@ -2949,15 +3030,7 @@ def test_prepare_rejects_every_preexisting_candidate_path_before_any_command(
         (candidate / ".stale").write_text("stale data\n", encoding="utf-8")
     elif candidate_shape == "subdirectory":
         (candidate / "nested").mkdir()
-    manifest = {
-        "schema": 2,
-        "source_sha": VALID_SHA,
-        "approved_remote_ref": "refs/remotes/origin/main",
-        "image_reference": f"commerce-ops-desk:{VALID_SHA}",
-        "image_id": "sha256:" + "1" * 64,
-        "docker_daemon_id": DOCKER_DAEMON_ID,
-        "deployment_assets": deployment_asset_payload(product_root),
-    }
+    manifest = loaded_legacy_build_manifest(module, product_root)
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
     monkeypatch.setattr(module, "APP_ROOT", app_root)
     monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
@@ -3003,15 +3076,7 @@ def test_prepare_rejects_stale_candidate_state_before_any_docker_call(
         stale_state.mkdir()
     else:
         stale_state.symlink_to(tmp_path / "missing-state")
-    manifest = {
-        "schema": 2,
-        "source_sha": VALID_SHA,
-        "approved_remote_ref": "refs/remotes/origin/main",
-        "image_reference": f"commerce-ops-desk:{VALID_SHA}",
-        "image_id": "sha256:" + "1" * 64,
-        "docker_daemon_id": DOCKER_DAEMON_ID,
-        "deployment_assets": deployment_asset_payload(product_root),
-    }
+    manifest = loaded_legacy_build_manifest(module, product_root)
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
     monkeypatch.setattr(module, "APP_ROOT", app_root)
     monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
@@ -3043,15 +3108,7 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
     state_directory.mkdir(mode=0o700)
     (tmp_path / "live").mkdir()
     contents = write_deployment_assets(product_root)
-    manifest = {
-        "schema": 2,
-        "source_sha": VALID_SHA,
-        "approved_remote_ref": "refs/remotes/origin/main",
-        "image_reference": f"commerce-ops-desk:{VALID_SHA}",
-        "image_id": "sha256:" + "1" * 64,
-        "docker_daemon_id": DOCKER_DAEMON_ID,
-        "deployment_assets": deployment_asset_payload(product_root),
-    }
+    manifest = loaded_legacy_build_manifest(module, product_root)
     identity = module.candidate_identity(VALID_SHA)
     network_name = f"{identity.project_name}_default"
     create_container_id = "1" * 64
@@ -3230,7 +3287,7 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
     assert exact_container_calls == [create_container_id, final_container_id]
     assert final_network_ids[-1] == final_container_id
     assert daemon_checks == [DOCKER_DAEMON_ID, DOCKER_DAEMON_ID]
-    assert written["schema"] == 2
+    assert written["schema"] == 3
     assert written["container_id"] == final_container_id
     assert written["docker_daemon_id"] == DOCKER_DAEMON_ID
     assert written["candidate_data_device"] == candidate_data_identity[0]
@@ -3240,7 +3297,30 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
     assert written["network_id"] == "a" * 64
     assert written["network_endpoint_id"] == "c" * 64
     assert written["runtime_sha256"] == "4" * 64
-    assert written["deployment_assets"] == manifest["deployment_assets"]
+    assert (
+        written["deployment_assets"]
+        == legacy_build_manifest_payload(product_root)["deployment_assets"]
+    )
+    expected_provenance = {
+        "schema": 1,
+        "kind": "source-build",
+        "source_manifest_schema": 2,
+        "source_manifest_sha256": manifest.raw_sha256,
+    }
+    expected_canonical = json.dumps(
+        expected_provenance,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    expected_provenance_digest = hashlib.sha256(
+        CANDIDATE_PROVENANCE_DOMAIN
+        + len(expected_canonical).to_bytes(8, byteorder="big", signed=False)
+        + expected_canonical
+    ).hexdigest()
+    assert written["build_provenance"] == expected_provenance
+    assert written["build_provenance_sha256"] == expected_provenance_digest
     assert candidate_creations == [(module.APP_ROOT, identity)]
     with module._candidate_prepare_lock(VALID_SHA):
         pass
@@ -3252,32 +3332,14 @@ def test_state_revalidation_rejects_a_recreated_candidate_container(
     module = load_deploy_tool()
     product_root = tmp_path / "product"
     write_deployment_assets(product_root)
-    identity = module.candidate_identity(VALID_SHA)
     prepared_container_id = "1" * 64
     replacement_container_id = "2" * 64
-    state = {
-        "schema": 2,
-        "source_sha": VALID_SHA,
-        "project_name": identity.project_name,
-        "container_name": identity.container_name,
-        "container_id": prepared_container_id,
-        "image": identity.image,
-        "image_id": "sha256:" + "1" * 64,
-        "docker_daemon_id": DOCKER_DAEMON_ID,
-        "candidate_port": 18088,
-        "candidate_data_dir": str(tmp_path / "candidate"),
-        "candidate_data_device": 64_769,
-        "candidate_data_inode": 55_451_027,
-        "live_data_dir": str(tmp_path / "live"),
-        "live_data_device": 64_769,
-        "live_data_inode": 55_451_026,
-        "network_name": f"{identity.project_name}_default",
-        "network_id": "2" * 64,
-        "network_endpoint_id": "3" * 64,
-        "runtime_sha256": "4" * 64,
-        "trusted_proxy_cidrs": ["192.0.2.1/32"],
-        "deployment_assets": deployment_asset_payload(product_root),
-    }
+    state = candidate_state_payload(
+        module,
+        product_root=product_root,
+        temporary_root=tmp_path,
+    )
+    state["container_id"] = prepared_container_id
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
     monkeypatch.setattr(
         module,
@@ -3513,31 +3575,11 @@ def test_private_state_requires_owner_mode_single_link_and_canonical_parent(
     state_directory = tmp_path / "deploy-state"
     state_directory.mkdir(mode=0o700)
     state_path = state_directory / "candidate-0123456789ab.json"
-    payload = {
-        "schema": 2,
-        "source_sha": VALID_SHA,
-        "project_name": "commerce-ops-candidate-0123456789ab",
-        "container_name": "app-commerce-ops-desk-candidate-0123456789ab",
-        "container_id": "1" * 64,
-        "image": f"commerce-ops-desk:{VALID_SHA}",
-        "image_id": "sha256:" + "1" * 64,
-        "docker_daemon_id": DOCKER_DAEMON_ID,
-        "candidate_port": 18088,
-        "candidate_data_dir": (
-            "/home/deploy/apps/commerce-ops-desk/data-candidate-0123456789ab"
-        ),
-        "candidate_data_device": 64_769,
-        "candidate_data_inode": 55_451_027,
-        "live_data_dir": "/home/deploy/apps/commerce-ops-desk/data-live",
-        "live_data_device": 64_769,
-        "live_data_inode": 55_451_026,
-        "network_name": "commerce-ops-candidate-0123456789ab_default",
-        "network_id": "2" * 64,
-        "network_endpoint_id": "3" * 64,
-        "runtime_sha256": "4" * 64,
-        "trusted_proxy_cidrs": ["192.0.2.1/32"],
-        "deployment_assets": deployment_asset_payload(),
-    }
+    payload = candidate_state_payload(
+        module,
+        product_root=PRODUCT_ROOT,
+        temporary_root=tmp_path,
+    )
     state_path.write_text(json.dumps(payload), encoding="utf-8")
     state_path.chmod(0o600)
     monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
