@@ -16,7 +16,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -51,11 +51,65 @@ DEPLOYMENT_ASSET_PATHS = (
 CANDIDATE_PROVENANCE_DOMAIN = b"commerce-ops-desk:candidate-build-provenance:v1\0"
 
 
-def create_candidate_prepare_lock(app_root: Path) -> Path:
+def create_legacy_candidate_prepare_lock(app_root: Path) -> Path:
     lock_path = app_root / "deploy-state" / f"candidate-{VALID_SHA[:12]}.prepare.lock"
     lock_path.write_text("", encoding="utf-8")
     lock_path.chmod(0o600)
     return lock_path
+
+
+def configure_canonical_deploy_tree(
+    module: ModuleType,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path, Path]:
+    home = root / "home"
+    app_root = home / "apps" / "commerce-ops-desk"
+    state_directory = app_root / "deploy-state"
+    state_directory.mkdir(mode=0o700, parents=True)
+    for directory in (home, home / "apps", app_root, state_directory):
+        directory.chmod(0o700)
+
+    def passwd_entry(uid: int) -> SimpleNamespace:
+        assert uid == os.geteuid()
+        return SimpleNamespace(pw_dir=str(home))
+
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "pwd",
+        SimpleNamespace(getpwuid=passwd_entry),
+    )
+    monkeypatch.setattr(module, "APP_ROOT", app_root)
+    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    return home, app_root, state_directory
+
+
+def assert_shared_build_lock_held(module: ModuleType, source_sha: str) -> None:
+    with (
+        module._PROVENANCE.open_canonical_state_directory() as state,
+        pytest.raises(
+            module._PROVENANCE.ProvenanceError,
+            match="already in progress",
+        ),
+        module._PROVENANCE.BuildLock.acquire(state, source_sha),
+    ):
+        pytest.fail("a second shared build lock unexpectedly succeeded")
+
+
+def write_canonical_legacy_manifest(
+    state_directory: Path,
+    *,
+    product_root: Path = PRODUCT_ROOT,
+) -> Path:
+    manifest_path = state_directory / f"build-{VALID_SHA}.json"
+    manifest_path.write_bytes(
+        json.dumps(
+            legacy_build_manifest_payload(product_root),
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    manifest_path.chmod(0o600)
+    return manifest_path
 
 
 class InlineSudoPythonRunner:
@@ -130,15 +184,13 @@ def prepare_candidate_quarantine_inputs(
     *,
     include_state: bool = False,
 ) -> tuple[Path, Path, Path, Path]:
-    app_root = root / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        root,
+        monkeypatch,
+    )
     monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
     monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    create_candidate_prepare_lock(app_root)
     data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
     data_path.mkdir(mode=0o700)
     retained = data_path / ".retained"
@@ -1628,8 +1680,12 @@ def test_prepare_rejects_post_build_compose_sidecar_before_any_docker_call(
 ) -> None:
     module = load_deploy_tool()
     product_root = tmp_path / "product"
-    state_directory = tmp_path / "deploy-state"
-    state_directory.mkdir(mode=0o700)
+    _home, _app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    manifest_path = state_directory / f"build-{VALID_SHA}.json"
     write_deployment_assets(product_root)
     manifest = loaded_legacy_build_manifest(module, product_root)
     (product_root / DEPLOYMENT_ASSET_PATHS[0]).write_text(
@@ -1642,8 +1698,11 @@ def test_prepare_rejects_post_build_compose_sidecar_before_any_docker_call(
         encoding="utf-8",
     )
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    monkeypatch.setattr(module, "_load_build_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        module,
+        "_load_build_manifest",
+        lambda _path, **_kwargs: manifest,
+    )
     monkeypatch.setattr(
         module,
         "validate_data_directories",
@@ -1658,7 +1717,7 @@ def test_prepare_rejects_post_build_compose_sidecar_before_any_docker_call(
             pytest.fail(f"Docker must not run after asset drift: {arguments}")
 
     arguments = argparse.Namespace(
-        build_manifest=str(tmp_path / "manifest.json"),
+        build_manifest=str(manifest_path),
         candidate_port="18088",
         live_data_dir=str(tmp_path / "live"),
         candidate_data_dir=str(tmp_path / "candidate"),
@@ -1672,19 +1731,24 @@ def test_prepare_rejects_a_historical_empty_candidate_directory_before_sudo_or_d
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
     product_root = app_root / "code"
-    state_directory = app_root / "deploy-state"
     live = app_root / "data-live"
     candidate = app_root / "data-candidate-0123456789ab"
     write_deployment_assets(product_root)
-    for directory in (state_directory, live, candidate):
+    for directory in (live, candidate):
         directory.mkdir(mode=0o700, parents=True)
     manifest = loaded_legacy_build_manifest(module, product_root)
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    monkeypatch.setattr(module, "_load_build_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        module,
+        "_load_build_manifest",
+        lambda _path, **_kwargs: manifest,
+    )
 
     class NoCommandRunner:
         def run(
@@ -1693,7 +1757,7 @@ def test_prepare_rejects_a_historical_empty_candidate_directory_before_sudo_or_d
             pytest.fail(f"no command may run for a historical candidate: {arguments}")
 
     arguments = argparse.Namespace(
-        build_manifest=str(state_directory / "manifest.json"),
+        build_manifest=str(state_directory / f"build-{VALID_SHA}.json"),
         candidate_port="18088",
         live_data_dir=str(live),
         candidate_data_dir=str(candidate),
@@ -1992,70 +2056,300 @@ def test_candidate_creation_helper_never_replaces_a_prepositioned_final_path(
     assert candidate.read_text(encoding="utf-8") == "pre-positioned\n"
 
 
-def test_candidate_prepare_lock_rejects_a_concurrent_prepare_for_the_same_sha(
+@pytest.mark.parametrize(
+    "manifest_case",
+    ("wrong-parent", "short-sha", "extra-suffix"),
+)
+def test_prepare_rejects_noncanonical_manifest_path_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest_case: str,
+) -> None:
+    module = load_deploy_tool()
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    if manifest_case == "wrong-parent":
+        manifest_path = app_root / f"build-{VALID_SHA}.json"
+    elif manifest_case == "short-sha":
+        manifest_path = state_directory / f"build-{VALID_SHA[:12]}.json"
+    else:
+        manifest_path = state_directory / f"build-{VALID_SHA}.json.bak"
+
+    def unexpected_load(_path: Path, **_kwargs: object) -> object:
+        pytest.fail("a noncanonical manifest path was read")
+
+    def unexpected_prepare(*_args: object, **_kwargs: object) -> Path:
+        pytest.fail("candidate preparation started for a noncanonical manifest")
+
+    monkeypatch.setattr(module, "_load_build_manifest", unexpected_load)
+    monkeypatch.setattr(module, "_prepare_candidate_locked", unexpected_prepare)
+
+    class NoObservationRunner:
+        def run(
+            self, arguments: list[str], **_: object
+        ) -> subprocess.CompletedProcess[str]:
+            pytest.fail(f"a noncanonical manifest caused a command: {arguments}")
+
+    arguments = argparse.Namespace(build_manifest=str(manifest_path))
+    with pytest.raises(module.DeploymentError, match="manifest path"):
+        module.prepare_candidate(arguments, NoObservationRunner())
+
+    assert list(state_directory.glob(".build-*.lock")) == []
+
+
+def test_prepare_holds_full_sha_build_lock_before_manifest_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    state_directory = tmp_path / "deploy-state"
-    state_directory.mkdir(mode=0o700)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    _home, _app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    write_deployment_assets(product_root)
+    manifest_path = write_canonical_legacy_manifest(
+        state_directory,
+        product_root=product_root,
+    )
+    real_load = module._load_build_manifest
+    events: list[str] = []
 
+    def load_under_lock(path: Path, **kwargs: object) -> object:
+        events.append("load")
+        assert_shared_build_lock_held(module, VALID_SHA)
+        return real_load(path, **kwargs)
+
+    def prepare_under_lock(
+        _arguments: argparse.Namespace,
+        _runner: object,
+        *,
+        build_manifest: object,
+        identity: object,
+        **_kwargs: object,
+    ) -> Path:
+        events.append("prepare")
+        assert build_manifest.source_sha == VALID_SHA
+        assert identity.source_sha == VALID_SHA
+        assert_shared_build_lock_held(module, VALID_SHA)
+        return state_directory / f"candidate-{VALID_SHA[:12]}.json"
+
+    monkeypatch.setattr(module, "_load_build_manifest", load_under_lock)
+    monkeypatch.setattr(module, "_prepare_candidate_locked", prepare_under_lock)
+    arguments = argparse.Namespace(build_manifest=str(manifest_path))
+
+    result = module.prepare_candidate(arguments, object())
+
+    assert result == state_directory / f"candidate-{VALID_SHA[:12]}.json"
+    assert events == ["load", "prepare"]
+    assert (state_directory / f".build-{VALID_SHA}.lock").is_file()
+    assert not list(state_directory.glob("candidate-*.prepare.lock"))
+
+
+def test_active_deployment_code_has_no_legacy_prepare_lock_path() -> None:
+    source = DEPLOY_TOOL.read_text(encoding="utf-8")
+
+    assert "prepare.lock" not in source
+    assert "CandidatePrepareLock" not in source
+    assert "_candidate_prepare_lock" not in source
+
+
+def test_prepare_rejects_a_passwd_state_mismatch_before_lock_or_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    _home, _canonical_app, canonical_state = configure_canonical_deploy_tree(
+        module,
+        tmp_path / "canonical",
+        monkeypatch,
+    )
+    configured_home = tmp_path / "configured-home"
+    configured_app = configured_home / "apps" / "commerce-ops-desk"
+    configured_state = configured_app / "deploy-state"
+    configured_state.mkdir(mode=0o700, parents=True)
+    for directory in (
+        configured_home,
+        configured_home / "apps",
+        configured_app,
+        configured_state,
+    ):
+        directory.chmod(0o700)
+    monkeypatch.setattr(module, "APP_ROOT", configured_app)
+    monkeypatch.setattr(module, "STATE_DIRECTORY", configured_state)
+
+    def unexpected_load(_path: Path, **_kwargs: object) -> object:
+        pytest.fail("a manifest was read from a state root that was not locked")
+
+    monkeypatch.setattr(module, "_load_build_manifest", unexpected_load)
+    manifest_path = canonical_state / f"build-{VALID_SHA}.json"
+
+    with pytest.raises(
+        module.DeploymentError,
+        match="deployment state path is not canonical",
+    ):
+        module.prepare_candidate(
+            argparse.Namespace(build_manifest=str(manifest_path)),
+            object(),
+        )
+
+    assert not list(canonical_state.glob(".build-*.lock"))
+    assert not list(configured_state.glob(".build-*.lock"))
+
+
+def test_prepare_ignores_a_busy_legacy_lock_without_touching_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    write_deployment_assets(product_root)
+    manifest_path = write_canonical_legacy_manifest(
+        state_directory,
+        product_root=product_root,
+    )
+    legacy_lock = create_legacy_candidate_prepare_lock(app_root)
+    legacy_before = legacy_lock.stat()
+    legacy_bytes = legacy_lock.read_bytes()
+
+    def prepare_under_shared_lock(
+        _arguments: argparse.Namespace,
+        _runner: object,
+        **_kwargs: object,
+    ) -> Path:
+        assert_shared_build_lock_held(module, VALID_SHA)
+        return state_directory / f"candidate-{VALID_SHA[:12]}.json"
+
+    monkeypatch.setattr(
+        module,
+        "_prepare_candidate_locked",
+        prepare_under_shared_lock,
+    )
+    with legacy_lock.open("r+b") as legacy_descriptor:
+        fcntl.flock(legacy_descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = module.prepare_candidate(
+            argparse.Namespace(build_manifest=str(manifest_path)),
+            object(),
+        )
+
+    legacy_after = legacy_lock.stat()
+    assert result == state_directory / f"candidate-{VALID_SHA[:12]}.json"
+    assert legacy_lock.read_bytes() == legacy_bytes
+    assert (legacy_after.st_dev, legacy_after.st_ino) == (
+        legacy_before.st_dev,
+        legacy_before.st_ino,
+    )
+    assert stat.S_IMODE(legacy_after.st_mode) == stat.S_IMODE(legacy_before.st_mode)
+    assert legacy_after.st_nlink == legacy_before.st_nlink
+    assert (state_directory / f".build-{VALID_SHA}.lock").is_file()
+
+
+def test_busy_shared_build_lock_blocks_prepare_before_all_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    manifest_path = state_directory / f"build-{VALID_SHA}.json"
+    observations: list[str] = []
+
+    def unexpected_load(_path: Path, **_kwargs: object) -> object:
+        observations.append("manifest")
+        raise AssertionError("manifest was read before lock acquisition")
+
+    def unexpected_prepare(*_args: object, **_kwargs: object) -> Path:
+        observations.append("candidate")
+        raise AssertionError("candidate preparation started while lock was busy")
+
+    monkeypatch.setattr(module, "_load_build_manifest", unexpected_load)
+    monkeypatch.setattr(module, "_prepare_candidate_locked", unexpected_prepare)
+
+    class NoObservationRunner:
+        def run(
+            self, arguments: list[str], **_: object
+        ) -> subprocess.CompletedProcess[str]:
+            observations.append("command")
+            raise AssertionError(f"command ran while lock was busy: {arguments}")
+
+    arguments = argparse.Namespace(build_manifest=str(manifest_path))
     with (
-        module._candidate_prepare_lock(VALID_SHA),
+        module._PROVENANCE.open_canonical_state_directory() as state,
+        module._PROVENANCE.BuildLock.acquire(state, VALID_SHA),
         pytest.raises(module.DeploymentError, match="already in progress"),
-        module._candidate_prepare_lock(VALID_SHA),
     ):
-        pytest.fail("a concurrent prepare must not acquire the same SHA lock")
+        module.prepare_candidate(arguments, NoObservationRunner())
 
-    lock_path = state_directory / f"candidate-{VALID_SHA[:12]}.prepare.lock"
-    metadata = lock_path.lstat()
-    assert metadata.st_uid == os.geteuid()
-    assert metadata.st_nlink == 1
-    assert metadata.st_mode & 0o777 == 0o600
+    assert observations == []
+    assert not list(app_root.glob(f"data-candidate-{VALID_SHA[:12]}*"))
+    assert not list(state_directory.glob(f"candidate-{VALID_SHA[:12]}*"))
 
 
-def test_candidate_prepare_lock_reports_replacement_when_body_also_fails(
+def test_prepare_rejects_manifest_content_sha_mismatch_before_candidate_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    state_directory = tmp_path / "deploy-state"
-    state_directory.mkdir(mode=0o700)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    lock_path = state_directory / f"candidate-{VALID_SHA[:12]}.prepare.lock"
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    write_deployment_assets(product_root)
+    other_sha = "f" * 40
+    payload = legacy_build_manifest_payload(product_root)
+    payload["source_sha"] = other_sha
+    payload["image_reference"] = f"commerce-ops-desk:{other_sha}"
+    manifest_path = state_directory / f"build-{VALID_SHA}.json"
+    manifest_path.write_bytes(json.dumps(payload, separators=(",", ":")).encode())
+    manifest_path.chmod(0o600)
 
-    with (
-        pytest.raises(module.DeploymentError, match="lock changed") as error,
-        module._candidate_prepare_lock(VALID_SHA),
-    ):
-        lock_path.unlink()
-        lock_path.write_text("", encoding="utf-8")
-        lock_path.chmod(0o600)
-        raise module.DeploymentError("body failed")
+    def unexpected_prepare(*_args: object, **_kwargs: object) -> Path:
+        pytest.fail("candidate work started for a mismatched manifest")
 
-    original_error = error.value.__cause__ or error.value.__context__
-    assert isinstance(original_error, module.DeploymentError)
-    assert str(original_error) == "body failed"
+    monkeypatch.setattr(module, "_prepare_candidate_locked", unexpected_prepare)
+
+    class NoObservationRunner:
+        def run(
+            self, arguments: list[str], **_: object
+        ) -> subprocess.CompletedProcess[str]:
+            pytest.fail(f"mismatched manifest caused a command: {arguments}")
+
+    arguments = argparse.Namespace(build_manifest=str(manifest_path))
+    with pytest.raises(module.DeploymentError, match="manifest.*SOURCE_SHA"):
+        module.prepare_candidate(arguments, NoObservationRunner())
+
+    assert not list(app_root.glob(f"data-candidate-{VALID_SHA[:12]}*"))
+    assert not list(state_directory.glob(f"candidate-{VALID_SHA[:12]}*"))
 
 
 @pytest.mark.parametrize("candidate_shape", ["data-only", "state-only", "both"])
-def test_quarantine_candidate_inputs_moves_each_shape_under_the_prepare_lock(
+def test_quarantine_candidate_inputs_moves_each_shape_under_the_shared_build_lock(
     rename_noreplace_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     candidate_shape: str,
 ) -> None:
     module = load_deploy_tool()
-    tmp_path = rename_noreplace_path
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        rename_noreplace_path,
+        monkeypatch,
+    )
     monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
     monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    create_candidate_prepare_lock(app_root)
     data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
     state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
     if candidate_shape in {"data-only", "both"}:
@@ -2125,23 +2419,21 @@ def test_quarantine_candidate_inputs_moves_each_shape_under_the_prepare_lock(
             "|".join(str(value) for value in data_identity) + "\n"
         )
     assert local_moves == ([state_path.name] if candidate_shape != "data-only" else [])
+    assert not list(state_directory.glob("candidate-*.prepare.lock"))
 
 
-def test_quarantine_candidate_inputs_holds_prepare_lock_through_both_moves(
+def test_quarantine_candidate_inputs_holds_shared_build_lock_through_both_moves(
     rename_noreplace_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    tmp_path = rename_noreplace_path
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        rename_noreplace_path,
+        monkeypatch,
+    )
     monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
     monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    create_candidate_prepare_lock(app_root)
     data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
     data_path.mkdir(mode=0o700)
     state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
@@ -2151,11 +2443,7 @@ def test_quarantine_candidate_inputs_holds_prepare_lock_through_both_moves(
     observed_moves: list[str] = []
 
     def assert_lock_during_data_helper(_command: list[str]) -> None:
-        with (
-            pytest.raises(module.DeploymentError, match="already in progress"),
-            module._candidate_prepare_lock(VALID_SHA),
-        ):
-            pytest.fail("quarantine released its SHA lock before the data helper")
+        assert_shared_build_lock_held(module, VALID_SHA)
         observed_moves.append(data_path.name)
 
     def assert_lock_then_rename(
@@ -2165,11 +2453,7 @@ def test_quarantine_candidate_inputs_holds_prepare_lock_through_both_moves(
         src_dir_fd: int,
         dst_dir_fd: int,
     ) -> None:
-        with (
-            pytest.raises(module.DeploymentError, match="already in progress"),
-            module._candidate_prepare_lock(VALID_SHA),
-        ):
-            pytest.fail("quarantine released its SHA lock before moving both inputs")
+        assert_shared_build_lock_held(module, VALID_SHA)
         observed_moves.append(source)
         real_rename(
             source,
@@ -2192,6 +2476,142 @@ def test_quarantine_candidate_inputs_holds_prepare_lock_through_both_moves(
 
     assert observed_moves == [data_path.name, state_path.name]
     assert len(runner.calls) == 1
+    with (
+        module._PROVENANCE.open_canonical_state_directory() as state,
+        module._PROVENANCE.BuildLock.acquire(state, VALID_SHA),
+    ):
+        pass
+
+
+def test_busy_shared_build_lock_blocks_quarantine_before_all_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    _home, app_root, _state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
+    data_path.mkdir(mode=0o700)
+    observations: list[str] = []
+
+    def unexpected_open_root() -> tuple[int, tuple[int, int]]:
+        observations.append("application root")
+        raise AssertionError("application root opened while the build lock was busy")
+
+    def unexpected_input(*_args: object, **_kwargs: object) -> os.stat_result | None:
+        observations.append("input")
+        raise AssertionError("candidate input observed while the build lock was busy")
+
+    def unexpected_archive(*_args: object, **_kwargs: object) -> object:
+        observations.append("archive")
+        raise AssertionError("archive created while the build lock was busy")
+
+    monkeypatch.setattr(
+        module,
+        "_open_quarantine_application_root",
+        unexpected_open_root,
+    )
+    monkeypatch.setattr(module, "_candidate_input_metadata", unexpected_input)
+    monkeypatch.setattr(module, "_create_quarantine_archive", unexpected_archive)
+
+    class NoHelperRunner:
+        def run(
+            self, arguments: list[str], **_: object
+        ) -> subprocess.CompletedProcess[str]:
+            observations.append("helper")
+            raise AssertionError(
+                f"helper ran while the build lock was busy: {arguments}"
+            )
+
+    with (
+        module._PROVENANCE.open_canonical_state_directory() as state,
+        module._PROVENANCE.BuildLock.acquire(state, VALID_SHA),
+        pytest.raises(module.DeploymentError, match="already in progress"),
+    ):
+        module.quarantine_candidate_inputs(VALID_SHA, NoHelperRunner())
+
+    assert observations == []
+    assert data_path.is_dir()
+    assert not list(app_root.glob(f"quarantine-candidate-{VALID_SHA[:12]}-*"))
+
+
+def test_quarantine_migrates_legacy_lock_without_touching_it(
+    rename_noreplace_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        rename_noreplace_path,
+        monkeypatch,
+    )
+    monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
+    monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
+    legacy_lock = create_legacy_candidate_prepare_lock(app_root)
+    legacy_before = legacy_lock.stat()
+    legacy_bytes = legacy_lock.read_bytes()
+    data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
+    data_path.mkdir(mode=0o700)
+    (data_path / ".retained").write_text("keep\n", encoding="utf-8")
+    state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
+    state_path.write_text('{"keep": true}\n', encoding="utf-8")
+    state_path.chmod(0o600)
+    real_rename = module._rename_candidate_input_noreplace
+    observed: list[str] = []
+
+    def assert_lock_during_data(_command: list[str]) -> None:
+        assert_shared_build_lock_held(module, VALID_SHA)
+        observed.append("data")
+
+    def assert_lock_during_state(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+    ) -> None:
+        assert_shared_build_lock_held(module, VALID_SHA)
+        observed.append("state")
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(
+        module,
+        "_rename_candidate_input_noreplace",
+        assert_lock_during_state,
+    )
+    runner = InlineSudoPythonRunner(module, before_execute=assert_lock_during_data)
+
+    with legacy_lock.open("r+b") as legacy_descriptor:
+        fcntl.flock(legacy_descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        archive = module.quarantine_candidate_inputs(VALID_SHA, runner)
+
+    legacy_after = legacy_lock.stat()
+    assert observed == ["data", "state"]
+    assert (archive / "data" / ".retained").read_text(encoding="utf-8") == "keep\n"
+    assert (archive / state_path.name).read_text(encoding="utf-8") == (
+        '{"keep": true}\n'
+    )
+    assert legacy_lock.read_bytes() == legacy_bytes
+    assert (legacy_after.st_dev, legacy_after.st_ino) == (
+        legacy_before.st_dev,
+        legacy_before.st_ino,
+    )
+    assert stat.S_IMODE(legacy_after.st_mode) == stat.S_IMODE(legacy_before.st_mode)
+    assert legacy_after.st_nlink == legacy_before.st_nlink
+    assert (state_directory / f".build-{VALID_SHA}.lock").is_file()
+    with (
+        module._PROVENANCE.open_canonical_state_directory() as state,
+        module._PROVENANCE.BuildLock.acquire(state, VALID_SHA),
+    ):
+        pass
 
 
 def test_candidate_data_quarantine_helper_never_replaces_a_prepositioned_destination(
@@ -2373,71 +2793,29 @@ def test_candidate_data_quarantine_requires_one_exact_identity_receipt(
     assert (archive / "data" / ".retained").read_text(encoding="utf-8") == ("keep\n")
 
 
-@pytest.mark.parametrize(
-    "unsafe_lock_shape",
-    ["missing", "symlink", "directory", "wrong-mode", "hard-link"],
-)
-def test_quarantine_candidate_inputs_rejects_an_unsafe_prepare_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    unsafe_lock_shape: str,
-) -> None:
-    module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
-    monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    lock_path = state_directory / f"candidate-{VALID_SHA[:12]}.prepare.lock"
-    if unsafe_lock_shape == "symlink":
-        target = tmp_path / "external-lock"
-        target.write_text("", encoding="utf-8")
-        target.chmod(0o600)
-        lock_path.symlink_to(target)
-    elif unsafe_lock_shape == "directory":
-        lock_path.mkdir(mode=0o600)
-    elif unsafe_lock_shape == "wrong-mode":
-        lock_path.write_text("", encoding="utf-8")
-        lock_path.chmod(0o644)
-    elif unsafe_lock_shape == "hard-link":
-        lock_path.write_text("", encoding="utf-8")
-        lock_path.chmod(0o600)
-        os.link(lock_path, tmp_path / "second-lock-link")
-    data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
-    data_path.mkdir(mode=0o700)
-
-    with pytest.raises(module.DeploymentError, match="prepare lock"):
-        module.quarantine_candidate_inputs(VALID_SHA)
-
-    assert data_path.is_dir()
-    assert not list(app_root.glob(f"quarantine-candidate-{VALID_SHA[:12]}-*"))
-
-
 def test_quarantine_candidate_inputs_rejects_a_symlinked_state_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    app_root.mkdir(mode=0o700, parents=True)
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
     external_state = tmp_path / "external-state"
     external_state.mkdir(mode=0o700)
-    state_directory = app_root / "deploy-state"
+    state_directory.rmdir()
     state_directory.symlink_to(external_state, target_is_directory=True)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
     monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
     monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    lock_path = external_state / f"candidate-{VALID_SHA[:12]}.prepare.lock"
-    lock_path.write_text("", encoding="utf-8")
-    lock_path.chmod(0o600)
     data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
     data_path.mkdir(mode=0o700)
 
-    with pytest.raises(module.DeploymentError, match="symbolic link"):
+    with pytest.raises(
+        module.DeploymentError,
+        match="canonical state directory is unavailable",
+    ):
         module.quarantine_candidate_inputs(VALID_SHA)
 
     assert data_path.is_dir()
@@ -2445,24 +2823,21 @@ def test_quarantine_candidate_inputs_rejects_a_symlinked_state_directory(
 
 
 @pytest.mark.parametrize("unsafe_mode", [0o770, 0o707, 0o777])
-def test_quarantine_candidate_inputs_rejects_a_group_or_world_writable_app_root(
+def test_quarantine_candidate_inputs_rejects_an_unsafe_canonical_app_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     unsafe_mode: int,
 ) -> None:
     module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
+    _home, app_root, _state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
     app_root.chmod(unsafe_mode)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    create_candidate_prepare_lock(app_root)
 
     with pytest.raises(
-        module.DeploymentError,
-        match="application root.*(group|world|mode|writable)",
+        module.DeploymentError, match="canonical state directory is unsafe"
     ):
         module.quarantine_candidate_inputs(VALID_SHA)
 
@@ -2475,42 +2850,41 @@ def test_quarantine_rejects_cross_device_state_before_creating_an_archive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    app_root = rename_noreplace_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    app_root.mkdir(mode=0o700, parents=True)
-    state_directory.mkdir(mode=0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    lock_path = create_candidate_prepare_lock(app_root)
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        rename_noreplace_path,
+        monkeypatch,
+    )
     state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
     state_path.write_text('{"keep": true}\n', encoding="utf-8")
     state_path.chmod(0o600)
 
     real_fstat = module.os.fstat
-    real_lstat = module.os.lstat
     real_stat = module.os.stat
     state_fd = os.open(state_directory, os.O_RDONLY | os.O_DIRECTORY)
-    lock_fd = os.open(lock_path, os.O_RDWR)
     state_metadata = real_fstat(state_fd)
-    lock_metadata = real_fstat(lock_fd)
     fake_state_device = app_root.stat().st_dev + 1
     state_fields = list(state_metadata)
     state_fields[stat.ST_DEV] = fake_state_device
     cross_device_state = os.stat_result(state_fields)
-    held_lock = module.CandidatePrepareLock(
-        state_directory_fd=state_fd,
-        state_directory_path=state_directory,
-        state_directory_identity=(fake_state_device, state_metadata.st_ino),
-        lock_fd=lock_fd,
-        lock_name=lock_path.name,
-        lock_identity=(lock_metadata.st_dev, lock_metadata.st_ino),
+    synthetic_state = SimpleNamespace(
+        path=state_directory,
+        descriptor=state_fd,
+        revalidate=lambda: None,
+        fsync=lambda: None,
     )
+    held_lock = SimpleNamespace(state=synthetic_state, revalidate=lambda: None)
+    synthetic_lock_active = False
 
     class SyntheticCrossDeviceLock:
         def __enter__(self) -> object:
+            nonlocal synthetic_lock_active
+            synthetic_lock_active = True
             return held_lock
 
         def __exit__(self, *_error: object) -> bool:
+            nonlocal synthetic_lock_active
+            synthetic_lock_active = False
             return False
 
     def cross_device_fstat(descriptor: int) -> os.stat_result:
@@ -2518,43 +2892,28 @@ def test_quarantine_rejects_cross_device_state_before_creating_an_archive(
             return cross_device_state
         return real_fstat(descriptor)
 
-    def cross_device_lstat(
-        path: str | bytes | int | Path,
-        *,
-        dir_fd: int | None = None,
-    ) -> os.stat_result:
-        if path == state_directory or path == str(state_directory):
-            return cross_device_state
-        return real_lstat(path, dir_fd=dir_fd)
-
     def cross_device_stat(
         path: str | bytes | int | Path,
         *,
         dir_fd: int | None = None,
         follow_symlinks: bool = True,
     ) -> os.stat_result:
-        if (
-            path == state_directory
-            or path == str(state_directory)
-            or (path == "deploy-state" and dir_fd is not None)
-        ):
+        if synthetic_lock_active and path == "deploy-state" and dir_fd is not None:
             return cross_device_state
         return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
 
     monkeypatch.setattr(
-        module,
-        "_candidate_prepare_lock",
-        lambda *_args, **_kwargs: SyntheticCrossDeviceLock(),
+        module._PROVENANCE.BuildLock,
+        "acquire",
+        classmethod(lambda _cls, _state, _source_sha: SyntheticCrossDeviceLock()),
     )
     monkeypatch.setattr(module.os, "fstat", cross_device_fstat)
-    monkeypatch.setattr(module.os, "lstat", cross_device_lstat)
     monkeypatch.setattr(module.os, "stat", cross_device_stat)
 
     try:
         with pytest.raises(module.DeploymentError, match="same filesystem"):
             module.quarantine_candidate_inputs(VALID_SHA)
     finally:
-        os.close(lock_fd)
         os.close(state_fd)
 
     assert state_path.is_file()
@@ -2566,13 +2925,11 @@ def test_quarantine_rejects_a_cross_device_state_file_before_creating_an_archive
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    app_root = rename_noreplace_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    create_candidate_prepare_lock(app_root)
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        rename_noreplace_path,
+        monkeypatch,
+    )
     state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
     state_path.write_text('{"keep": true}\n', encoding="utf-8")
     state_path.chmod(0o600)
@@ -2608,112 +2965,6 @@ def test_quarantine_rejects_a_cross_device_state_file_before_creating_an_archive
     assert not list(app_root.glob(f"quarantine-candidate-{VALID_SHA[:12]}-*"))
 
 
-def test_quarantine_candidate_inputs_rejects_a_busy_prepare_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
-    monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    lock_path = create_candidate_prepare_lock(app_root)
-    data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
-    data_path.mkdir(mode=0o700)
-
-    with lock_path.open("r+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with pytest.raises(module.DeploymentError, match="already in progress"):
-            module.quarantine_candidate_inputs(VALID_SHA)
-
-    assert data_path.is_dir()
-    assert not list(app_root.glob(f"quarantine-candidate-{VALID_SHA[:12]}-*"))
-
-
-def test_quarantine_candidate_inputs_rejects_a_lock_replacement_race(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
-    monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    lock_path = create_candidate_prepare_lock(app_root)
-    original_lock_inode = lock_path.stat().st_ino
-    data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
-    data_path.mkdir(mode=0o700)
-    real_flock = module.fcntl.flock
-    replaced = False
-
-    def replace_lock_after_acquisition(descriptor: int, operation: int) -> None:
-        nonlocal replaced
-        real_flock(descriptor, operation)
-        if operation & fcntl.LOCK_EX and not replaced:
-            replaced = True
-            lock_path.unlink()
-            lock_path.write_text("replacement\n", encoding="utf-8")
-            lock_path.chmod(0o600)
-
-    monkeypatch.setattr(module.fcntl, "flock", replace_lock_after_acquisition)
-
-    with pytest.raises(module.DeploymentError, match="changed while acquiring"):
-        module.quarantine_candidate_inputs(VALID_SHA)
-
-    assert lock_path.stat().st_ino != original_lock_inode
-    assert data_path.is_dir()
-    assert not list(app_root.glob(f"quarantine-candidate-{VALID_SHA[:12]}-*"))
-
-
-def test_quarantine_candidate_inputs_rejects_a_wrong_owner_prepare_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
-    monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    lock_path = create_candidate_prepare_lock(app_root)
-    lock_name = lock_path.name
-    data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
-    data_path.mkdir(mode=0o700)
-    real_stat = module.os.stat
-
-    def stat_with_wrong_lock_owner(
-        path: str | bytes | int | Path,
-        *,
-        dir_fd: int | None = None,
-        follow_symlinks: bool = True,
-    ) -> os.stat_result:
-        metadata = real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
-        if path == lock_name and dir_fd is not None:
-            fields = list(metadata)
-            fields[stat.ST_UID] = os.geteuid() + 1
-            return os.stat_result(fields)
-        return metadata
-
-    monkeypatch.setattr(module.os, "stat", stat_with_wrong_lock_owner)
-
-    with pytest.raises(module.DeploymentError, match="prepare lock is unsafe"):
-        module.quarantine_candidate_inputs(VALID_SHA)
-
-    assert data_path.is_dir()
-    assert not list(app_root.glob(f"quarantine-candidate-{VALID_SHA[:12]}-*"))
-
-
 @pytest.mark.parametrize(
     ("candidate_item", "broken"),
     [("data", False), ("data", True), ("state", False), ("state", True)],
@@ -2725,15 +2976,13 @@ def test_quarantine_candidate_inputs_never_follows_candidate_symlinks(
     broken: bool,
 ) -> None:
     module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
     monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
     monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    create_candidate_prepare_lock(app_root)
     link_path = (
         app_root / f"data-candidate-{VALID_SHA[:12]}"
         if candidate_item == "data"
@@ -2772,15 +3021,13 @@ def test_quarantine_candidate_inputs_rejects_unsafe_input_metadata(
     unsafe_input: str,
 ) -> None:
     module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
     monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
     monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    create_candidate_prepare_lock(app_root)
     data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
     state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
 
@@ -2814,13 +3061,11 @@ def test_quarantine_candidate_inputs_refuses_no_inputs_without_empty_archive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    create_candidate_prepare_lock(app_root)
+    _home, app_root, _state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
 
     with pytest.raises(module.DeploymentError, match="no candidate data or state"):
         module.quarantine_candidate_inputs(VALID_SHA)
@@ -2833,16 +3078,13 @@ def test_quarantine_candidate_inputs_resumes_without_reusing_the_first_archive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    tmp_path = rename_noreplace_path
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        rename_noreplace_path,
+        monkeypatch,
+    )
     monkeypatch.setattr(module, "RUNTIME_UID", os.geteuid())
     monkeypatch.setattr(module, "RUNTIME_GID", os.getegid())
-    create_candidate_prepare_lock(app_root)
     data_path = app_root / f"data-candidate-{VALID_SHA[:12]}"
     data_path.mkdir(mode=0o700)
     retained = data_path / ".retained"
@@ -2937,14 +3179,11 @@ def test_quarantine_candidate_inputs_refuses_a_racing_archive_destination(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    tmp_path = rename_noreplace_path
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700, parents=True)
-    app_root.chmod(0o700)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    create_candidate_prepare_lock(app_root)
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        rename_noreplace_path,
+        monkeypatch,
+    )
     state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
     state_path.write_text('{"keep": true}\n', encoding="utf-8")
     state_path.chmod(0o600)
@@ -3008,13 +3247,16 @@ def test_prepare_rejects_every_preexisting_candidate_path_before_any_command(
     candidate_shape: str,
 ) -> None:
     module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
     product_root = app_root / "code"
-    state_directory = app_root / "deploy-state"
     live = app_root / "data-live"
     candidate = app_root / "data-candidate-0123456789ab"
     write_deployment_assets(product_root)
-    for directory in (state_directory, live):
+    for directory in (live,):
         directory.mkdir(mode=0o700, parents=True)
     if candidate_shape == "regular-file":
         candidate.write_text("stale data\n", encoding="utf-8")
@@ -3032,9 +3274,11 @@ def test_prepare_rejects_every_preexisting_candidate_path_before_any_command(
         (candidate / "nested").mkdir()
     manifest = loaded_legacy_build_manifest(module, product_root)
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    monkeypatch.setattr(module, "_load_build_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        module,
+        "_load_build_manifest",
+        lambda _path, **_kwargs: manifest,
+    )
 
     class NoCommandRunner:
         def run(
@@ -3043,7 +3287,7 @@ def test_prepare_rejects_every_preexisting_candidate_path_before_any_command(
             pytest.fail(f"no command may run with stale candidate data: {arguments}")
 
     arguments = argparse.Namespace(
-        build_manifest=str(state_directory / "manifest.json"),
+        build_manifest=str(state_directory / f"build-{VALID_SHA}.json"),
         candidate_port="18088",
         live_data_dir=str(live),
         candidate_data_dir=str(candidate),
@@ -3060,13 +3304,16 @@ def test_prepare_rejects_stale_candidate_state_before_any_docker_call(
     state_shape: str,
 ) -> None:
     module = load_deploy_tool()
-    app_root = tmp_path / "apps" / "commerce-ops-desk"
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
     product_root = app_root / "code"
-    state_directory = app_root / "deploy-state"
     live = app_root / "data-live"
     candidate = app_root / "data-candidate-0123456789ab"
     write_deployment_assets(product_root)
-    for directory in (state_directory, live):
+    for directory in (live,):
         directory.mkdir(mode=0o700, parents=True)
     stale_state = state_directory / "candidate-0123456789ab.json"
     if state_shape == "regular-file":
@@ -3078,9 +3325,11 @@ def test_prepare_rejects_stale_candidate_state_before_any_docker_call(
         stale_state.symlink_to(tmp_path / "missing-state")
     manifest = loaded_legacy_build_manifest(module, product_root)
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    monkeypatch.setattr(module, "_load_build_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        module,
+        "_load_build_manifest",
+        lambda _path, **_kwargs: manifest,
+    )
 
     class NoDockerRunner:
         def run(
@@ -3089,7 +3338,7 @@ def test_prepare_rejects_stale_candidate_state_before_any_docker_call(
             pytest.fail(f"Docker must not run with stale candidate state: {arguments}")
 
     arguments = argparse.Namespace(
-        build_manifest=str(state_directory / "manifest.json"),
+        build_manifest=str(state_directory / f"build-{VALID_SHA}.json"),
         candidate_port="18088",
         live_data_dir=str(live),
         candidate_data_dir=str(candidate),
@@ -3104,8 +3353,11 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
 ) -> None:
     module = load_deploy_tool()
     product_root = tmp_path / "product"
-    state_directory = tmp_path / "deploy-state"
-    state_directory.mkdir(mode=0o700)
+    _home, _app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
     (tmp_path / "live").mkdir()
     contents = write_deployment_assets(product_root)
     manifest = loaded_legacy_build_manifest(module, product_root)
@@ -3127,8 +3379,11 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
         }
     ]
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
-    monkeypatch.setattr(module, "_load_build_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        module,
+        "_load_build_manifest",
+        lambda _path, **_kwargs: manifest,
+    )
     monkeypatch.setattr(
         module,
         "_candidate_data_path_for_creation",
@@ -3225,11 +3480,7 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
     written: dict[str, object] = {}
 
     def publish_state(_path: Path, payload: Mapping[str, object]) -> None:
-        with (
-            pytest.raises(module.DeploymentError, match="already in progress"),
-            module._candidate_prepare_lock(VALID_SHA),
-        ):
-            pytest.fail("prepare released its SHA lock before state publication")
+        assert_shared_build_lock_held(module, VALID_SHA)
         written.update(payload)
 
     monkeypatch.setattr(
@@ -3263,7 +3514,7 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
 
     runner = ComposeRunner()
     arguments = argparse.Namespace(
-        build_manifest=str(tmp_path / "manifest.json"),
+        build_manifest=str(state_directory / f"build-{VALID_SHA}.json"),
         candidate_port="18088",
         live_data_dir=str(tmp_path / "live"),
         candidate_data_dir=str(tmp_path / "candidate"),
@@ -3322,7 +3573,10 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
     assert written["build_provenance"] == expected_provenance
     assert written["build_provenance_sha256"] == expected_provenance_digest
     assert candidate_creations == [(module.APP_ROOT, identity)]
-    with module._candidate_prepare_lock(VALID_SHA):
+    with (
+        module._PROVENANCE.open_canonical_state_directory() as state,
+        module._PROVENANCE.BuildLock.acquire(state, VALID_SHA),
+    ):
         pass
 
 
@@ -3694,13 +3948,11 @@ def test_candidate_state_link_before_unlink_interruption_remains_quarantinable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_deploy_tool()
-    app_root = rename_noreplace_path / "commerce-ops-desk"
-    app_root.mkdir(mode=0o700)
-    state_directory = app_root / "deploy-state"
-    state_directory.mkdir(mode=0o700)
-    create_candidate_prepare_lock(app_root)
-    monkeypatch.setattr(module, "APP_ROOT", app_root)
-    monkeypatch.setattr(module, "STATE_DIRECTORY", state_directory)
+    _home, _app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        rename_noreplace_path,
+        monkeypatch,
+    )
     state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
     real_link = os.link
     interrupted_exit = 73
@@ -4018,7 +4270,8 @@ def test_runbook_is_explicit_about_blue_green_and_gateway_limitations() -> None:
         "schema-2 manifest",
         "Docker daemon ID",
         "--file -",
-        "fixed-argv isolated privileged helper",
+        "fixed-argv",
+        "isolated privileged helper",
         "atomic no-clobber operation",
     ):
         assert required_phrase in runbook
@@ -4469,7 +4722,11 @@ def test_runbook_fails_closed_and_archives_stale_candidate_inputs() -> None:
         "dirfd",
         "O_NOFOLLOW",
         "RENAME_NOREPLACE",
-        "same non-blocking per-SHA prepare lock",
+        "same non-blocking shared full-SHA operation lock",
+        "safely opens and acquires the existing lock",
+        "retained untouched as evidence",
+        "A missing shared full-SHA lock is created safely",
+        "no longer read, locked, modified, or deleted",
         "same filesystem",
         "verify_exact_checkout",
         "/usr/bin/python3 -I deploy/workstation/deploy.py quarantine",

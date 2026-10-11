@@ -797,50 +797,6 @@ class CandidateIdentity:
     data_directory_name: str
 
 
-@dataclass(frozen=True)
-class CandidatePrepareLock:
-    """An inode-bound per-candidate lock held for the context lifetime."""
-
-    state_directory_fd: int
-    state_directory_path: Path
-    state_directory_identity: tuple[int, int]
-    lock_fd: int
-    lock_name: str
-    lock_identity: tuple[int, int]
-
-    def assert_current(self) -> None:
-        """Fail if either pathname no longer names the locked inode."""
-
-        try:
-            opened_directory = os.fstat(self.state_directory_fd)
-            current_directory = self.state_directory_path.lstat()
-            current_lock = os.stat(
-                self.lock_name,
-                dir_fd=self.state_directory_fd,
-                follow_symlinks=False,
-            )
-            opened_lock = os.fstat(self.lock_fd)
-        except OSError:
-            raise DeploymentError("candidate prepare lock changed while held") from None
-        if (
-            not stat.S_ISDIR(opened_directory.st_mode)
-            or not stat.S_ISDIR(current_directory.st_mode)
-            or (opened_directory.st_dev, opened_directory.st_ino)
-            != self.state_directory_identity
-            or (current_directory.st_dev, current_directory.st_ino)
-            != self.state_directory_identity
-            or opened_directory.st_uid != os.geteuid()
-            or current_directory.st_uid != os.geteuid()
-            or stat.S_IMODE(opened_directory.st_mode) != 0o700
-            or stat.S_IMODE(current_directory.st_mode) != 0o700
-            or not _safe_candidate_prepare_lock_metadata(current_lock)
-            or not _safe_candidate_prepare_lock_metadata(opened_lock)
-            or (current_lock.st_dev, current_lock.st_ino) != self.lock_identity
-            or (opened_lock.st_dev, opened_lock.st_ino) != self.lock_identity
-        ):
-            raise DeploymentError("candidate prepare lock changed while held")
-
-
 DataDirectoryIdentity = tuple[int, int, int, int]
 
 
@@ -3314,166 +3270,19 @@ def _prepare_private_directory(directory: Path, *, label: str) -> Path:
     return _validate_private_directory(directory, label=label)
 
 
-def _safe_candidate_prepare_lock_metadata(metadata: os.stat_result) -> bool:
-    return (
-        stat.S_ISREG(metadata.st_mode)
-        and metadata.st_uid == os.geteuid()
-        and stat.S_IMODE(metadata.st_mode) == 0o600
-        and metadata.st_nlink == 1
-    )
+def _require_canonical_deployment_state(state: Any) -> Path:
+    """Bind deploy globals to the retained passwd-derived state root."""
 
-
-@contextmanager
-def _candidate_prepare_lock(
-    source_sha: str,
-    *,
-    require_existing: bool = False,
-) -> Iterator[CandidatePrepareLock]:
-    identity = candidate_identity(source_sha)
-    directory = _validate_private_directory(
-        STATE_DIRECTORY,
-        label="candidate prepare lock directory",
-    )
-    lock_name = f"candidate-{identity.source_sha[:12]}.prepare.lock"
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    directory_flags |= getattr(os, "O_CLOEXEC", 0)
-    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
-    file_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-    file_flags |= getattr(os, "O_NOFOLLOW", 0)
-    directory_descriptor = -1
-    descriptor = -1
-    locked = False
-    try:
-        directory_descriptor = os.open(directory, directory_flags)
-        opened_directory = os.fstat(directory_descriptor)
-        current_directory = directory.lstat()
-        if (
-            not stat.S_ISDIR(opened_directory.st_mode)
-            or (
-                opened_directory.st_dev,
-                opened_directory.st_ino,
-            )
-            != (current_directory.st_dev, current_directory.st_ino)
-            or (
-                opened_directory.st_uid != os.geteuid()
-                or stat.S_IMODE(opened_directory.st_mode) != 0o700
-            )
-        ):
-            raise DeploymentError("candidate prepare lock directory changed")
-        created = False
-        if require_existing:
-            try:
-                existing = os.stat(
-                    lock_name,
-                    dir_fd=directory_descriptor,
-                    follow_symlinks=False,
-                )
-                descriptor = os.open(
-                    lock_name,
-                    file_flags,
-                    dir_fd=directory_descriptor,
-                )
-            except OSError:
-                raise DeploymentError("candidate prepare lock is unsafe") from None
-        else:
-            try:
-                descriptor = os.open(
-                    lock_name,
-                    file_flags | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=directory_descriptor,
-                )
-            except FileExistsError:
-                try:
-                    existing = os.stat(
-                        lock_name,
-                        dir_fd=directory_descriptor,
-                        follow_symlinks=False,
-                    )
-                    descriptor = os.open(
-                        lock_name,
-                        file_flags,
-                        dir_fd=directory_descriptor,
-                    )
-                except OSError:
-                    raise DeploymentError("candidate prepare lock is unsafe") from None
-            else:
-                created = True
-        if not created:
-            opened = os.fstat(descriptor)
-            if (
-                not _safe_candidate_prepare_lock_metadata(existing)
-                or not _safe_candidate_prepare_lock_metadata(opened)
-                or (existing.st_dev, existing.st_ino) != (opened.st_dev, opened.st_ino)
-            ):
-                raise DeploymentError("candidate prepare lock is unsafe")
-        else:
-            os.fchmod(descriptor, 0o600)
-            os.fsync(descriptor)
-            os.fsync(directory_descriptor)
-            opened = os.fstat(descriptor)
-            if not _safe_candidate_prepare_lock_metadata(opened):
-                raise DeploymentError("candidate prepare lock is unsafe")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise DeploymentError(
-                "candidate preparation is already in progress for this SOURCE_SHA"
-            ) from None
-        locked = True
-        current_lock = os.stat(
-            lock_name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-        opened_lock = os.fstat(descriptor)
-        if (
-            not _safe_candidate_prepare_lock_metadata(current_lock)
-            or not _safe_candidate_prepare_lock_metadata(opened_lock)
-            or (current_lock.st_dev, current_lock.st_ino)
-            != (opened_lock.st_dev, opened_lock.st_ino)
-        ):
-            raise DeploymentError("candidate prepare lock changed while acquiring")
-        held_lock = CandidatePrepareLock(
-            state_directory_fd=directory_descriptor,
-            state_directory_path=directory,
-            state_directory_identity=(
-                opened_directory.st_dev,
-                opened_directory.st_ino,
-            ),
-            lock_fd=descriptor,
-            lock_name=lock_name,
-            lock_identity=(opened_lock.st_dev, opened_lock.st_ino),
-        )
-        body_error: BaseException | None = None
-        try:
-            yield held_lock
-        except BaseException as error:
-            body_error = error
-            raise
-        finally:
-            try:
-                held_lock.assert_current()
-            except DeploymentError:
-                if body_error is not None:
-                    raise DeploymentError(
-                        "candidate prepare lock changed while held after the "
-                        "candidate operation also failed"
-                    ) from body_error
-                raise
-    except DeploymentError:
-        raise
-    except OSError:
-        raise DeploymentError(
-            "candidate prepare lock could not be acquired safely"
-        ) from None
-    finally:
-        if locked and descriptor >= 0:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        if descriptor >= 0:
-            os.close(descriptor)
-        if directory_descriptor >= 0:
-            os.close(directory_descriptor)
+    state.revalidate()
+    state_path = state.path
+    if (
+        not isinstance(state_path, Path)
+        or state_path != STATE_DIRECTORY
+        or state_path.parent != APP_ROOT
+        or STATE_DIRECTORY != APP_ROOT / "deploy-state"
+    ):
+        raise DeploymentError("deployment state path is not canonical")
+    return state_path
 
 
 def _open_quarantine_application_root() -> tuple[int, tuple[int, int]]:
@@ -3486,9 +3295,10 @@ def _open_quarantine_application_root() -> tuple[int, tuple[int, int]]:
 def _assert_quarantine_hierarchy_current(
     app_root_fd: int,
     app_root_identity: tuple[int, int],
-    lock: CandidatePrepareLock,
+    lock: Any,
 ) -> None:
-    lock.assert_current()
+    lock.revalidate()
+    lock.state.revalidate()
     try:
         opened_root = os.fstat(app_root_fd)
         current_root = APP_ROOT.lstat()
@@ -3497,7 +3307,7 @@ def _assert_quarantine_hierarchy_current(
             dir_fd=app_root_fd,
             follow_symlinks=False,
         )
-        opened_state = os.fstat(lock.state_directory_fd)
+        opened_state = os.fstat(lock.state.descriptor)
     except OSError:
         raise DeploymentError("candidate quarantine hierarchy changed") from None
     if (
@@ -3512,8 +3322,8 @@ def _assert_quarantine_hierarchy_current(
         or stat.S_IMODE(opened_root.st_mode) != 0o700
         or stat.S_IMODE(current_root.st_mode) != 0o700
         or not stat.S_ISDIR(linked_state.st_mode)
-        or (linked_state.st_dev, linked_state.st_ino) != lock.state_directory_identity
-        or (opened_state.st_dev, opened_state.st_ino) != lock.state_directory_identity
+        or (linked_state.st_dev, linked_state.st_ino)
+        != (opened_state.st_dev, opened_state.st_ino)
         or linked_state.st_uid != os.geteuid()
         or opened_state.st_uid != os.geteuid()
         or stat.S_IMODE(linked_state.st_mode) != 0o700
@@ -3524,6 +3334,8 @@ def _assert_quarantine_hierarchy_current(
         raise DeploymentError(
             "application root and state directory must use the same filesystem"
         )
+    lock.state.revalidate()
+    lock.revalidate()
 
 
 def _candidate_input_metadata(
@@ -3672,7 +3484,7 @@ def _move_candidate_input_to_quarantine(
     label: str,
     app_root_fd: int,
     app_root_identity: tuple[int, int],
-    lock: CandidatePrepareLock,
+    lock: Any,
 ) -> None:
     _assert_quarantine_hierarchy_current(app_root_fd, app_root_identity, lock)
     current = _candidate_input_metadata(
@@ -3726,7 +3538,7 @@ def _move_candidate_data_to_quarantine(
     expected: os.stat_result,
     app_root_fd: int,
     app_root_identity: tuple[int, int],
-    lock: CandidatePrepareLock,
+    lock: Any,
 ) -> None:
     """Move runtime-owned candidate data through the isolated root helper."""
 
@@ -3867,119 +3679,129 @@ def quarantine_candidate_inputs(
     identity = candidate_identity(source_sha)
     app_root_fd = -1
     archive_fd = -1
-    with _candidate_prepare_lock(
-        identity.source_sha,
-        require_existing=True,
-    ) as lock:
-        try:
-            app_root_fd, app_root_identity = _open_quarantine_application_root()
-            _assert_quarantine_hierarchy_current(
-                app_root_fd,
-                app_root_identity,
-                lock,
-            )
-            data_name = identity.data_directory_name
-            state_name = f"candidate-{identity.source_sha[:12]}.json"
-            data_metadata = _candidate_input_metadata(
-                data_name,
-                directory_fd=app_root_fd,
-                label="candidate data",
-            )
-            state_metadata = _candidate_input_metadata(
-                state_name,
-                directory_fd=lock.state_directory_fd,
-                label="candidate state",
-            )
-            if data_metadata is not None:
-                _validate_quarantine_data(data_metadata)
-                if data_metadata.st_dev != app_root_identity[0]:
-                    raise DeploymentError(
-                        "candidate data and application root must use the same "
-                        "filesystem"
+    try:
+        with _PROVENANCE.open_canonical_state_directory() as state:
+            _require_canonical_deployment_state(state)
+            with _PROVENANCE.BuildLock.acquire(state, identity.source_sha) as lock:
+                try:
+                    app_root_fd, app_root_identity = _open_quarantine_application_root()
+                    _assert_quarantine_hierarchy_current(
+                        app_root_fd,
+                        app_root_identity,
+                        lock,
                     )
-            if state_metadata is not None:
-                _validate_quarantine_state(state_metadata)
-                if state_metadata.st_dev != app_root_identity[0]:
-                    raise DeploymentError(
-                        "candidate state and application root must use the same "
-                        "filesystem"
+                    data_name = identity.data_directory_name
+                    state_name = f"candidate-{identity.source_sha[:12]}.json"
+                    data_metadata = _candidate_input_metadata(
+                        data_name,
+                        directory_fd=app_root_fd,
+                        label="candidate data",
                     )
-            if data_metadata is None and state_metadata is None:
-                raise DeploymentError(
-                    "no candidate data or state remains to quarantine"
-                )
+                    state_metadata = _candidate_input_metadata(
+                        state_name,
+                        directory_fd=lock.state.descriptor,
+                        label="candidate state",
+                    )
+                    if data_metadata is not None:
+                        _validate_quarantine_data(data_metadata)
+                        if data_metadata.st_dev != app_root_identity[0]:
+                            raise DeploymentError(
+                                "candidate data and application root must use the "
+                                "same filesystem"
+                            )
+                    if state_metadata is not None:
+                        _validate_quarantine_state(state_metadata)
+                        if state_metadata.st_dev != app_root_identity[0]:
+                            raise DeploymentError(
+                                "candidate state and application root must use the "
+                                "same filesystem"
+                            )
+                    if data_metadata is None and state_metadata is None:
+                        raise DeploymentError(
+                            "no candidate data or state remains to quarantine"
+                        )
 
-            archive_name, archive_fd, archive_identity = _create_quarantine_archive(
-                app_root_fd,
-                source_sha=identity.source_sha,
-            )
-            if data_metadata is not None:
-                command_runner = runner if runner is not None else CommandRunner()
-                _move_candidate_data_to_quarantine(
-                    command_runner,
-                    source_name=data_name,
-                    archive_name=archive_name,
-                    archive_fd=archive_fd,
-                    archive_identity=archive_identity,
-                    expected=data_metadata,
-                    app_root_fd=app_root_fd,
-                    app_root_identity=app_root_identity,
-                    lock=lock,
-                )
-            if state_metadata is not None:
-                _move_candidate_input_to_quarantine(
-                    source_name=state_name,
-                    source_directory_fd=lock.state_directory_fd,
-                    destination_name=state_name,
-                    archive_fd=archive_fd,
-                    expected=state_metadata,
-                    validate=_validate_quarantine_state,
-                    label="candidate state",
-                    app_root_fd=app_root_fd,
-                    app_root_identity=app_root_identity,
-                    lock=lock,
-                )
-            _assert_quarantine_hierarchy_current(
-                app_root_fd,
-                app_root_identity,
-                lock,
-            )
-            linked_archive = os.stat(
-                archive_name,
-                dir_fd=app_root_fd,
-                follow_symlinks=False,
-            )
-            opened_archive = os.fstat(archive_fd)
-            if (
-                not stat.S_ISDIR(linked_archive.st_mode)
-                or not stat.S_ISDIR(opened_archive.st_mode)
-                or (linked_archive.st_dev, linked_archive.st_ino) != archive_identity
-                or (opened_archive.st_dev, opened_archive.st_ino) != archive_identity
-                or (linked_archive.st_uid, linked_archive.st_gid)
-                != (os.geteuid(), os.getegid())
-                or (opened_archive.st_uid, opened_archive.st_gid)
-                != (os.geteuid(), os.getegid())
-                or stat.S_IMODE(linked_archive.st_mode) != 0o700
-                or stat.S_IMODE(opened_archive.st_mode) != 0o700
-            ):
-                raise DeploymentError(
-                    "candidate quarantine archive changed during recovery"
-                )
-            os.fsync(archive_fd)
-            os.fsync(lock.state_directory_fd)
-            os.fsync(app_root_fd)
-            return APP_ROOT / archive_name
-        except DeploymentError:
-            raise
-        except OSError:
-            raise DeploymentError(
-                "candidate inputs could not be quarantined safely"
-            ) from None
-        finally:
-            if archive_fd >= 0:
-                os.close(archive_fd)
-            if app_root_fd >= 0:
-                os.close(app_root_fd)
+                    archive_name, archive_fd, archive_identity = (
+                        _create_quarantine_archive(
+                            app_root_fd,
+                            source_sha=identity.source_sha,
+                        )
+                    )
+                    if data_metadata is not None:
+                        command_runner = (
+                            runner if runner is not None else CommandRunner()
+                        )
+                        _move_candidate_data_to_quarantine(
+                            command_runner,
+                            source_name=data_name,
+                            archive_name=archive_name,
+                            archive_fd=archive_fd,
+                            archive_identity=archive_identity,
+                            expected=data_metadata,
+                            app_root_fd=app_root_fd,
+                            app_root_identity=app_root_identity,
+                            lock=lock,
+                        )
+                    if state_metadata is not None:
+                        _move_candidate_input_to_quarantine(
+                            source_name=state_name,
+                            source_directory_fd=lock.state.descriptor,
+                            destination_name=state_name,
+                            archive_fd=archive_fd,
+                            expected=state_metadata,
+                            validate=_validate_quarantine_state,
+                            label="candidate state",
+                            app_root_fd=app_root_fd,
+                            app_root_identity=app_root_identity,
+                            lock=lock,
+                        )
+                    _assert_quarantine_hierarchy_current(
+                        app_root_fd,
+                        app_root_identity,
+                        lock,
+                    )
+                    linked_archive = os.stat(
+                        archive_name,
+                        dir_fd=app_root_fd,
+                        follow_symlinks=False,
+                    )
+                    opened_archive = os.fstat(archive_fd)
+                    if (
+                        not stat.S_ISDIR(linked_archive.st_mode)
+                        or not stat.S_ISDIR(opened_archive.st_mode)
+                        or (linked_archive.st_dev, linked_archive.st_ino)
+                        != archive_identity
+                        or (opened_archive.st_dev, opened_archive.st_ino)
+                        != archive_identity
+                        or (linked_archive.st_uid, linked_archive.st_gid)
+                        != (os.geteuid(), os.getegid())
+                        or (opened_archive.st_uid, opened_archive.st_gid)
+                        != (os.geteuid(), os.getegid())
+                        or stat.S_IMODE(linked_archive.st_mode) != 0o700
+                        or stat.S_IMODE(opened_archive.st_mode) != 0o700
+                    ):
+                        raise DeploymentError(
+                            "candidate quarantine archive changed during recovery"
+                        )
+                    os.fsync(archive_fd)
+                    lock.state.fsync()
+                    os.fsync(app_root_fd)
+                    return APP_ROOT / archive_name
+                except DeploymentError:
+                    raise
+                except OSError:
+                    raise DeploymentError(
+                        "candidate inputs could not be quarantined safely"
+                    ) from None
+                finally:
+                    if archive_fd >= 0:
+                        os.close(archive_fd)
+                    if app_root_fd >= 0:
+                        os.close(app_root_fd)
+    except DeploymentError:
+        raise
+    except _PROVENANCE.ProvenanceError as error:
+        raise DeploymentError(str(error)) from None
 
 
 def _read_private_bytes(path: Path, *, directory: Path, label: str) -> bytes:
@@ -4150,10 +3972,14 @@ def _deployment_asset_identity_payload(
     }
 
 
-def _load_build_manifest(path: Path) -> Any:
+def _load_build_manifest(
+    path: Path,
+    *,
+    state_directory: Path | None = None,
+) -> Any:
     raw = _read_private_bytes(
         path,
-        directory=STATE_DIRECTORY,
+        directory=STATE_DIRECTORY if state_directory is None else state_directory,
         label="verified build manifest",
     )
     try:
@@ -4325,17 +4151,37 @@ def _write_private_json(path: Path, payload: Mapping[str, object]) -> None:
 
 
 def prepare_candidate(arguments: argparse.Namespace, runner: CommandRunner) -> Path:
-    build_manifest = _load_build_manifest(Path(arguments.build_manifest))
-    if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
-        raise DeploymentError("verified build manifest is invalid")
-    identity = candidate_identity(build_manifest.source_sha)
-    with _candidate_prepare_lock(identity.source_sha):
-        return _prepare_candidate_locked(
-            arguments,
-            runner,
-            build_manifest=build_manifest,
-            identity=identity,
-        )
+    try:
+        with _PROVENANCE.open_canonical_state_directory() as state:
+            state_directory = _require_canonical_deployment_state(state)
+            manifest_path = Path(arguments.build_manifest)
+            filename_sha = _PROVENANCE.source_sha_from_manifest_path(
+                state,
+                manifest_path,
+            )
+            with _PROVENANCE.BuildLock.acquire(state, filename_sha):
+                build_manifest = _load_build_manifest(
+                    manifest_path,
+                    state_directory=state_directory,
+                )
+                if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
+                    raise DeploymentError("verified build manifest is invalid")
+                if build_manifest.source_sha != filename_sha:
+                    raise DeploymentError(
+                        "verified build manifest SOURCE_SHA does not match its filename"
+                    )
+                identity = candidate_identity(filename_sha)
+                return _prepare_candidate_locked(
+                    arguments,
+                    runner,
+                    build_manifest=build_manifest,
+                    identity=identity,
+                    state_directory=state_directory,
+                )
+    except DeploymentError:
+        raise
+    except _PROVENANCE.ProvenanceError as error:
+        raise DeploymentError(str(error)) from None
 
 
 def _prepare_candidate_locked(
@@ -4344,6 +4190,7 @@ def _prepare_candidate_locked(
     *,
     build_manifest: Any,
     identity: CandidateIdentity,
+    state_directory: Path,
 ) -> Path:
     if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
         raise DeploymentError("verified build manifest is invalid")
@@ -4363,7 +4210,7 @@ def _prepare_candidate_locked(
         requested_path=Path(arguments.candidate_data_dir),
         source_sha=identity.source_sha,
     )
-    state_path = STATE_DIRECTORY / f"candidate-{identity.source_sha[:12]}.json"
+    state_path = state_directory / f"candidate-{identity.source_sha[:12]}.json"
     _assert_initial_candidate_state_absent(state_path)
     candidate, candidate_data_identity = _create_candidate_data_directory(
         runner,
