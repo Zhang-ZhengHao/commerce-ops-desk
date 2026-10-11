@@ -65,10 +65,10 @@ public-scan:
 	bash scripts/scan-public-history.sh
 
 lint:
-	"$(PYTHON)" -m ruff check backend scripts deploy/workstation/deploy.py deploy/workstation/build_verified_image.py
-	"$(PYTHON)" -m ruff format --check backend scripts deploy/workstation/deploy.py deploy/workstation/build_verified_image.py
+	"$(PYTHON)" -m ruff check backend scripts deploy/workstation/deploy.py deploy/workstation/build_verified_image.py deploy/workstation/verified_provenance.py
+	"$(PYTHON)" -m ruff format --check backend scripts deploy/workstation/deploy.py deploy/workstation/build_verified_image.py deploy/workstation/verified_provenance.py
 	cd backend && "$(PYTHON)" -m mypy app alembic tests postgres_tests
-	"$(PYTHON)" -m mypy --config-file backend/pyproject.toml deploy/workstation/deploy.py deploy/workstation/build_verified_image.py
+	"$(PYTHON)" -m mypy --config-file backend/pyproject.toml deploy/workstation/deploy.py deploy/workstation/build_verified_image.py deploy/workstation/verified_provenance.py
 	npm --prefix frontend run typecheck
 
 build:

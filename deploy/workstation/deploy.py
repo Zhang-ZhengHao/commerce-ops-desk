@@ -8,11 +8,14 @@ CommerceOps Caddy site fragment.
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
+import math
 import os
 import re
 import secrets
@@ -24,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from ipaddress import (
@@ -36,8 +39,28 @@ from ipaddress import (
     ip_network,
 )
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 from typing import Any, cast
+
+
+def _load_verified_provenance_module() -> ModuleType:
+    module_path = Path(__file__).with_name("verified_provenance.py")
+    module_name = "commerce_ops_verified_provenance_deploy"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("verified provenance module could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if sys.modules.get(module_name) is module:
+            del sys.modules[module_name]
+        raise
+    return module
+
+
+_PROVENANCE = _load_verified_provenance_module()
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = PRODUCT_ROOT / "deploy" / "workstation" / "compose.yaml"
@@ -599,6 +622,7 @@ if fence_bytes != (fence_token + "\\n").encode("ascii"):
     raise SystemExit("Caddy mutation fence token changed")
 """
 SOURCE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
+CANDIDATE_STATE_NAME_PATTERN = re.compile(r"candidate-([0-9a-f]{12})\.json\Z")
 IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 CONTAINER_ID_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 TRANSACTION_ID_PATTERN = re.compile(r"(?P<transaction_id>\d{8}T\d{6}Z-[0-9a-f]{32})\Z")
@@ -609,7 +633,7 @@ BACKUP_NAME_PATTERN = re.compile(
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 COMPOSE_SERVICE = "commerce-ops-desk"
 BUILD_MANIFEST_SCHEMA = 2
-CANDIDATE_STATE_SCHEMA = 2
+CANDIDATE_STATE_SCHEMA = 3
 DEPLOYMENT_ASSET_SCHEMA = 1
 DEPLOYMENT_ASSET_PATHS = (
     "deploy/workstation/compose.yaml",
@@ -775,50 +799,6 @@ class CandidateIdentity:
     data_directory_name: str
 
 
-@dataclass(frozen=True)
-class CandidatePrepareLock:
-    """An inode-bound per-candidate lock held for the context lifetime."""
-
-    state_directory_fd: int
-    state_directory_path: Path
-    state_directory_identity: tuple[int, int]
-    lock_fd: int
-    lock_name: str
-    lock_identity: tuple[int, int]
-
-    def assert_current(self) -> None:
-        """Fail if either pathname no longer names the locked inode."""
-
-        try:
-            opened_directory = os.fstat(self.state_directory_fd)
-            current_directory = self.state_directory_path.lstat()
-            current_lock = os.stat(
-                self.lock_name,
-                dir_fd=self.state_directory_fd,
-                follow_symlinks=False,
-            )
-            opened_lock = os.fstat(self.lock_fd)
-        except OSError:
-            raise DeploymentError("candidate prepare lock changed while held") from None
-        if (
-            not stat.S_ISDIR(opened_directory.st_mode)
-            or not stat.S_ISDIR(current_directory.st_mode)
-            or (opened_directory.st_dev, opened_directory.st_ino)
-            != self.state_directory_identity
-            or (current_directory.st_dev, current_directory.st_ino)
-            != self.state_directory_identity
-            or opened_directory.st_uid != os.geteuid()
-            or current_directory.st_uid != os.geteuid()
-            or stat.S_IMODE(opened_directory.st_mode) != 0o700
-            or stat.S_IMODE(current_directory.st_mode) != 0o700
-            or not _safe_candidate_prepare_lock_metadata(current_lock)
-            or not _safe_candidate_prepare_lock_metadata(opened_lock)
-            or (current_lock.st_dev, current_lock.st_ino) != self.lock_identity
-            or (opened_lock.st_dev, opened_lock.st_ino) != self.lock_identity
-        ):
-            raise DeploymentError("candidate prepare lock changed while held")
-
-
 DataDirectoryIdentity = tuple[int, int, int, int]
 
 
@@ -864,6 +844,24 @@ class VerifiedDeploymentAssets:
     identity: Mapping[str, object]
     compose_yaml: str
     caddy_templates: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class VerifiedPrepareInputs:
+    """All provenance inputs frozen before candidate-side effects begin."""
+
+    deployment_assets: VerifiedDeploymentAssets
+    image_config: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ManifestImageEvidence:
+    """Immutable image surfaces bound to one parsed build manifest."""
+
+    image_id: str
+    config: Mapping[str, Any]
+    rootfs: Mapping[str, Any]
+    platform: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -1887,10 +1885,13 @@ def _parse_json(raw: str, *, label: str) -> object:
 
 
 def _local_docker_daemon_id(runner: CommandRunner) -> str:
-    identifier = _parse_json(
-        runner.run([DOCKER_BINARY, "info", "--format", "{{json .ID}}"]).stdout,
-        label="local Docker daemon identity",
-    )
+    try:
+        result = runner.run([DOCKER_BINARY, "info", "--format", "{{json .ID}}"])
+    except DeploymentError:
+        raise DeploymentError(
+            "local Docker daemon identity could not be inspected"
+        ) from None
+    identifier = _parse_json(result.stdout, label="local Docker daemon identity")
     return _validate_docker_daemon_id(identifier, label="local Docker daemon")
 
 
@@ -2134,6 +2135,251 @@ def _immutable_image_config(
             "immutable candidate image runtime source SHA does not match SOURCE_SHA"
         )
     return cast(dict[str, Any], config)
+
+
+def _manifest_image_document(
+    runner: CommandRunner,
+    reference: str,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    try:
+        result = runner.run([DOCKER_BINARY, "image", "inspect", reference])
+    except DeploymentError:
+        raise DeploymentError(f"{label} could not be inspected") from None
+    inspection = _parse_json(
+        result.stdout,
+        label=label,
+    )
+    if (
+        not isinstance(inspection, list)
+        or len(inspection) != 1
+        or not isinstance(inspection[0], dict)
+    ):
+        raise DeploymentError(f"{label} returned an invalid shape")
+    return cast(dict[str, Any], inspection[0])
+
+
+def _same_json_value(left: object, right: object) -> bool:
+    """Compare JSON values without Python's bool/int/float coercions."""
+
+    if type(left) is not type(right):
+        return False
+    if left is None or type(left) in (str, bool, int):
+        return left == right
+    if type(left) is float:
+        return (
+            isinstance(right, float)
+            and math.isfinite(left)
+            and math.isfinite(right)
+            and left == right
+        )
+    if type(left) is list:
+        if not isinstance(right, list) or len(left) != len(right):
+            return False
+        return all(
+            _same_json_value(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if type(left) is dict:
+        if not isinstance(right, dict):  # pragma: no cover - guarded by type equality.
+            return False
+        if (
+            any(type(key) is not str for key in left)
+            or any(type(key) is not str for key in right)
+            or left.keys() != right.keys()
+        ):
+            return False
+        return all(_same_json_value(left[key], right[key]) for key in left)
+    return False
+
+
+def _unique_image_environment(config: Mapping[str, Any]) -> dict[str, str]:
+    raw_environment = config.get("Env")
+    if not isinstance(raw_environment, list) or any(
+        not isinstance(entry, str)
+        or "=" not in entry
+        or not entry.partition("=")[0]
+        or "\x00" in entry.partition("=")[0]
+        for entry in raw_environment
+    ):
+        raise DeploymentError("image environment is invalid")
+    environment: dict[str, str] = {}
+    for entry in raw_environment:
+        name, _separator, value = entry.partition("=")
+        if name in environment:
+            raise DeploymentError("image environment names must be unique")
+        environment[name] = value
+    return environment
+
+
+def _inspect_manifest_image(
+    runner: CommandRunner,
+    manifest: Any,
+) -> ManifestImageEvidence:
+    """Bind both mutable tag and immutable ID to one manifest image."""
+
+    if not isinstance(manifest, _PROVENANCE.LoadedBuildManifest):
+        raise DeploymentError("verified build manifest is invalid")
+    tag_document = _manifest_image_document(
+        runner,
+        manifest.image_reference,
+        label="manifest image tag inspection",
+    )
+    immutable_document = _manifest_image_document(
+        runner,
+        manifest.image_id,
+        label="manifest immutable image inspection",
+    )
+    if (
+        tag_document.get("Id") != manifest.image_id
+        or immutable_document.get("Id") != manifest.image_id
+        or not _same_json_value(tag_document, immutable_document)
+    ):
+        raise DeploymentError("manifest image tag and immutable identity differ")
+    config = immutable_document.get("Config")
+    rootfs = immutable_document.get("RootFS")
+    if not isinstance(config, dict) or not isinstance(rootfs, dict):
+        raise DeploymentError("manifest image inspection is incomplete")
+    layers = rootfs.get("Layers")
+    if (
+        set(rootfs) != {"Type", "Layers"}
+        or not isinstance(rootfs.get("Type"), str)
+        or not rootfs["Type"]
+        or not isinstance(layers, list)
+        or any(
+            not isinstance(layer, str) or IMAGE_ID_PATTERN.fullmatch(layer) is None
+            for layer in layers
+        )
+    ):
+        raise DeploymentError("manifest image RootFS is invalid")
+    if any(
+        not isinstance(immutable_document.get(key), str) or not immutable_document[key]
+        for key in ("Os", "Architecture")
+    ) or (
+        "Variant" in immutable_document
+        and not isinstance(immutable_document["Variant"], str)
+    ):
+        raise DeploymentError("manifest image platform is invalid")
+    labels = config.get("Labels")
+    if not isinstance(labels, dict):
+        raise DeploymentError("manifest image labels are invalid")
+    if labels.get("org.opencontainers.image.revision") != manifest.source_sha:
+        raise DeploymentError("manifest image OCI revision does not match SOURCE_SHA")
+    environment = _unique_image_environment(config)
+    if environment.get("COMMERCE_OPS_SOURCE_SHA") != manifest.source_sha:
+        raise DeploymentError(
+            "manifest image runtime source SHA does not match SOURCE_SHA"
+        )
+    try:
+        _PROVENANCE.validate_reserved_provenance_labels(manifest, labels)
+    except _PROVENANCE.ProvenanceError as error:
+        raise DeploymentError(str(error)) from None
+    platform: dict[str, Any] = {
+        key: copy.deepcopy(immutable_document[key])
+        for key in ("Os", "Architecture", "Variant")
+        if key in immutable_document
+    }
+    return ManifestImageEvidence(
+        image_id=manifest.image_id,
+        config=MappingProxyType(copy.deepcopy(config)),
+        rootfs=MappingProxyType(copy.deepcopy(rootfs)),
+        platform=MappingProxyType(platform),
+    )
+
+
+def _restore_reuse_config_to_donor(
+    target_manifest: Any,
+    target_config: Mapping[str, Any],
+    donor_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(target_manifest.build, _PROVENANCE.VerifiedRuntimeReuse):
+        raise DeploymentError("reuse image evidence is invalid")
+    normalized = copy.deepcopy(dict(target_config))
+    donor = copy.deepcopy(dict(donor_config))
+    target_environment = _unique_image_environment(normalized)
+    donor_environment = _unique_image_environment(donor)
+    if set(target_environment) != set(donor_environment):
+        raise DeploymentError("reuse image environments are not equivalent")
+    raw_environment = normalized.get("Env")
+    assert isinstance(raw_environment, list)
+    normalized["Env"] = [
+        (
+            f"COMMERCE_OPS_SOURCE_SHA={donor_environment[name]}"
+            if name == "COMMERCE_OPS_SOURCE_SHA"
+            else entry
+        )
+        for entry in raw_environment
+        for name in [entry.partition("=")[0]]
+    ]
+
+    target_labels = normalized.get("Labels")
+    donor_labels = donor.get("Labels")
+    if not isinstance(target_labels, dict) or not isinstance(donor_labels, dict):
+        raise DeploymentError("reuse image labels are invalid")
+    normalized_labels = cast(dict[str, Any], target_labels)
+    donor_revision_key = "org.opencontainers.image.revision"
+    if donor_revision_key not in donor_labels:
+        raise DeploymentError("donor image OCI revision is missing")
+    normalized_labels[donor_revision_key] = donor_labels[donor_revision_key]
+    for key in (
+        _PROVENANCE.BUILD_KIND_LABEL,
+        _PROVENANCE.REUSED_FROM_SOURCE_LABEL,
+        _PROVENANCE.REUSED_FROM_IMAGE_ID_LABEL,
+        _PROVENANCE.RUNTIME_INPUTS_SHA256_LABEL,
+    ):
+        if key in donor_labels:
+            normalized_labels[key] = donor_labels[key]
+        else:
+            normalized_labels.pop(key, None)
+    return normalized
+
+
+def _assert_reuse_image_equivalence(
+    *,
+    target_manifest: Any,
+    target_image: ManifestImageEvidence,
+    donor_manifest: Any,
+    donor_image: ManifestImageEvidence,
+) -> None:
+    """Require complete runtime equivalence after approved metadata rebinding."""
+
+    if (
+        not isinstance(target_manifest, _PROVENANCE.LoadedBuildManifest)
+        or not isinstance(donor_manifest, _PROVENANCE.LoadedBuildManifest)
+        or not isinstance(target_image, ManifestImageEvidence)
+        or not isinstance(donor_image, ManifestImageEvidence)
+        or target_image.image_id != target_manifest.image_id
+        or donor_image.image_id != donor_manifest.image_id
+        or target_image.image_id == donor_image.image_id
+    ):
+        raise DeploymentError("reuse image evidence is invalid")
+    try:
+        _PROVENANCE.validate_candidate_manifest_chain(
+            target_manifest,
+            donor_manifest,
+        )
+    except _PROVENANCE.ProvenanceError as error:
+        raise DeploymentError(str(error)) from None
+    if (
+        not _same_json_value(
+            dict(target_image.rootfs),
+            dict(donor_image.rootfs),
+        )
+        or not _same_json_value(
+            dict(target_image.platform),
+            dict(donor_image.platform),
+        )
+        or not _same_json_value(
+            _restore_reuse_config_to_donor(
+                target_manifest,
+                target_image.config,
+                donor_image.config,
+            ),
+            dict(donor_image.config),
+        )
+    ):
+        raise DeploymentError("reuse image runtime configuration is not equivalent")
 
 
 def _assert_candidate_absent(
@@ -3292,166 +3538,19 @@ def _prepare_private_directory(directory: Path, *, label: str) -> Path:
     return _validate_private_directory(directory, label=label)
 
 
-def _safe_candidate_prepare_lock_metadata(metadata: os.stat_result) -> bool:
-    return (
-        stat.S_ISREG(metadata.st_mode)
-        and metadata.st_uid == os.geteuid()
-        and stat.S_IMODE(metadata.st_mode) == 0o600
-        and metadata.st_nlink == 1
-    )
+def _require_canonical_deployment_state(state: Any) -> Path:
+    """Bind deploy globals to the retained passwd-derived state root."""
 
-
-@contextmanager
-def _candidate_prepare_lock(
-    source_sha: str,
-    *,
-    require_existing: bool = False,
-) -> Iterator[CandidatePrepareLock]:
-    identity = candidate_identity(source_sha)
-    directory = _validate_private_directory(
-        STATE_DIRECTORY,
-        label="candidate prepare lock directory",
-    )
-    lock_name = f"candidate-{identity.source_sha[:12]}.prepare.lock"
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    directory_flags |= getattr(os, "O_CLOEXEC", 0)
-    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
-    file_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-    file_flags |= getattr(os, "O_NOFOLLOW", 0)
-    directory_descriptor = -1
-    descriptor = -1
-    locked = False
-    try:
-        directory_descriptor = os.open(directory, directory_flags)
-        opened_directory = os.fstat(directory_descriptor)
-        current_directory = directory.lstat()
-        if (
-            not stat.S_ISDIR(opened_directory.st_mode)
-            or (
-                opened_directory.st_dev,
-                opened_directory.st_ino,
-            )
-            != (current_directory.st_dev, current_directory.st_ino)
-            or (
-                opened_directory.st_uid != os.geteuid()
-                or stat.S_IMODE(opened_directory.st_mode) != 0o700
-            )
-        ):
-            raise DeploymentError("candidate prepare lock directory changed")
-        created = False
-        if require_existing:
-            try:
-                existing = os.stat(
-                    lock_name,
-                    dir_fd=directory_descriptor,
-                    follow_symlinks=False,
-                )
-                descriptor = os.open(
-                    lock_name,
-                    file_flags,
-                    dir_fd=directory_descriptor,
-                )
-            except OSError:
-                raise DeploymentError("candidate prepare lock is unsafe") from None
-        else:
-            try:
-                descriptor = os.open(
-                    lock_name,
-                    file_flags | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=directory_descriptor,
-                )
-            except FileExistsError:
-                try:
-                    existing = os.stat(
-                        lock_name,
-                        dir_fd=directory_descriptor,
-                        follow_symlinks=False,
-                    )
-                    descriptor = os.open(
-                        lock_name,
-                        file_flags,
-                        dir_fd=directory_descriptor,
-                    )
-                except OSError:
-                    raise DeploymentError("candidate prepare lock is unsafe") from None
-            else:
-                created = True
-        if not created:
-            opened = os.fstat(descriptor)
-            if (
-                not _safe_candidate_prepare_lock_metadata(existing)
-                or not _safe_candidate_prepare_lock_metadata(opened)
-                or (existing.st_dev, existing.st_ino) != (opened.st_dev, opened.st_ino)
-            ):
-                raise DeploymentError("candidate prepare lock is unsafe")
-        else:
-            os.fchmod(descriptor, 0o600)
-            os.fsync(descriptor)
-            os.fsync(directory_descriptor)
-            opened = os.fstat(descriptor)
-            if not _safe_candidate_prepare_lock_metadata(opened):
-                raise DeploymentError("candidate prepare lock is unsafe")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise DeploymentError(
-                "candidate preparation is already in progress for this SOURCE_SHA"
-            ) from None
-        locked = True
-        current_lock = os.stat(
-            lock_name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-        opened_lock = os.fstat(descriptor)
-        if (
-            not _safe_candidate_prepare_lock_metadata(current_lock)
-            or not _safe_candidate_prepare_lock_metadata(opened_lock)
-            or (current_lock.st_dev, current_lock.st_ino)
-            != (opened_lock.st_dev, opened_lock.st_ino)
-        ):
-            raise DeploymentError("candidate prepare lock changed while acquiring")
-        held_lock = CandidatePrepareLock(
-            state_directory_fd=directory_descriptor,
-            state_directory_path=directory,
-            state_directory_identity=(
-                opened_directory.st_dev,
-                opened_directory.st_ino,
-            ),
-            lock_fd=descriptor,
-            lock_name=lock_name,
-            lock_identity=(opened_lock.st_dev, opened_lock.st_ino),
-        )
-        body_error: BaseException | None = None
-        try:
-            yield held_lock
-        except BaseException as error:
-            body_error = error
-            raise
-        finally:
-            try:
-                held_lock.assert_current()
-            except DeploymentError:
-                if body_error is not None:
-                    raise DeploymentError(
-                        "candidate prepare lock changed while held after the "
-                        "candidate operation also failed"
-                    ) from body_error
-                raise
-    except DeploymentError:
-        raise
-    except OSError:
-        raise DeploymentError(
-            "candidate prepare lock could not be acquired safely"
-        ) from None
-    finally:
-        if locked and descriptor >= 0:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        if descriptor >= 0:
-            os.close(descriptor)
-        if directory_descriptor >= 0:
-            os.close(directory_descriptor)
+    state.revalidate()
+    state_path = state.path
+    if (
+        not isinstance(state_path, Path)
+        or state_path != STATE_DIRECTORY
+        or state_path.parent != APP_ROOT
+        or STATE_DIRECTORY != APP_ROOT / "deploy-state"
+    ):
+        raise DeploymentError("deployment state path is not canonical")
+    return state_path
 
 
 def _open_quarantine_application_root() -> tuple[int, tuple[int, int]]:
@@ -3464,9 +3563,10 @@ def _open_quarantine_application_root() -> tuple[int, tuple[int, int]]:
 def _assert_quarantine_hierarchy_current(
     app_root_fd: int,
     app_root_identity: tuple[int, int],
-    lock: CandidatePrepareLock,
+    lock: Any,
 ) -> None:
-    lock.assert_current()
+    lock.revalidate()
+    lock.state.revalidate()
     try:
         opened_root = os.fstat(app_root_fd)
         current_root = APP_ROOT.lstat()
@@ -3475,7 +3575,7 @@ def _assert_quarantine_hierarchy_current(
             dir_fd=app_root_fd,
             follow_symlinks=False,
         )
-        opened_state = os.fstat(lock.state_directory_fd)
+        opened_state = os.fstat(lock.state.descriptor)
     except OSError:
         raise DeploymentError("candidate quarantine hierarchy changed") from None
     if (
@@ -3490,8 +3590,8 @@ def _assert_quarantine_hierarchy_current(
         or stat.S_IMODE(opened_root.st_mode) != 0o700
         or stat.S_IMODE(current_root.st_mode) != 0o700
         or not stat.S_ISDIR(linked_state.st_mode)
-        or (linked_state.st_dev, linked_state.st_ino) != lock.state_directory_identity
-        or (opened_state.st_dev, opened_state.st_ino) != lock.state_directory_identity
+        or (linked_state.st_dev, linked_state.st_ino)
+        != (opened_state.st_dev, opened_state.st_ino)
         or linked_state.st_uid != os.geteuid()
         or opened_state.st_uid != os.geteuid()
         or stat.S_IMODE(linked_state.st_mode) != 0o700
@@ -3502,6 +3602,8 @@ def _assert_quarantine_hierarchy_current(
         raise DeploymentError(
             "application root and state directory must use the same filesystem"
         )
+    lock.state.revalidate()
+    lock.revalidate()
 
 
 def _candidate_input_metadata(
@@ -3650,7 +3752,7 @@ def _move_candidate_input_to_quarantine(
     label: str,
     app_root_fd: int,
     app_root_identity: tuple[int, int],
-    lock: CandidatePrepareLock,
+    lock: Any,
 ) -> None:
     _assert_quarantine_hierarchy_current(app_root_fd, app_root_identity, lock)
     current = _candidate_input_metadata(
@@ -3704,7 +3806,7 @@ def _move_candidate_data_to_quarantine(
     expected: os.stat_result,
     app_root_fd: int,
     app_root_identity: tuple[int, int],
-    lock: CandidatePrepareLock,
+    lock: Any,
 ) -> None:
     """Move runtime-owned candidate data through the isolated root helper."""
 
@@ -3845,122 +3947,132 @@ def quarantine_candidate_inputs(
     identity = candidate_identity(source_sha)
     app_root_fd = -1
     archive_fd = -1
-    with _candidate_prepare_lock(
-        identity.source_sha,
-        require_existing=True,
-    ) as lock:
-        try:
-            app_root_fd, app_root_identity = _open_quarantine_application_root()
-            _assert_quarantine_hierarchy_current(
-                app_root_fd,
-                app_root_identity,
-                lock,
-            )
-            data_name = identity.data_directory_name
-            state_name = f"candidate-{identity.source_sha[:12]}.json"
-            data_metadata = _candidate_input_metadata(
-                data_name,
-                directory_fd=app_root_fd,
-                label="candidate data",
-            )
-            state_metadata = _candidate_input_metadata(
-                state_name,
-                directory_fd=lock.state_directory_fd,
-                label="candidate state",
-            )
-            if data_metadata is not None:
-                _validate_quarantine_data(data_metadata)
-                if data_metadata.st_dev != app_root_identity[0]:
-                    raise DeploymentError(
-                        "candidate data and application root must use the same "
-                        "filesystem"
+    try:
+        with _PROVENANCE.open_canonical_state_directory() as state:
+            _require_canonical_deployment_state(state)
+            with _PROVENANCE.BuildLock.acquire(state, identity.source_sha) as lock:
+                try:
+                    app_root_fd, app_root_identity = _open_quarantine_application_root()
+                    _assert_quarantine_hierarchy_current(
+                        app_root_fd,
+                        app_root_identity,
+                        lock,
                     )
-            if state_metadata is not None:
-                _validate_quarantine_state(state_metadata)
-                if state_metadata.st_dev != app_root_identity[0]:
-                    raise DeploymentError(
-                        "candidate state and application root must use the same "
-                        "filesystem"
+                    data_name = identity.data_directory_name
+                    state_name = f"candidate-{identity.source_sha[:12]}.json"
+                    data_metadata = _candidate_input_metadata(
+                        data_name,
+                        directory_fd=app_root_fd,
+                        label="candidate data",
                     )
-            if data_metadata is None and state_metadata is None:
-                raise DeploymentError(
-                    "no candidate data or state remains to quarantine"
-                )
+                    state_metadata = _candidate_input_metadata(
+                        state_name,
+                        directory_fd=lock.state.descriptor,
+                        label="candidate state",
+                    )
+                    if data_metadata is not None:
+                        _validate_quarantine_data(data_metadata)
+                        if data_metadata.st_dev != app_root_identity[0]:
+                            raise DeploymentError(
+                                "candidate data and application root must use the "
+                                "same filesystem"
+                            )
+                    if state_metadata is not None:
+                        _validate_quarantine_state(state_metadata)
+                        if state_metadata.st_dev != app_root_identity[0]:
+                            raise DeploymentError(
+                                "candidate state and application root must use the "
+                                "same filesystem"
+                            )
+                    if data_metadata is None and state_metadata is None:
+                        raise DeploymentError(
+                            "no candidate data or state remains to quarantine"
+                        )
 
-            archive_name, archive_fd, archive_identity = _create_quarantine_archive(
-                app_root_fd,
-                source_sha=identity.source_sha,
-            )
-            if data_metadata is not None:
-                command_runner = runner if runner is not None else CommandRunner()
-                _move_candidate_data_to_quarantine(
-                    command_runner,
-                    source_name=data_name,
-                    archive_name=archive_name,
-                    archive_fd=archive_fd,
-                    archive_identity=archive_identity,
-                    expected=data_metadata,
-                    app_root_fd=app_root_fd,
-                    app_root_identity=app_root_identity,
-                    lock=lock,
-                )
-            if state_metadata is not None:
-                _move_candidate_input_to_quarantine(
-                    source_name=state_name,
-                    source_directory_fd=lock.state_directory_fd,
-                    destination_name=state_name,
-                    archive_fd=archive_fd,
-                    expected=state_metadata,
-                    validate=_validate_quarantine_state,
-                    label="candidate state",
-                    app_root_fd=app_root_fd,
-                    app_root_identity=app_root_identity,
-                    lock=lock,
-                )
-            _assert_quarantine_hierarchy_current(
-                app_root_fd,
-                app_root_identity,
-                lock,
-            )
-            linked_archive = os.stat(
-                archive_name,
-                dir_fd=app_root_fd,
-                follow_symlinks=False,
-            )
-            opened_archive = os.fstat(archive_fd)
-            if (
-                not stat.S_ISDIR(linked_archive.st_mode)
-                or not stat.S_ISDIR(opened_archive.st_mode)
-                or (linked_archive.st_dev, linked_archive.st_ino) != archive_identity
-                or (opened_archive.st_dev, opened_archive.st_ino) != archive_identity
-                or (linked_archive.st_uid, linked_archive.st_gid)
-                != (os.geteuid(), os.getegid())
-                or (opened_archive.st_uid, opened_archive.st_gid)
-                != (os.geteuid(), os.getegid())
-                or stat.S_IMODE(linked_archive.st_mode) != 0o700
-                or stat.S_IMODE(opened_archive.st_mode) != 0o700
-            ):
-                raise DeploymentError(
-                    "candidate quarantine archive changed during recovery"
-                )
-            os.fsync(archive_fd)
-            os.fsync(lock.state_directory_fd)
-            os.fsync(app_root_fd)
-            return APP_ROOT / archive_name
-        except DeploymentError:
-            raise
-        except OSError:
-            raise DeploymentError(
-                "candidate inputs could not be quarantined safely"
-            ) from None
-        finally:
-            if archive_fd >= 0:
-                os.close(archive_fd)
-            if app_root_fd >= 0:
-                os.close(app_root_fd)
+                    archive_name, archive_fd, archive_identity = (
+                        _create_quarantine_archive(
+                            app_root_fd,
+                            source_sha=identity.source_sha,
+                        )
+                    )
+                    if data_metadata is not None:
+                        command_runner = (
+                            runner if runner is not None else CommandRunner()
+                        )
+                        _move_candidate_data_to_quarantine(
+                            command_runner,
+                            source_name=data_name,
+                            archive_name=archive_name,
+                            archive_fd=archive_fd,
+                            archive_identity=archive_identity,
+                            expected=data_metadata,
+                            app_root_fd=app_root_fd,
+                            app_root_identity=app_root_identity,
+                            lock=lock,
+                        )
+                    if state_metadata is not None:
+                        _move_candidate_input_to_quarantine(
+                            source_name=state_name,
+                            source_directory_fd=lock.state.descriptor,
+                            destination_name=state_name,
+                            archive_fd=archive_fd,
+                            expected=state_metadata,
+                            validate=_validate_quarantine_state,
+                            label="candidate state",
+                            app_root_fd=app_root_fd,
+                            app_root_identity=app_root_identity,
+                            lock=lock,
+                        )
+                    _assert_quarantine_hierarchy_current(
+                        app_root_fd,
+                        app_root_identity,
+                        lock,
+                    )
+                    linked_archive = os.stat(
+                        archive_name,
+                        dir_fd=app_root_fd,
+                        follow_symlinks=False,
+                    )
+                    opened_archive = os.fstat(archive_fd)
+                    if (
+                        not stat.S_ISDIR(linked_archive.st_mode)
+                        or not stat.S_ISDIR(opened_archive.st_mode)
+                        or (linked_archive.st_dev, linked_archive.st_ino)
+                        != archive_identity
+                        or (opened_archive.st_dev, opened_archive.st_ino)
+                        != archive_identity
+                        or (linked_archive.st_uid, linked_archive.st_gid)
+                        != (os.geteuid(), os.getegid())
+                        or (opened_archive.st_uid, opened_archive.st_gid)
+                        != (os.geteuid(), os.getegid())
+                        or stat.S_IMODE(linked_archive.st_mode) != 0o700
+                        or stat.S_IMODE(opened_archive.st_mode) != 0o700
+                    ):
+                        raise DeploymentError(
+                            "candidate quarantine archive changed during recovery"
+                        )
+                    os.fsync(archive_fd)
+                    lock.state.fsync()
+                    os.fsync(app_root_fd)
+                    return APP_ROOT / archive_name
+                except DeploymentError:
+                    raise
+                except OSError:
+                    raise DeploymentError(
+                        "candidate inputs could not be quarantined safely"
+                    ) from None
+                finally:
+                    if archive_fd >= 0:
+                        os.close(archive_fd)
+                    if app_root_fd >= 0:
+                        os.close(app_root_fd)
+    except DeploymentError:
+        raise
+    except _PROVENANCE.ProvenanceError as error:
+        raise DeploymentError(str(error)) from None
 
 
-def _read_private_text(path: Path, *, directory: Path, label: str) -> str:
+def _read_private_bytes(path: Path, *, directory: Path, label: str) -> bytes:
     private_directory = _validate_private_directory(
         directory, label=f"{label} directory"
     )
@@ -3982,8 +4094,8 @@ def _read_private_text(path: Path, *, directory: Path, label: str) -> str:
     if metadata.st_nlink != 1:
         raise DeploymentError(f"{label} must have exactly one hard link")
     try:
-        return resolved.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        return resolved.read_bytes()
+    except OSError:
         raise DeploymentError(f"{label} could not be read safely") from None
 
 
@@ -4128,49 +4240,200 @@ def _deployment_asset_identity_payload(
     }
 
 
-def _load_build_manifest(path: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(
-            _read_private_text(
-                path,
-                directory=STATE_DIRECTORY,
-                label="verified build manifest",
-            )
+def _load_build_manifest(
+    path: Path,
+    *,
+    state_directory: Path | None = None,
+    retained_bytes: bytes | None = None,
+) -> Any:
+    raw = (
+        _read_private_bytes(
+            path,
+            directory=STATE_DIRECTORY if state_directory is None else state_directory,
+            label="verified build manifest",
         )
-    except json.JSONDecodeError:
-        raise DeploymentError("verified build manifest is invalid") from None
-    expected_fields = {
-        "approved_remote_ref",
-        "deployment_assets",
-        "docker_daemon_id",
-        "image_id",
-        "image_reference",
-        "schema",
-        "source_sha",
-    }
-    if not isinstance(payload, dict) or set(payload) != expected_fields:
-        raise DeploymentError("verified build manifest schema is invalid")
-    if (
-        type(payload.get("schema")) is not int
-        or payload["schema"] != BUILD_MANIFEST_SCHEMA
-    ):
-        raise DeploymentError("verified build manifest schema is unsupported")
-    source_sha = payload.get("source_sha")
-    if not isinstance(source_sha, str):
-        raise DeploymentError("verified build manifest is missing SOURCE_SHA")
-    identity = candidate_identity(source_sha)
-    if payload.get("image_reference") != identity.image:
-        raise DeploymentError("verified build manifest has an invalid image reference")
-    image_id = payload.get("image_id")
-    if not isinstance(image_id, str) or IMAGE_ID_PATTERN.fullmatch(image_id) is None:
-        raise DeploymentError("verified build manifest has an invalid image ID")
-    _validate_manifest_remote_ref(payload.get("approved_remote_ref"))
-    _validate_deployment_assets(payload.get("deployment_assets"))
-    _validate_docker_daemon_id(
-        payload.get("docker_daemon_id"),
-        label="verified build manifest",
+        if retained_bytes is None
+        else retained_bytes
     )
-    return cast(dict[str, Any], payload)
+    if type(raw) is not bytes:
+        raise DeploymentError("verified build manifest is invalid")
+    try:
+        return _PROVENANCE.parse_build_manifest_bytes(raw)
+    except _PROVENANCE.ProvenanceError:
+        raise DeploymentError("verified build manifest is invalid") from None
+
+
+def _typed_deployment_asset_payload(manifest: Any) -> dict[str, object]:
+    if not isinstance(manifest, _PROVENANCE.LoadedBuildManifest):
+        raise DeploymentError("verified build manifest is invalid")
+    assets = manifest.deployment_assets
+    return {
+        "schema": assets.schema,
+        "sha256": dict(assets.sha256),
+    }
+
+
+def _same_deployment_asset_identity(
+    observed: object,
+    expected: Any,
+) -> bool:
+    return (
+        isinstance(observed, _PROVENANCE.DeploymentAssets)
+        and isinstance(expected, _PROVENANCE.DeploymentAssets)
+        and observed == expected
+    )
+
+
+def _verify_prepare_inputs(
+    *,
+    state: Any,
+    build_lock: Any,
+    target_manifest_read: Any,
+    build_manifest: Any,
+    runner: CommandRunner,
+) -> VerifiedPrepareInputs:
+    """Finish every mutable provenance check before candidate-side effects."""
+
+    if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
+        raise DeploymentError("verified build manifest is invalid")
+    if target_manifest_read.data != build_manifest.raw_bytes:
+        raise DeploymentError("verified build manifest identity changed")
+
+    donor_manifest: Any | None = None
+    donor_manifest_read: Any | None = None
+    donor_sha: str | None = None
+    asset_reads: dict[str, Any] = {}
+    with ExitStack() as retained:
+        if isinstance(build_manifest.build, _PROVENANCE.SourceBuild):
+            _PROVENANCE.validate_candidate_manifest_chain(build_manifest, None)
+        elif isinstance(build_manifest.build, _PROVENANCE.VerifiedRuntimeReuse):
+            donor_sha = build_manifest.build.reused_from.source_sha
+            donor_path = _PROVENANCE.canonical_manifest_path(state, donor_sha)
+            donor_manifest_read = retained.enter_context(
+                _PROVENANCE.safe_read_direct_child(
+                    state,
+                    donor_path.name,
+                    expected_mode=0o600,
+                    maximum_size=256 * 1024,
+                )
+            )
+            donor_manifest = _PROVENANCE.parse_build_manifest_bytes(
+                donor_manifest_read.data
+            )
+            if donor_manifest.source_sha != donor_sha:
+                raise DeploymentError(
+                    "donor build manifest SOURCE_SHA does not match its filename"
+                )
+            _PROVENANCE.validate_candidate_manifest_chain(
+                build_manifest,
+                donor_manifest,
+            )
+        else:  # pragma: no cover - typed manifest constructor invariant.
+            raise DeploymentError("verified build manifest is invalid")
+
+        checkout = retained.enter_context(
+            _PROVENANCE.open_canonical_checkout_root(PRODUCT_ROOT)
+        )
+        if isinstance(build_manifest.build, _PROVENANCE.SourceBuild):
+            git_evidence = _PROVENANCE.export_revision_evidence(
+                checkout,
+                build_manifest.source_sha,
+                build_manifest.approved_remote_ref,
+                workspace=state.path,
+            )
+            if (
+                git_evidence.source_sha != build_manifest.source_sha
+                or not _same_deployment_asset_identity(
+                    git_evidence.deployment_assets,
+                    build_manifest.deployment_assets,
+                )
+            ):
+                raise DeploymentError(
+                    "current Git evidence does not match the build manifest"
+                )
+        else:
+            assert donor_sha is not None
+            assert donor_manifest is not None
+            git_evidence = _PROVENANCE.recompute_runtime_equivalence(
+                checkout,
+                donor_sha=donor_sha,
+                target_sha=build_manifest.source_sha,
+                approved_remote_ref=build_manifest.approved_remote_ref,
+                workspace=state.path,
+            )
+            if (
+                git_evidence.donor.source_sha != donor_manifest.source_sha
+                or not _same_deployment_asset_identity(
+                    git_evidence.donor.deployment_assets,
+                    donor_manifest.deployment_assets,
+                )
+                or git_evidence.target.source_sha != build_manifest.source_sha
+                or not _same_deployment_asset_identity(
+                    git_evidence.target.deployment_assets,
+                    build_manifest.deployment_assets,
+                )
+                or git_evidence.runtime_equivalence
+                != build_manifest.build.runtime_equivalence
+            ):
+                raise DeploymentError(
+                    "current Git reuse evidence does not match the build manifest"
+                )
+
+        _assert_local_docker_daemon(runner, build_manifest.docker_daemon_id)
+        target_image = _inspect_manifest_image(runner, build_manifest)
+        if donor_manifest is not None:
+            donor_image = _inspect_manifest_image(runner, donor_manifest)
+            _assert_reuse_image_equivalence(
+                target_manifest=build_manifest,
+                target_image=target_image,
+                donor_manifest=donor_manifest,
+                donor_image=donor_image,
+            )
+
+        asset_contents: dict[str, str] = {}
+        expected_digests = build_manifest.deployment_assets.sha256
+        for relative_path in DEPLOYMENT_ASSET_PATHS:
+            opened = retained.enter_context(
+                _PROVENANCE.safe_read_deployment_asset(checkout, relative_path)
+            )
+            asset_reads[relative_path] = opened
+            if (
+                hashlib.sha256(opened.data).hexdigest()
+                != expected_digests[relative_path]
+                or opened.text is None
+            ):
+                raise DeploymentError(
+                    f"deployment asset digest changed: {relative_path}"
+                )
+            asset_contents[relative_path] = opened.text
+
+        target_manifest_read.fsync()
+        state.fsync()
+        target_manifest_read.revalidate()
+        if donor_manifest_read is not None:
+            donor_manifest_read.revalidate()
+        for relative_path in DEPLOYMENT_ASSET_PATHS:
+            asset_reads[relative_path].revalidate()
+        checkout.revalidate()
+        build_lock.revalidate()
+
+        identity: dict[str, object] = {
+            "schema": build_manifest.deployment_assets.schema,
+            "sha256": dict(expected_digests),
+        }
+        return VerifiedPrepareInputs(
+            deployment_assets=VerifiedDeploymentAssets(
+                identity=MappingProxyType(identity),
+                compose_yaml=asset_contents[COMPOSE_ASSET_PATH],
+                caddy_templates=MappingProxyType(
+                    {
+                        profile: asset_contents[relative_path]
+                        for profile, relative_path in CADDY_PROFILE_ASSET_PATHS.items()
+                    }
+                ),
+            ),
+            image_config=target_image.config,
+        )
 
 
 def _write_private_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -4326,34 +4589,84 @@ def _write_private_json(path: Path, payload: Mapping[str, object]) -> None:
 
 
 def prepare_candidate(arguments: argparse.Namespace, runner: CommandRunner) -> Path:
-    build_manifest = _load_build_manifest(Path(arguments.build_manifest))
-    identity = candidate_identity(cast(str, build_manifest["source_sha"]))
-    with _candidate_prepare_lock(identity.source_sha):
-        return _prepare_candidate_locked(
-            arguments,
-            runner,
-            build_manifest=build_manifest,
-            identity=identity,
-        )
+    try:
+        with _PROVENANCE.open_canonical_state_directory() as state:
+            state_directory = _require_canonical_deployment_state(state)
+            manifest_path = Path(arguments.build_manifest)
+            filename_sha = _PROVENANCE.source_sha_from_manifest_path(
+                state,
+                manifest_path,
+            )
+            with (
+                _PROVENANCE.BuildLock.acquire(state, filename_sha) as build_lock,
+                _PROVENANCE.safe_read_direct_child(
+                    state,
+                    manifest_path.name,
+                    expected_mode=0o600,
+                    maximum_size=256 * 1024,
+                ) as target_manifest_read,
+            ):
+                build_manifest = _load_build_manifest(
+                    manifest_path,
+                    state_directory=state_directory,
+                    retained_bytes=target_manifest_read.data,
+                )
+                if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
+                    raise DeploymentError("verified build manifest is invalid")
+                if build_manifest.source_sha != filename_sha:
+                    raise DeploymentError(
+                        "verified build manifest SOURCE_SHA does not match its filename"
+                    )
+                verified_inputs = _verify_prepare_inputs(
+                    state=state,
+                    build_lock=build_lock,
+                    target_manifest_read=target_manifest_read,
+                    build_manifest=build_manifest,
+                    runner=runner,
+                )
+                identity = candidate_identity(filename_sha)
+                return _prepare_candidate_locked(
+                    arguments,
+                    runner,
+                    build_manifest=build_manifest,
+                    verified_inputs=verified_inputs,
+                    identity=identity,
+                    state_directory=state_directory,
+                )
+    except DeploymentError:
+        raise
+    except _PROVENANCE.ProvenanceError as error:
+        raise DeploymentError(str(error)) from None
 
 
 def _prepare_candidate_locked(
     arguments: argparse.Namespace,
     runner: CommandRunner,
     *,
-    build_manifest: Mapping[str, Any],
+    build_manifest: Any,
+    verified_inputs: VerifiedPrepareInputs,
     identity: CandidateIdentity,
+    state_directory: Path,
 ) -> Path:
-    deployment_assets = _load_verified_deployment_assets(
-        build_manifest["deployment_assets"]
+    if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
+        raise DeploymentError("verified build manifest is invalid")
+    if not isinstance(verified_inputs, VerifiedPrepareInputs):
+        raise DeploymentError("verified prepare inputs are invalid")
+    build_provenance = _PROVENANCE.candidate_build_provenance(build_manifest)
+    build_provenance_payload = _PROVENANCE.candidate_build_provenance_payload(
+        build_provenance
     )
+    build_provenance_digest = _PROVENANCE.candidate_build_provenance_digest(
+        build_provenance
+    )
+    deployment_assets = verified_inputs.deployment_assets
     port = validate_candidate_port(arguments.candidate_port)
     requested_candidate = _candidate_data_path_for_creation(
         app_root=APP_ROOT,
         requested_path=Path(arguments.candidate_data_dir),
         source_sha=identity.source_sha,
     )
-    state_path = STATE_DIRECTORY / f"candidate-{identity.source_sha[:12]}.json"
+    state_path = state_directory / f"candidate-{identity.source_sha[:12]}.json"
     _assert_initial_candidate_state_absent(state_path)
     candidate, candidate_data_identity = _create_candidate_data_directory(
         runner,
@@ -4382,15 +4695,9 @@ def _prepare_candidate_locked(
         label="candidate data directory",
     )
     _assert_initial_candidate_data(runner, candidate, candidate_data_identity)
-    docker_daemon_id = cast(str, build_manifest["docker_daemon_id"])
-    _assert_local_docker_daemon(runner, docker_daemon_id)
-    expected_image_id = cast(str, build_manifest["image_id"])
-    _assert_image_revision(
-        runner,
-        identity,
-        expected_image_id=expected_image_id,
-    )
-    image_config = _immutable_image_config(runner, identity, expected_image_id)
+    docker_daemon_id = build_manifest.docker_daemon_id
+    expected_image_id = build_manifest.image_id
+    image_config = verified_inputs.image_config
     _assert_candidate_absent(runner, identity)
     _assert_port_available(runner, port)
 
@@ -4490,7 +4797,7 @@ def _prepare_candidate_locked(
     )
     _assert_local_docker_daemon(runner, docker_daemon_id)
 
-    _write_private_json(
+    _write_candidate_state(
         state_path,
         {
             "schema": CANDIDATE_STATE_SCHEMA,
@@ -4514,21 +4821,23 @@ def _prepare_candidate_locked(
             "runtime_sha256": runtime_sha256,
             "trusted_proxy_cidrs": json.loads(trusted_proxy_json),
             "deployment_assets": _deployment_asset_identity_payload(deployment_assets),
+            "build_provenance": build_provenance_payload,
+            "build_provenance_sha256": build_provenance_digest.sha256,
         },
     )
     return state_path
 
 
-def _load_candidate_state(path: Path) -> dict[str, Any]:
+def _parse_candidate_state_bytes(
+    raw: bytes,
+    *,
+    filename: str,
+) -> dict[str, Any]:
+    """Strictly parse one schema-3 candidate state without performing I/O."""
+
     try:
-        payload = json.loads(
-            _read_private_text(
-                path,
-                directory=STATE_DIRECTORY,
-                label="candidate state file",
-            )
-        )
-    except json.JSONDecodeError:
+        payload = _PROVENANCE.strict_json_loads(raw)
+    except _PROVENANCE.ProvenanceError:
         raise DeploymentError("candidate state file is invalid") from None
     expected_fields = {
         "schema",
@@ -4552,6 +4861,8 @@ def _load_candidate_state(path: Path) -> dict[str, Any]:
         "runtime_sha256",
         "trusted_proxy_cidrs",
         "deployment_assets",
+        "build_provenance",
+        "build_provenance_sha256",
     }
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise DeploymentError("candidate state schema is invalid")
@@ -4564,6 +4875,13 @@ def _load_candidate_state(path: Path) -> dict[str, Any]:
     if not isinstance(source_sha, str):
         raise DeploymentError("candidate state is missing SOURCE_SHA")
     identity = candidate_identity(source_sha)
+    filename_match = (
+        CANDIDATE_STATE_NAME_PATTERN.fullmatch(filename)
+        if isinstance(filename, str)
+        else None
+    )
+    if filename_match is None or filename_match.group(1) != source_sha[:12]:
+        raise DeploymentError("candidate state filename is invalid")
     expected = {
         "project_name": identity.project_name,
         "container_name": identity.container_name,
@@ -4630,7 +4948,61 @@ def _load_candidate_state(path: Path) -> dict[str, Any]:
     trusted_proxy_cidrs = payload.get("trusted_proxy_cidrs")
     if not isinstance(trusted_proxy_cidrs, list) or len(trusted_proxy_cidrs) != 1:
         raise DeploymentError("candidate state has invalid trusted proxy CIDRs")
+    try:
+        provenance = _PROVENANCE.parse_candidate_build_provenance(
+            payload.get("build_provenance")
+        )
+        provenance_digest = _PROVENANCE.candidate_build_provenance_digest(provenance)
+    except _PROVENANCE.ProvenanceError:
+        raise DeploymentError("candidate state build provenance is invalid") from None
+    persisted_digest = payload.get("build_provenance_sha256")
+    if (
+        not isinstance(persisted_digest, str)
+        or SHA256_PATTERN.fullmatch(persisted_digest) is None
+        or persisted_digest != provenance_digest.sha256
+    ):
+        raise DeploymentError("candidate state build provenance digest is invalid")
+    if isinstance(provenance, _PROVENANCE.CandidateReuseBuildProvenance) and (
+        provenance.reused_from.source_sha == source_sha
+        or provenance.reused_from.image_id == image_id
+    ):
+        raise DeploymentError("candidate state build provenance is invalid")
     return cast(dict[str, Any], payload)
+
+
+def _write_candidate_state(
+    path: Path,
+    payload: Mapping[str, object],
+) -> None:
+    """Validate candidate semantics before invoking durable private I/O."""
+
+    try:
+        raw = (
+            json.dumps(
+                payload,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (OverflowError, RecursionError, TypeError, ValueError):
+        raise DeploymentError("candidate state is not serializable") from None
+    validated = _parse_candidate_state_bytes(raw, filename=path.name)
+    _write_private_json(path, validated)
+
+
+def _load_candidate_state(path: Path) -> dict[str, Any]:
+    raw = _read_private_bytes(
+        path,
+        directory=STATE_DIRECTORY,
+        label="candidate state file",
+    )
+    return _parse_candidate_state_bytes(
+        raw,
+        filename=path.name,
+    )
 
 
 def _assert_state_candidate_ready(

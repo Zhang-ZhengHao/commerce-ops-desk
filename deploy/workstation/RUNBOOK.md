@@ -248,8 +248,9 @@ inspection; neither is silently deleted or reused.
 
 Choose the current live directory deliberately and derive the one allowed
 candidate path from the approved SHA. Do not create the candidate directory by
-hand: `deploy.py prepare` owns its atomic creation and binds the newly created
-inode before any candidate-preparation Docker inspection or resource creation.
+hand: after completing its read-only provenance checks, `deploy.py prepare`
+owns the atomic creation and binds the newly created inode before any candidate
+Docker resource is created.
 
 ```bash
 set -euo pipefail
@@ -271,8 +272,9 @@ fi
 The existing live directory must already have the same numeric ownership and
 mode, but do not blindly change a live directory. The live directory and
 candidate directory must be different. Check both paths before continuing; do
-not create either directory through Docker or Compose. Under the per-SHA
-prepare lock, the tool's fixed-argv isolated privileged helper atomically
+not create either directory through Docker or Compose. Under the shared
+full-SHA operation lock (`.build-<40-character-SHA>.lock`), the tool's fixed-argv
+isolated privileged helper atomically
 creates a random hidden sibling, assigns numeric `10001:10001` and mode `0700`,
 flushes its inode and parent, and only then publishes exactly the direct child
 derived from the SHA with Linux `renameat2(RENAME_NOREPLACE)`—that final
@@ -283,18 +285,19 @@ administrator inspection, but it cannot occupy the final candidate path. The
 helper returns the published device/inode identity. Any
 pre-existing object—an empty directory, regular file, hidden-content directory,
 symlink, or broken symlink—fails closed. The identity-bound empty check is still
-performed immediately before any candidate-preparation Docker inspection or
-resource creation. This freshness statement does not cover the earlier
-verified-image build.
+performed immediately before privileged candidate-data creation. The preceding
+Docker operations inspect only the daemon and verified image provenance; they
+do not create a project, network, or container. This freshness statement does
+not cover the earlier verified-image build.
 
 The final candidate state is flushed to a hidden file and published through the
 same dirfd-bound Linux `renameat2(RENAME_NOREPLACE)` atomic no-clobber operation. An
 interruption leaves either the hidden pre-publication file or the single-link
 final state, never a two-link intermediate state. A concurrent state insertion
-is retained and causes refusal; it is never replaced. The same per-SHA lock
-remains held from candidate validation through final state publication. These
-controls bind the candidate data, state, deployment assets, and running
-container to tools from the exact clean `DEPLOY_SHA` checkout.
+is retained and causes refusal; it is never replaced. The same shared full-SHA
+operation lock remains held from candidate validation through final state
+publication. These controls bind the candidate data, state, deployment assets,
+and running container to tools from the exact clean `DEPLOY_SHA` checkout.
 `APP_ROOT` and `deploy-state` must remain on the same filesystem so each
 candidate input can be quarantined with one atomic rename. Candidate data and
 state are separate moves rather than one combined transaction, so interruption
@@ -311,8 +314,11 @@ data. After an administrator confirms that the retained data is not live and no
 container mounts it, use the versioned `quarantine` subcommand below. Its only
 operator-controlled value is the full source SHA; all input names, archive
 names, and move destinations are derived internally and passed through fixed
-argv. The parent holds the same non-blocking per-SHA prepare lock through every
-move and anchors the hierarchy to dirfd handles opened with `O_NOFOLLOW`.
+argv. The parent safely creates or opens the same non-blocking shared full-SHA
+operation lock and holds it through every move. Legacy
+`candidate-<12-character-SHA>.prepare.lock` files are retained untouched as
+evidence; they are no longer read, locked, modified, or deleted. The operation
+anchors the hierarchy to dirfd handles opened with `O_NOFOLLOW`.
 Candidate data is owned by runtime identity `10001:10001`, so only that data
 move is delegated through fixed argv to the narrow
 `sudo /usr/bin/python3 -I` helper. The helper independently revalidates the
@@ -321,16 +327,18 @@ before performing the no-clobber rename. Candidate state remains an
 unprivileged move by the deployment user.
 Each input uses its own Linux `renameat2(RENAME_NOREPLACE)`, so a racing archive
 entry is retained and causes refusal instead of being overwritten; a kernel or
-filesystem without that atomic operation also fails closed. A missing,
-replaced, unsafe, or busy lock stops recovery.
+filesystem without that atomic operation also fails closed. A missing shared
+full-SHA lock is created safely; a replaced, unsafe, or busy shared lock stops
+recovery.
 
 The subcommand supports data-only, state-only, or both paths. The two inputs do
 not move atomically together. If a prior run moved one item and stopped, rerun
 it: the remaining item moves into another newly created quarantine archive,
 while the earlier archive remains untouched. It never changes candidate
 ownership, follows a symbolic link, deletes candidate data or state, or falls
-back to a less constrained move. Every `prepare` invocation creates the
-required lock before inspecting candidate inputs.
+back to a less constrained move. Every `prepare` invocation creates the shared
+full-SHA operation lock when absent, or safely opens and acquires the existing
+lock, before inspecting candidate inputs.
 
 ```bash
 set -euo pipefail
@@ -347,7 +355,8 @@ verify_exact_checkout
 `INTERRUPTED_SOURCE_SHA` identifies the retained input, not necessarily the
 revision of the currently verified deployment tool. When a compatibility fix
 has produced a new `DEPLOY_SHA`, use the old failed deployment SHA here so the
-derived candidate path and per-SHA lock identify the old residual data.
+derived candidate path and shared full-SHA operation lock identify the old
+residual data.
 
 If the command fails after the privileged helper may have committed, it does
 not guess, restore, or delete anything and might not print the new archive
@@ -424,12 +433,25 @@ verify_exact_checkout
 ```
 
 `prepare` accepts no standalone source SHA. It requires the private build
-manifest, confirms the current image tag still resolves to that manifest's
-immutable ID, inspects the image configuration by immutable ID, and verifies
-the created container against that baseline. It then performs the two-stage
-network creation, derives the single /32, waits for Docker health, and records a
-private candidate state file under `~/apps/commerce-ops-desk/deploy-state/`. It
-does not change Caddy.
+manifest. It derives the target SHA only from the canonical manifest filename,
+holds the shared full-SHA lock, and retains the safely opened manifest inode.
+Before candidate data or any Docker resource is created, it revalidates the
+approved Git ref and commit evidence, the local daemon, both the image tag and
+immutable ID, the schema-specific provenance labels, and the complete image
+configuration. A reuse manifest additionally requires its exact canonical
+source-build donor manifest, current donor image, approved ancestry, runtime
+inventory, Dockerfile transition, identical RootFS and platform, and a complete
+normalized Config match. Only the source environment, OCI revision, and four
+defined reuse labels may differ. The three deployment assets always come from
+the target checkout. Finally, `prepare` flushes the same retained target
+manifest inode and state-directory descriptor and repeats every retained-file
+identity check.
+
+After that provenance barrier succeeds, `prepare` creates the candidate data,
+performs the two-stage network creation, derives the single /32, verifies the
+created container against the retained image configuration, waits for Docker
+health, and records a private candidate state file under
+`~/apps/commerce-ops-desk/deploy-state/`. It does not change Caddy.
 
 During `prepare` and `switch`, the helper accepts only the exact three-path
 deployment asset set recorded in the manifest or state. It opens each canonical
