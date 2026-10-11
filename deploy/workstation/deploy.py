@@ -8,12 +8,14 @@ CommerceOps Caddy site fragment.
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import errno
 import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import secrets
@@ -25,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from ipaddress import (
@@ -842,6 +844,24 @@ class VerifiedDeploymentAssets:
     identity: Mapping[str, object]
     compose_yaml: str
     caddy_templates: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class VerifiedPrepareInputs:
+    """All provenance inputs frozen before candidate-side effects begin."""
+
+    deployment_assets: VerifiedDeploymentAssets
+    image_config: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ManifestImageEvidence:
+    """Immutable image surfaces bound to one parsed build manifest."""
+
+    image_id: str
+    config: Mapping[str, Any]
+    rootfs: Mapping[str, Any]
+    platform: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -1865,10 +1885,13 @@ def _parse_json(raw: str, *, label: str) -> object:
 
 
 def _local_docker_daemon_id(runner: CommandRunner) -> str:
-    identifier = _parse_json(
-        runner.run([DOCKER_BINARY, "info", "--format", "{{json .ID}}"]).stdout,
-        label="local Docker daemon identity",
-    )
+    try:
+        result = runner.run([DOCKER_BINARY, "info", "--format", "{{json .ID}}"])
+    except DeploymentError:
+        raise DeploymentError(
+            "local Docker daemon identity could not be inspected"
+        ) from None
+    identifier = _parse_json(result.stdout, label="local Docker daemon identity")
     return _validate_docker_daemon_id(identifier, label="local Docker daemon")
 
 
@@ -2112,6 +2135,251 @@ def _immutable_image_config(
             "immutable candidate image runtime source SHA does not match SOURCE_SHA"
         )
     return cast(dict[str, Any], config)
+
+
+def _manifest_image_document(
+    runner: CommandRunner,
+    reference: str,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    try:
+        result = runner.run([DOCKER_BINARY, "image", "inspect", reference])
+    except DeploymentError:
+        raise DeploymentError(f"{label} could not be inspected") from None
+    inspection = _parse_json(
+        result.stdout,
+        label=label,
+    )
+    if (
+        not isinstance(inspection, list)
+        or len(inspection) != 1
+        or not isinstance(inspection[0], dict)
+    ):
+        raise DeploymentError(f"{label} returned an invalid shape")
+    return cast(dict[str, Any], inspection[0])
+
+
+def _same_json_value(left: object, right: object) -> bool:
+    """Compare JSON values without Python's bool/int/float coercions."""
+
+    if type(left) is not type(right):
+        return False
+    if left is None or type(left) in (str, bool, int):
+        return left == right
+    if type(left) is float:
+        return (
+            isinstance(right, float)
+            and math.isfinite(left)
+            and math.isfinite(right)
+            and left == right
+        )
+    if type(left) is list:
+        if not isinstance(right, list) or len(left) != len(right):
+            return False
+        return all(
+            _same_json_value(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if type(left) is dict:
+        if not isinstance(right, dict):  # pragma: no cover - guarded by type equality.
+            return False
+        if (
+            any(type(key) is not str for key in left)
+            or any(type(key) is not str for key in right)
+            or left.keys() != right.keys()
+        ):
+            return False
+        return all(_same_json_value(left[key], right[key]) for key in left)
+    return False
+
+
+def _unique_image_environment(config: Mapping[str, Any]) -> dict[str, str]:
+    raw_environment = config.get("Env")
+    if not isinstance(raw_environment, list) or any(
+        not isinstance(entry, str)
+        or "=" not in entry
+        or not entry.partition("=")[0]
+        or "\x00" in entry.partition("=")[0]
+        for entry in raw_environment
+    ):
+        raise DeploymentError("image environment is invalid")
+    environment: dict[str, str] = {}
+    for entry in raw_environment:
+        name, _separator, value = entry.partition("=")
+        if name in environment:
+            raise DeploymentError("image environment names must be unique")
+        environment[name] = value
+    return environment
+
+
+def _inspect_manifest_image(
+    runner: CommandRunner,
+    manifest: Any,
+) -> ManifestImageEvidence:
+    """Bind both mutable tag and immutable ID to one manifest image."""
+
+    if not isinstance(manifest, _PROVENANCE.LoadedBuildManifest):
+        raise DeploymentError("verified build manifest is invalid")
+    tag_document = _manifest_image_document(
+        runner,
+        manifest.image_reference,
+        label="manifest image tag inspection",
+    )
+    immutable_document = _manifest_image_document(
+        runner,
+        manifest.image_id,
+        label="manifest immutable image inspection",
+    )
+    if (
+        tag_document.get("Id") != manifest.image_id
+        or immutable_document.get("Id") != manifest.image_id
+        or not _same_json_value(tag_document, immutable_document)
+    ):
+        raise DeploymentError("manifest image tag and immutable identity differ")
+    config = immutable_document.get("Config")
+    rootfs = immutable_document.get("RootFS")
+    if not isinstance(config, dict) or not isinstance(rootfs, dict):
+        raise DeploymentError("manifest image inspection is incomplete")
+    layers = rootfs.get("Layers")
+    if (
+        set(rootfs) != {"Type", "Layers"}
+        or not isinstance(rootfs.get("Type"), str)
+        or not rootfs["Type"]
+        or not isinstance(layers, list)
+        or any(
+            not isinstance(layer, str) or IMAGE_ID_PATTERN.fullmatch(layer) is None
+            for layer in layers
+        )
+    ):
+        raise DeploymentError("manifest image RootFS is invalid")
+    if any(
+        not isinstance(immutable_document.get(key), str) or not immutable_document[key]
+        for key in ("Os", "Architecture")
+    ) or (
+        "Variant" in immutable_document
+        and not isinstance(immutable_document["Variant"], str)
+    ):
+        raise DeploymentError("manifest image platform is invalid")
+    labels = config.get("Labels")
+    if not isinstance(labels, dict):
+        raise DeploymentError("manifest image labels are invalid")
+    if labels.get("org.opencontainers.image.revision") != manifest.source_sha:
+        raise DeploymentError("manifest image OCI revision does not match SOURCE_SHA")
+    environment = _unique_image_environment(config)
+    if environment.get("COMMERCE_OPS_SOURCE_SHA") != manifest.source_sha:
+        raise DeploymentError(
+            "manifest image runtime source SHA does not match SOURCE_SHA"
+        )
+    try:
+        _PROVENANCE.validate_reserved_provenance_labels(manifest, labels)
+    except _PROVENANCE.ProvenanceError as error:
+        raise DeploymentError(str(error)) from None
+    platform: dict[str, Any] = {
+        key: copy.deepcopy(immutable_document[key])
+        for key in ("Os", "Architecture", "Variant")
+        if key in immutable_document
+    }
+    return ManifestImageEvidence(
+        image_id=manifest.image_id,
+        config=MappingProxyType(copy.deepcopy(config)),
+        rootfs=MappingProxyType(copy.deepcopy(rootfs)),
+        platform=MappingProxyType(platform),
+    )
+
+
+def _restore_reuse_config_to_donor(
+    target_manifest: Any,
+    target_config: Mapping[str, Any],
+    donor_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(target_manifest.build, _PROVENANCE.VerifiedRuntimeReuse):
+        raise DeploymentError("reuse image evidence is invalid")
+    normalized = copy.deepcopy(dict(target_config))
+    donor = copy.deepcopy(dict(donor_config))
+    target_environment = _unique_image_environment(normalized)
+    donor_environment = _unique_image_environment(donor)
+    if set(target_environment) != set(donor_environment):
+        raise DeploymentError("reuse image environments are not equivalent")
+    raw_environment = normalized.get("Env")
+    assert isinstance(raw_environment, list)
+    normalized["Env"] = [
+        (
+            f"COMMERCE_OPS_SOURCE_SHA={donor_environment[name]}"
+            if name == "COMMERCE_OPS_SOURCE_SHA"
+            else entry
+        )
+        for entry in raw_environment
+        for name in [entry.partition("=")[0]]
+    ]
+
+    target_labels = normalized.get("Labels")
+    donor_labels = donor.get("Labels")
+    if not isinstance(target_labels, dict) or not isinstance(donor_labels, dict):
+        raise DeploymentError("reuse image labels are invalid")
+    normalized_labels = cast(dict[str, Any], target_labels)
+    donor_revision_key = "org.opencontainers.image.revision"
+    if donor_revision_key not in donor_labels:
+        raise DeploymentError("donor image OCI revision is missing")
+    normalized_labels[donor_revision_key] = donor_labels[donor_revision_key]
+    for key in (
+        _PROVENANCE.BUILD_KIND_LABEL,
+        _PROVENANCE.REUSED_FROM_SOURCE_LABEL,
+        _PROVENANCE.REUSED_FROM_IMAGE_ID_LABEL,
+        _PROVENANCE.RUNTIME_INPUTS_SHA256_LABEL,
+    ):
+        if key in donor_labels:
+            normalized_labels[key] = donor_labels[key]
+        else:
+            normalized_labels.pop(key, None)
+    return normalized
+
+
+def _assert_reuse_image_equivalence(
+    *,
+    target_manifest: Any,
+    target_image: ManifestImageEvidence,
+    donor_manifest: Any,
+    donor_image: ManifestImageEvidence,
+) -> None:
+    """Require complete runtime equivalence after approved metadata rebinding."""
+
+    if (
+        not isinstance(target_manifest, _PROVENANCE.LoadedBuildManifest)
+        or not isinstance(donor_manifest, _PROVENANCE.LoadedBuildManifest)
+        or not isinstance(target_image, ManifestImageEvidence)
+        or not isinstance(donor_image, ManifestImageEvidence)
+        or target_image.image_id != target_manifest.image_id
+        or donor_image.image_id != donor_manifest.image_id
+        or target_image.image_id == donor_image.image_id
+    ):
+        raise DeploymentError("reuse image evidence is invalid")
+    try:
+        _PROVENANCE.validate_candidate_manifest_chain(
+            target_manifest,
+            donor_manifest,
+        )
+    except _PROVENANCE.ProvenanceError as error:
+        raise DeploymentError(str(error)) from None
+    if (
+        not _same_json_value(
+            dict(target_image.rootfs),
+            dict(donor_image.rootfs),
+        )
+        or not _same_json_value(
+            dict(target_image.platform),
+            dict(donor_image.platform),
+        )
+        or not _same_json_value(
+            _restore_reuse_config_to_donor(
+                target_manifest,
+                target_image.config,
+                donor_image.config,
+            ),
+            dict(donor_image.config),
+        )
+    ):
+        raise DeploymentError("reuse image runtime configuration is not equivalent")
 
 
 def _assert_candidate_absent(
@@ -3976,12 +4244,19 @@ def _load_build_manifest(
     path: Path,
     *,
     state_directory: Path | None = None,
+    retained_bytes: bytes | None = None,
 ) -> Any:
-    raw = _read_private_bytes(
-        path,
-        directory=STATE_DIRECTORY if state_directory is None else state_directory,
-        label="verified build manifest",
+    raw = (
+        _read_private_bytes(
+            path,
+            directory=STATE_DIRECTORY if state_directory is None else state_directory,
+            label="verified build manifest",
+        )
+        if retained_bytes is None
+        else retained_bytes
     )
+    if type(raw) is not bytes:
+        raise DeploymentError("verified build manifest is invalid")
     try:
         return _PROVENANCE.parse_build_manifest_bytes(raw)
     except _PROVENANCE.ProvenanceError:
@@ -3996,6 +4271,169 @@ def _typed_deployment_asset_payload(manifest: Any) -> dict[str, object]:
         "schema": assets.schema,
         "sha256": dict(assets.sha256),
     }
+
+
+def _same_deployment_asset_identity(
+    observed: object,
+    expected: Any,
+) -> bool:
+    return (
+        isinstance(observed, _PROVENANCE.DeploymentAssets)
+        and isinstance(expected, _PROVENANCE.DeploymentAssets)
+        and observed == expected
+    )
+
+
+def _verify_prepare_inputs(
+    *,
+    state: Any,
+    build_lock: Any,
+    target_manifest_read: Any,
+    build_manifest: Any,
+    runner: CommandRunner,
+) -> VerifiedPrepareInputs:
+    """Finish every mutable provenance check before candidate-side effects."""
+
+    if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
+        raise DeploymentError("verified build manifest is invalid")
+    if target_manifest_read.data != build_manifest.raw_bytes:
+        raise DeploymentError("verified build manifest identity changed")
+
+    donor_manifest: Any | None = None
+    donor_manifest_read: Any | None = None
+    donor_sha: str | None = None
+    asset_reads: dict[str, Any] = {}
+    with ExitStack() as retained:
+        if isinstance(build_manifest.build, _PROVENANCE.SourceBuild):
+            _PROVENANCE.validate_candidate_manifest_chain(build_manifest, None)
+        elif isinstance(build_manifest.build, _PROVENANCE.VerifiedRuntimeReuse):
+            donor_sha = build_manifest.build.reused_from.source_sha
+            donor_path = _PROVENANCE.canonical_manifest_path(state, donor_sha)
+            donor_manifest_read = retained.enter_context(
+                _PROVENANCE.safe_read_direct_child(
+                    state,
+                    donor_path.name,
+                    expected_mode=0o600,
+                    maximum_size=256 * 1024,
+                )
+            )
+            donor_manifest = _PROVENANCE.parse_build_manifest_bytes(
+                donor_manifest_read.data
+            )
+            if donor_manifest.source_sha != donor_sha:
+                raise DeploymentError(
+                    "donor build manifest SOURCE_SHA does not match its filename"
+                )
+            _PROVENANCE.validate_candidate_manifest_chain(
+                build_manifest,
+                donor_manifest,
+            )
+        else:  # pragma: no cover - typed manifest constructor invariant.
+            raise DeploymentError("verified build manifest is invalid")
+
+        checkout = retained.enter_context(
+            _PROVENANCE.open_canonical_checkout_root(PRODUCT_ROOT)
+        )
+        if isinstance(build_manifest.build, _PROVENANCE.SourceBuild):
+            git_evidence = _PROVENANCE.export_revision_evidence(
+                checkout,
+                build_manifest.source_sha,
+                build_manifest.approved_remote_ref,
+                workspace=state.path,
+            )
+            if (
+                git_evidence.source_sha != build_manifest.source_sha
+                or not _same_deployment_asset_identity(
+                    git_evidence.deployment_assets,
+                    build_manifest.deployment_assets,
+                )
+            ):
+                raise DeploymentError(
+                    "current Git evidence does not match the build manifest"
+                )
+        else:
+            assert donor_sha is not None
+            assert donor_manifest is not None
+            git_evidence = _PROVENANCE.recompute_runtime_equivalence(
+                checkout,
+                donor_sha=donor_sha,
+                target_sha=build_manifest.source_sha,
+                approved_remote_ref=build_manifest.approved_remote_ref,
+                workspace=state.path,
+            )
+            if (
+                git_evidence.donor.source_sha != donor_manifest.source_sha
+                or not _same_deployment_asset_identity(
+                    git_evidence.donor.deployment_assets,
+                    donor_manifest.deployment_assets,
+                )
+                or git_evidence.target.source_sha != build_manifest.source_sha
+                or not _same_deployment_asset_identity(
+                    git_evidence.target.deployment_assets,
+                    build_manifest.deployment_assets,
+                )
+                or git_evidence.runtime_equivalence
+                != build_manifest.build.runtime_equivalence
+            ):
+                raise DeploymentError(
+                    "current Git reuse evidence does not match the build manifest"
+                )
+
+        _assert_local_docker_daemon(runner, build_manifest.docker_daemon_id)
+        target_image = _inspect_manifest_image(runner, build_manifest)
+        if donor_manifest is not None:
+            donor_image = _inspect_manifest_image(runner, donor_manifest)
+            _assert_reuse_image_equivalence(
+                target_manifest=build_manifest,
+                target_image=target_image,
+                donor_manifest=donor_manifest,
+                donor_image=donor_image,
+            )
+
+        asset_contents: dict[str, str] = {}
+        expected_digests = build_manifest.deployment_assets.sha256
+        for relative_path in DEPLOYMENT_ASSET_PATHS:
+            opened = retained.enter_context(
+                _PROVENANCE.safe_read_deployment_asset(checkout, relative_path)
+            )
+            asset_reads[relative_path] = opened
+            if (
+                hashlib.sha256(opened.data).hexdigest()
+                != expected_digests[relative_path]
+                or opened.text is None
+            ):
+                raise DeploymentError(
+                    f"deployment asset digest changed: {relative_path}"
+                )
+            asset_contents[relative_path] = opened.text
+
+        target_manifest_read.fsync()
+        state.fsync()
+        target_manifest_read.revalidate()
+        if donor_manifest_read is not None:
+            donor_manifest_read.revalidate()
+        for relative_path in DEPLOYMENT_ASSET_PATHS:
+            asset_reads[relative_path].revalidate()
+        checkout.revalidate()
+        build_lock.revalidate()
+
+        identity: dict[str, object] = {
+            "schema": build_manifest.deployment_assets.schema,
+            "sha256": dict(expected_digests),
+        }
+        return VerifiedPrepareInputs(
+            deployment_assets=VerifiedDeploymentAssets(
+                identity=MappingProxyType(identity),
+                compose_yaml=asset_contents[COMPOSE_ASSET_PATH],
+                caddy_templates=MappingProxyType(
+                    {
+                        profile: asset_contents[relative_path]
+                        for profile, relative_path in CADDY_PROFILE_ASSET_PATHS.items()
+                    }
+                ),
+            ),
+            image_config=target_image.config,
+        )
 
 
 def _write_private_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -4159,10 +4597,19 @@ def prepare_candidate(arguments: argparse.Namespace, runner: CommandRunner) -> P
                 state,
                 manifest_path,
             )
-            with _PROVENANCE.BuildLock.acquire(state, filename_sha):
+            with (
+                _PROVENANCE.BuildLock.acquire(state, filename_sha) as build_lock,
+                _PROVENANCE.safe_read_direct_child(
+                    state,
+                    manifest_path.name,
+                    expected_mode=0o600,
+                    maximum_size=256 * 1024,
+                ) as target_manifest_read,
+            ):
                 build_manifest = _load_build_manifest(
                     manifest_path,
                     state_directory=state_directory,
+                    retained_bytes=target_manifest_read.data,
                 )
                 if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
                     raise DeploymentError("verified build manifest is invalid")
@@ -4170,11 +4617,19 @@ def prepare_candidate(arguments: argparse.Namespace, runner: CommandRunner) -> P
                     raise DeploymentError(
                         "verified build manifest SOURCE_SHA does not match its filename"
                     )
+                verified_inputs = _verify_prepare_inputs(
+                    state=state,
+                    build_lock=build_lock,
+                    target_manifest_read=target_manifest_read,
+                    build_manifest=build_manifest,
+                    runner=runner,
+                )
                 identity = candidate_identity(filename_sha)
                 return _prepare_candidate_locked(
                     arguments,
                     runner,
                     build_manifest=build_manifest,
+                    verified_inputs=verified_inputs,
                     identity=identity,
                     state_directory=state_directory,
                 )
@@ -4189,11 +4644,14 @@ def _prepare_candidate_locked(
     runner: CommandRunner,
     *,
     build_manifest: Any,
+    verified_inputs: VerifiedPrepareInputs,
     identity: CandidateIdentity,
     state_directory: Path,
 ) -> Path:
     if not isinstance(build_manifest, _PROVENANCE.LoadedBuildManifest):
         raise DeploymentError("verified build manifest is invalid")
+    if not isinstance(verified_inputs, VerifiedPrepareInputs):
+        raise DeploymentError("verified prepare inputs are invalid")
     build_provenance = _PROVENANCE.candidate_build_provenance(build_manifest)
     build_provenance_payload = _PROVENANCE.candidate_build_provenance_payload(
         build_provenance
@@ -4201,9 +4659,7 @@ def _prepare_candidate_locked(
     build_provenance_digest = _PROVENANCE.candidate_build_provenance_digest(
         build_provenance
     )
-    deployment_assets = _load_verified_deployment_assets(
-        _typed_deployment_asset_payload(build_manifest)
-    )
+    deployment_assets = verified_inputs.deployment_assets
     port = validate_candidate_port(arguments.candidate_port)
     requested_candidate = _candidate_data_path_for_creation(
         app_root=APP_ROOT,
@@ -4240,14 +4696,8 @@ def _prepare_candidate_locked(
     )
     _assert_initial_candidate_data(runner, candidate, candidate_data_identity)
     docker_daemon_id = build_manifest.docker_daemon_id
-    _assert_local_docker_daemon(runner, docker_daemon_id)
     expected_image_id = build_manifest.image_id
-    _assert_image_revision(
-        runner,
-        identity,
-        expected_image_id=expected_image_id,
-    )
-    image_config = _immutable_image_config(runner, identity, expected_image_id)
+    image_config = verified_inputs.image_config
     _assert_candidate_absent(runner, identity)
     _assert_port_available(runner, port)
 

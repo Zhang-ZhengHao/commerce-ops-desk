@@ -248,8 +248,9 @@ inspection; neither is silently deleted or reused.
 
 Choose the current live directory deliberately and derive the one allowed
 candidate path from the approved SHA. Do not create the candidate directory by
-hand: `deploy.py prepare` owns its atomic creation and binds the newly created
-inode before any candidate-preparation Docker inspection or resource creation.
+hand: after completing its read-only provenance checks, `deploy.py prepare`
+owns the atomic creation and binds the newly created inode before any candidate
+Docker resource is created.
 
 ```bash
 set -euo pipefail
@@ -284,9 +285,10 @@ administrator inspection, but it cannot occupy the final candidate path. The
 helper returns the published device/inode identity. Any
 pre-existing object—an empty directory, regular file, hidden-content directory,
 symlink, or broken symlink—fails closed. The identity-bound empty check is still
-performed immediately before any candidate-preparation Docker inspection or
-resource creation. This freshness statement does not cover the earlier
-verified-image build.
+performed immediately before privileged candidate-data creation. The preceding
+Docker operations inspect only the daemon and verified image provenance; they
+do not create a project, network, or container. This freshness statement does
+not cover the earlier verified-image build.
 
 The final candidate state is flushed to a hidden file and published through the
 same dirfd-bound Linux `renameat2(RENAME_NOREPLACE)` atomic no-clobber operation. An
@@ -431,12 +433,25 @@ verify_exact_checkout
 ```
 
 `prepare` accepts no standalone source SHA. It requires the private build
-manifest, confirms the current image tag still resolves to that manifest's
-immutable ID, inspects the image configuration by immutable ID, and verifies
-the created container against that baseline. It then performs the two-stage
-network creation, derives the single /32, waits for Docker health, and records a
-private candidate state file under `~/apps/commerce-ops-desk/deploy-state/`. It
-does not change Caddy.
+manifest. It derives the target SHA only from the canonical manifest filename,
+holds the shared full-SHA lock, and retains the safely opened manifest inode.
+Before candidate data or any Docker resource is created, it revalidates the
+approved Git ref and commit evidence, the local daemon, both the image tag and
+immutable ID, the schema-specific provenance labels, and the complete image
+configuration. A reuse manifest additionally requires its exact canonical
+source-build donor manifest, current donor image, approved ancestry, runtime
+inventory, Dockerfile transition, identical RootFS and platform, and a complete
+normalized Config match. Only the source environment, OCI revision, and four
+defined reuse labels may differ. The three deployment assets always come from
+the target checkout. Finally, `prepare` flushes the same retained target
+manifest inode and state-directory descriptor and repeats every retained-file
+identity check.
+
+After that provenance barrier succeeds, `prepare` creates the candidate data,
+performs the two-stage network creation, derives the single /32, verifies the
+created container against the retained image configuration, waits for Docker
+health, and records a private candidate state file under
+`~/apps/commerce-ops-desk/deploy-state/`. It does not change Caddy.
 
 During `prepare` and `switch`, the helper accepts only the exact three-path
 deployment asset set recorded in the manifest or state. It opens each canonical

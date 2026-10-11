@@ -17,6 +17,7 @@ import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Self
 
 import pytest
 
@@ -38,7 +39,10 @@ HARDENING_DESIGN = (
     / "2026-10-09-workstation-deployment-hardening-design.md"
 )
 VALID_SHA = "0123456789abcdef0123456789abcdef01234567"
+DONOR_SHA = "fedcba9876543210fedcba9876543210fedcba98"
 DOCKER_DAEMON_ID = "local-daemon-id"
+TARGET_IMAGE_ID = "sha256:" + "1" * 64
+DONOR_IMAGE_ID = "sha256:" + "2" * 64
 CADDY_LINUX_AMD64_IMAGE = (
     "caddy:2.6.2-alpine@"
     "sha256:7992b931b7da3cf0840dd69ea74b2c67d423faf03408da8abdc31b7590a239a7"
@@ -100,11 +104,17 @@ def write_canonical_legacy_manifest(
     state_directory: Path,
     *,
     product_root: Path = PRODUCT_ROOT,
+    source_sha: str = VALID_SHA,
+    image_id: str = TARGET_IMAGE_ID,
 ) -> Path:
-    manifest_path = state_directory / f"build-{VALID_SHA}.json"
+    manifest_path = state_directory / f"build-{source_sha}.json"
     manifest_path.write_bytes(
         json.dumps(
-            legacy_build_manifest_payload(product_root),
+            legacy_build_manifest_payload(
+                product_root,
+                source_sha=source_sha,
+                image_id=image_id,
+            ),
             separators=(",", ":"),
         ).encode("utf-8")
     )
@@ -225,15 +235,20 @@ def deployment_asset_payload(root: Path = PRODUCT_ROOT) -> dict[str, object]:
     }
 
 
-def legacy_build_manifest_payload(root: Path = PRODUCT_ROOT) -> dict[str, object]:
+def legacy_build_manifest_payload(
+    root: Path = PRODUCT_ROOT,
+    *,
+    source_sha: str = VALID_SHA,
+    image_id: str = TARGET_IMAGE_ID,
+) -> dict[str, object]:
     return {
         "approved_remote_ref": "refs/remotes/origin/main",
         "deployment_assets": deployment_asset_payload(root),
         "docker_daemon_id": DOCKER_DAEMON_ID,
-        "image_id": "sha256:" + "1" * 64,
-        "image_reference": f"commerce-ops-desk:{VALID_SHA}",
+        "image_id": image_id,
+        "image_reference": f"commerce-ops-desk:{source_sha}",
         "schema": 2,
-        "source_sha": VALID_SHA,
+        "source_sha": source_sha,
     }
 
 
@@ -241,11 +256,217 @@ def loaded_legacy_build_manifest(
     module: ModuleType,
     root: Path = PRODUCT_ROOT,
 ) -> object:
-    raw = json.dumps(
-        legacy_build_manifest_payload(root),
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return module._PROVENANCE.parse_build_manifest_bytes(raw)
+    return loaded_source_build_manifest(module, root, schema=2)
+
+
+def source_build_manifest_bytes(
+    module: ModuleType,
+    root: Path,
+    *,
+    schema: int,
+    source_sha: str = VALID_SHA,
+    image_id: str = TARGET_IMAGE_ID,
+    deployment_assets: object | None = None,
+) -> bytes:
+    payload = legacy_build_manifest_payload(
+        root,
+        source_sha=source_sha,
+        image_id=image_id,
+    )
+    if deployment_assets is not None:
+        payload["deployment_assets"] = deployment_assets
+    if schema == 2:
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if schema != 3:
+        raise AssertionError(f"unsupported source manifest schema: {schema}")
+    payload["schema"] = 3
+    payload["build"] = {"schema": 1, "kind": "source-build"}
+    return module._PROVENANCE.canonical_manifest_bytes(payload)
+
+
+def loaded_source_build_manifest(
+    module: ModuleType,
+    root: Path = PRODUCT_ROOT,
+    *,
+    schema: int,
+    source_sha: str = VALID_SHA,
+    image_id: str = TARGET_IMAGE_ID,
+    deployment_assets: object | None = None,
+) -> object:
+    return module._PROVENANCE.parse_build_manifest_bytes(
+        source_build_manifest_bytes(
+            module,
+            root,
+            schema=schema,
+            source_sha=source_sha,
+            image_id=image_id,
+            deployment_assets=deployment_assets,
+        )
+    )
+
+
+def write_source_build_manifest(
+    module: ModuleType,
+    state_directory: Path,
+    root: Path,
+    *,
+    schema: int,
+    source_sha: str = VALID_SHA,
+    image_id: str = TARGET_IMAGE_ID,
+    deployment_assets: object | None = None,
+) -> tuple[object, Path]:
+    raw = source_build_manifest_bytes(
+        module,
+        root,
+        schema=schema,
+        source_sha=source_sha,
+        image_id=image_id,
+        deployment_assets=deployment_assets,
+    )
+    manifest = module._PROVENANCE.parse_build_manifest_bytes(raw)
+    path = state_directory / f"build-{source_sha}.json"
+    path.write_bytes(raw)
+    path.chmod(0o600)
+    return manifest, path
+
+
+def drifted_deployment_assets(module: ModuleType, assets: object) -> object:
+    digests = dict(assets.sha256)
+    first_path = DEPLOYMENT_ASSET_PATHS[0]
+    digests[first_path] = "9" * 64 if digests[first_path] != "9" * 64 else "8" * 64
+    return module._PROVENANCE.DeploymentAssets(schema=1, sha256=digests)
+
+
+def matching_source_git_evidence(manifest: object) -> object:
+    return SimpleNamespace(
+        source_sha=manifest.source_sha,
+        deployment_assets=manifest.deployment_assets,
+    )
+
+
+def matching_reuse_git_evidence(donor: object, target: object) -> object:
+    return SimpleNamespace(
+        donor=SimpleNamespace(
+            source_sha=donor.source_sha,
+            deployment_assets=donor.deployment_assets,
+        ),
+        target=SimpleNamespace(
+            source_sha=target.source_sha,
+            deployment_assets=target.deployment_assets,
+        ),
+        runtime_equivalence=target.build.runtime_equivalence,
+    )
+
+
+def loaded_reuse_build_manifest(
+    module: ModuleType,
+    donor: object,
+    root: Path = PRODUCT_ROOT,
+) -> object:
+    component_digests = {
+        "backend": "a" * 64,
+        "dockerignore": "b" * 64,
+        "frontend": "c" * 64,
+        "scripts": "d" * 64,
+    }
+    combined = "e" * 64
+    payload = legacy_build_manifest_payload(root)
+    payload["schema"] = 3
+    payload["build"] = {
+        "schema": 1,
+        "kind": "verified-runtime-reuse",
+        "reused_from": {
+            "source_sha": donor.source_sha,
+            "image_reference": donor.image_reference,
+            "image_id": donor.image_id,
+            "manifest_sha256": donor.raw_sha256,
+        },
+        "runtime_equivalence": {
+            "schema": 1,
+            "policy": module._PROVENANCE.RUNTIME_EQUIVALENCE_POLICY,
+            "donor_copy_inputs_sha256": combined,
+            "target_copy_inputs_sha256": combined,
+            "components": {
+                name: {
+                    "donor_sha256": digest,
+                    "target_sha256": digest,
+                }
+                for name, digest in component_digests.items()
+            },
+            "dockerfile_transition": {
+                "policy": module._PROVENANCE.DOCKERFILE_TRANSITION_POLICY,
+                "from_sha256": module._PROVENANCE.DONOR_DOCKERFILE_SHA256,
+                "to_sha256": module._PROVENANCE.TARGET_DOCKERFILE_SHA256,
+            },
+        },
+    }
+    return module._PROVENANCE.parse_build_manifest_bytes(
+        module._PROVENANCE.canonical_manifest_bytes(payload)
+    )
+
+
+def write_reuse_manifest_chain(
+    module: ModuleType,
+    state_directory: Path,
+    root: Path,
+    *,
+    donor_schema: int = 2,
+    donor_deployment_assets: object | None = None,
+) -> tuple[object, object, Path, Path]:
+    donor, donor_path = write_source_build_manifest(
+        module,
+        state_directory,
+        root,
+        schema=donor_schema,
+        source_sha=DONOR_SHA,
+        image_id=DONOR_IMAGE_ID,
+        deployment_assets=donor_deployment_assets,
+    )
+    target = loaded_reuse_build_manifest(module, donor, root)
+    target_path = state_directory / f"build-{VALID_SHA}.json"
+    target_path.write_bytes(target.raw_bytes)
+    target_path.chmod(0o600)
+    return donor, target, donor_path, target_path
+
+
+def verified_prepare_inputs(
+    module: ModuleType,
+    root: Path,
+    *,
+    image_config: Mapping[str, object] | None = None,
+) -> object:
+    contents = {
+        relative_path: (root / relative_path).read_text(encoding="utf-8")
+        for relative_path in DEPLOYMENT_ASSET_PATHS
+    }
+    return module.VerifiedPrepareInputs(
+        deployment_assets=module.VerifiedDeploymentAssets(
+            identity=deployment_asset_payload(root),
+            compose_yaml=contents[DEPLOYMENT_ASSET_PATHS[0]],
+            caddy_templates={
+                module.CADDY_PROFILE_HARDENED: contents[DEPLOYMENT_ASSET_PATHS[1]],
+                module.CADDY_PROFILE_LEGACY_V020: contents[DEPLOYMENT_ASSET_PATHS[2]],
+            },
+        ),
+        image_config={} if image_config is None else dict(image_config),
+    )
+
+
+def stub_prepare_preflight(
+    module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    *,
+    callback: Callable[[], None] | None = None,
+) -> None:
+    verified = verified_prepare_inputs(module, root)
+
+    def verify(**_kwargs: object) -> object:
+        if callback is not None:
+            callback()
+        return verified
+
+    monkeypatch.setattr(module, "_verify_prepare_inputs", verify)
 
 
 def write_deployment_assets(root: Path) -> dict[str, str]:
@@ -1685,9 +1906,12 @@ def test_prepare_rejects_post_build_compose_sidecar_before_any_docker_call(
         tmp_path,
         monkeypatch,
     )
-    manifest_path = state_directory / f"build-{VALID_SHA}.json"
     write_deployment_assets(product_root)
     manifest = loaded_legacy_build_manifest(module, product_root)
+    manifest_path = write_canonical_legacy_manifest(
+        state_directory,
+        product_root=product_root,
+    )
     (product_root / DEPLOYMENT_ASSET_PATHS[0]).write_text(
         "services:\n"
         "  commerce-ops-desk:\n"
@@ -1699,9 +1923,18 @@ def test_prepare_rejects_post_build_compose_sidecar_before_any_docker_call(
     )
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
     monkeypatch.setattr(
+        module._PROVENANCE,
+        "export_revision_evidence",
+        lambda _checkout, source_sha, _approved_ref, **_kwargs: SimpleNamespace(
+            source_sha=source_sha,
+            deployment_assets=manifest.deployment_assets,
+        ),
+    )
+    monkeypatch.setattr(module, "_assert_local_docker_daemon", lambda *_args: None)
+    monkeypatch.setattr(
         module,
-        "_load_build_manifest",
-        lambda _path, **_kwargs: manifest,
+        "_inspect_manifest_image",
+        lambda *_args: SimpleNamespace(config={}),
     )
     monkeypatch.setattr(
         module,
@@ -1742,13 +1975,12 @@ def test_prepare_rejects_a_historical_empty_candidate_directory_before_sudo_or_d
     write_deployment_assets(product_root)
     for directory in (live, candidate):
         directory.mkdir(mode=0o700, parents=True)
-    manifest = loaded_legacy_build_manifest(module, product_root)
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
-    monkeypatch.setattr(
-        module,
-        "_load_build_manifest",
-        lambda _path, **_kwargs: manifest,
+    manifest_path = write_canonical_legacy_manifest(
+        state_directory,
+        product_root=product_root,
     )
+    stub_prepare_preflight(module, monkeypatch, product_root)
 
     class NoCommandRunner:
         def run(
@@ -1757,7 +1989,7 @@ def test_prepare_rejects_a_historical_empty_candidate_directory_before_sudo_or_d
             pytest.fail(f"no command may run for a historical candidate: {arguments}")
 
     arguments = argparse.Namespace(
-        build_manifest=str(state_directory / f"build-{VALID_SHA}.json"),
+        build_manifest=str(manifest_path),
         candidate_port="18088",
         live_data_dir=str(live),
         candidate_data_dir=str(candidate),
@@ -2138,14 +2370,24 @@ def test_prepare_holds_full_sha_build_lock_before_manifest_load(
         assert_shared_build_lock_held(module, VALID_SHA)
         return state_directory / f"candidate-{VALID_SHA[:12]}.json"
 
+    def verify_under_lock() -> None:
+        events.append("verify")
+        assert_shared_build_lock_held(module, VALID_SHA)
+
     monkeypatch.setattr(module, "_load_build_manifest", load_under_lock)
+    stub_prepare_preflight(
+        module,
+        monkeypatch,
+        product_root,
+        callback=verify_under_lock,
+    )
     monkeypatch.setattr(module, "_prepare_candidate_locked", prepare_under_lock)
     arguments = argparse.Namespace(build_manifest=str(manifest_path))
 
     result = module.prepare_candidate(arguments, object())
 
     assert result == state_directory / f"candidate-{VALID_SHA[:12]}.json"
-    assert events == ["load", "prepare"]
+    assert events == ["load", "verify", "prepare"]
     assert (state_directory / f".build-{VALID_SHA}.lock").is_file()
     assert not list(state_directory.glob("candidate-*.prepare.lock"))
 
@@ -2234,6 +2476,7 @@ def test_prepare_ignores_a_busy_legacy_lock_without_touching_it(
         "_prepare_candidate_locked",
         prepare_under_shared_lock,
     )
+    stub_prepare_preflight(module, monkeypatch, product_root)
     with legacy_lock.open("r+b") as legacy_descriptor:
         fcntl.flock(legacy_descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         result = module.prepare_candidate(
@@ -2334,6 +2577,1102 @@ def test_prepare_rejects_manifest_content_sha_mismatch_before_candidate_work(
 
     assert not list(app_root.glob(f"data-candidate-{VALID_SHA[:12]}*"))
     assert not list(state_directory.glob(f"candidate-{VALID_SHA[:12]}*"))
+
+
+def test_prepare_completes_provenance_preflight_before_candidate_data_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    write_deployment_assets(product_root)
+    manifest_path = write_canonical_legacy_manifest(
+        state_directory,
+        product_root=product_root,
+    )
+    monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
+    events: list[str] = []
+
+    def reject_provenance(*_args: object, **_kwargs: object) -> object:
+        events.append("provenance")
+        raise module.DeploymentError("provenance preflight sentinel")
+
+    def unexpected_candidate_creation(*_args: object, **_kwargs: object) -> object:
+        events.append("candidate-data")
+        pytest.fail("candidate data was created before provenance preflight completed")
+
+    monkeypatch.setattr(
+        module,
+        "_verify_prepare_inputs",
+        reject_provenance,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "_create_candidate_data_directory",
+        unexpected_candidate_creation,
+    )
+    for name in (
+        "_assert_compose_service_contract",
+        "_assert_candidate_absent",
+        "_created_project_network",
+        "_assert_exact_project_container",
+    ):
+        monkeypatch.setattr(module, name, unexpected_candidate_creation)
+    arguments = argparse.Namespace(
+        build_manifest=str(manifest_path),
+        candidate_port="18088",
+        live_data_dir=str(app_root / "data-live"),
+        candidate_data_dir=str(app_root / f"data-candidate-{VALID_SHA[:12]}"),
+    )
+
+    with pytest.raises(module.DeploymentError, match="provenance preflight sentinel"):
+        module.prepare_candidate(arguments, object())
+
+    assert events == ["provenance"]
+    assert not (app_root / f"data-candidate-{VALID_SHA[:12]}").exists()
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("git", "daemon", "image", "asset", "manifest-fsync", "state-fsync"),
+)
+def test_each_source_provenance_failure_stops_before_candidate_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    module = load_deploy_tool()
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    write_deployment_assets(product_root)
+    manifest_path = write_canonical_legacy_manifest(
+        state_directory,
+        product_root=product_root,
+    )
+    manifest = loaded_legacy_build_manifest(module, product_root)
+    monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "export_revision_evidence",
+        lambda _checkout, source_sha, _approved_ref, **_kwargs: SimpleNamespace(
+            source_sha=source_sha,
+            deployment_assets=manifest.deployment_assets,
+        ),
+    )
+    monkeypatch.setattr(module, "_assert_local_docker_daemon", lambda *_args: None)
+    monkeypatch.setattr(
+        module,
+        "_inspect_manifest_image",
+        lambda *_args: SimpleNamespace(config={}),
+    )
+    sentinel = f"{failure_stage} provenance sentinel"
+
+    def fail_provenance(*_args: object, **_kwargs: object) -> object:
+        raise module._PROVENANCE.ProvenanceError(sentinel)
+
+    def fail_deployment(*_args: object, **_kwargs: object) -> object:
+        raise module.DeploymentError(sentinel)
+
+    if failure_stage == "git":
+        monkeypatch.setattr(
+            module._PROVENANCE,
+            "export_revision_evidence",
+            fail_provenance,
+        )
+    elif failure_stage == "daemon":
+        monkeypatch.setattr(module, "_assert_local_docker_daemon", fail_deployment)
+    elif failure_stage == "image":
+        monkeypatch.setattr(module, "_inspect_manifest_image", fail_deployment)
+    elif failure_stage == "asset":
+        monkeypatch.setattr(
+            module._PROVENANCE,
+            "safe_read_deployment_asset",
+            fail_provenance,
+        )
+    elif failure_stage == "manifest-fsync":
+        monkeypatch.setattr(module._PROVENANCE.SafeRead, "fsync", fail_provenance)
+    elif failure_stage == "state-fsync":
+        monkeypatch.setattr(
+            module._PROVENANCE.CanonicalStateDirectory,
+            "fsync",
+            fail_provenance,
+        )
+    else:  # pragma: no cover - parameter table guard
+        raise AssertionError(f"unknown failure stage: {failure_stage}")
+
+    def unexpected_side_effect(*_args: object, **_kwargs: object) -> object:
+        pytest.fail(f"candidate side effect ran after {failure_stage} failure")
+
+    for name in (
+        "_create_candidate_data_directory",
+        "_assert_compose_service_contract",
+        "_assert_candidate_absent",
+        "_created_project_network",
+        "_assert_exact_project_container",
+    ):
+        monkeypatch.setattr(module, name, unexpected_side_effect)
+
+    class NoCommandRunner:
+        def run(self, arguments: list[str], **_kwargs: object) -> object:
+            pytest.fail(f"unexpected command at {failure_stage}: {arguments}")
+
+    arguments = argparse.Namespace(
+        build_manifest=str(manifest_path),
+        candidate_port="18088",
+        live_data_dir=str(app_root / "data-live"),
+        candidate_data_dir=str(app_root / f"data-candidate-{VALID_SHA[:12]}"),
+    )
+    with pytest.raises(module.DeploymentError, match=sentinel):
+        module.prepare_candidate(arguments, NoCommandRunner())
+
+    assert not (app_root / f"data-candidate-{VALID_SHA[:12]}").exists()
+    assert not (state_directory / f"candidate-{VALID_SHA[:12]}.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("manifest_arm", "source_schema", "donor_schema"),
+    (
+        ("source", 2, None),
+        ("source", 3, None),
+        ("reuse", None, 2),
+        ("reuse", None, 3),
+    ),
+    ids=("source-schema2", "source-schema3", "reuse-donor2", "reuse-donor3"),
+)
+def test_prepare_preflight_supports_every_source_and_donor_schema_with_exact_git_wiring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest_arm: str,
+    source_schema: int | None,
+    donor_schema: int | None,
+) -> None:
+    module = load_deploy_tool()
+    _home, _app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    write_deployment_assets(product_root)
+    monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
+    git_calls: list[tuple[object, ...]] = []
+
+    if manifest_arm == "source":
+        assert source_schema is not None
+        manifest, manifest_path = write_source_build_manifest(
+            module,
+            state_directory,
+            product_root,
+            schema=source_schema,
+        )
+
+        def export_revision(
+            checkout: object,
+            source_sha: str,
+            approved_remote_ref: str,
+            *,
+            workspace: Path,
+            extract_to: Path | None = None,
+        ) -> object:
+            git_calls.append(
+                (
+                    "source",
+                    checkout.path,
+                    source_sha,
+                    approved_remote_ref,
+                    workspace,
+                    extract_to,
+                )
+            )
+            return matching_source_git_evidence(manifest)
+
+        monkeypatch.setattr(
+            module._PROVENANCE,
+            "export_revision_evidence",
+            export_revision,
+        )
+    else:
+        assert donor_schema is not None
+        donor, manifest, _donor_path, manifest_path = write_reuse_manifest_chain(
+            module,
+            state_directory,
+            product_root,
+            donor_schema=donor_schema,
+        )
+
+        def recompute(
+            checkout: object,
+            *,
+            donor_sha: str,
+            target_sha: str,
+            approved_remote_ref: str,
+            workspace: Path,
+        ) -> object:
+            git_calls.append(
+                (
+                    "reuse",
+                    checkout.path,
+                    donor_sha,
+                    target_sha,
+                    approved_remote_ref,
+                    workspace,
+                )
+            )
+            return matching_reuse_git_evidence(donor, manifest)
+
+        monkeypatch.setattr(
+            module._PROVENANCE,
+            "recompute_runtime_equivalence",
+            recompute,
+        )
+        monkeypatch.setattr(
+            module,
+            "_assert_reuse_image_equivalence",
+            lambda **kwargs: (
+                (
+                    kwargs["target_manifest"].source_sha == VALID_SHA
+                    and kwargs["donor_manifest"].schema == donor_schema
+                )
+                or pytest.fail("prepare compared the wrong target/donor manifests")
+            ),
+        )
+
+    daemon_checks: list[str] = []
+    monkeypatch.setattr(
+        module,
+        "_assert_local_docker_daemon",
+        lambda _runner, daemon_id: daemon_checks.append(daemon_id),
+    )
+    monkeypatch.setattr(
+        module,
+        "_inspect_manifest_image",
+        lambda _runner, observed_manifest: SimpleNamespace(
+            config={"source_sha": observed_manifest.source_sha}
+        ),
+    )
+    prepared: list[object] = []
+    expected_state_path = state_directory / f"candidate-{VALID_SHA[:12]}.json"
+
+    def accept_preflight(
+        _arguments: argparse.Namespace,
+        _runner: object,
+        *,
+        build_manifest: object,
+        verified_inputs: object,
+        **_kwargs: object,
+    ) -> Path:
+        prepared.append((build_manifest, verified_inputs))
+        assert build_manifest.schema == manifest.schema
+        assert verified_inputs.deployment_assets.identity == deployment_asset_payload(
+            product_root
+        )
+        return expected_state_path
+
+    monkeypatch.setattr(module, "_prepare_candidate_locked", accept_preflight)
+
+    result = module.prepare_candidate(
+        argparse.Namespace(build_manifest=str(manifest_path)),
+        object(),
+    )
+
+    assert result == expected_state_path
+    assert len(prepared) == 1
+    assert daemon_checks == [DOCKER_DAEMON_ID]
+    if manifest_arm == "source":
+        assert git_calls == [
+            (
+                "source",
+                product_root,
+                VALID_SHA,
+                "refs/remotes/origin/main",
+                state_directory,
+                None,
+            )
+        ]
+    else:
+        assert git_calls == [
+            (
+                "reuse",
+                product_root,
+                DONOR_SHA,
+                VALID_SHA,
+                "refs/remotes/origin/main",
+                state_directory,
+            )
+        ]
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "donor-assets",
+        "target-assets",
+        "runtime-equivalence",
+        "donor-sha",
+        "target-sha",
+    ),
+)
+def test_reuse_prepare_rejects_each_returned_git_evidence_drift_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    module = load_deploy_tool()
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    write_deployment_assets(product_root)
+    donor, target, _donor_path, target_path = write_reuse_manifest_chain(
+        module,
+        state_directory,
+        product_root,
+        donor_schema=3,
+    )
+    evidence = matching_reuse_git_evidence(donor, target)
+    if drift == "donor-assets":
+        evidence.donor.deployment_assets = drifted_deployment_assets(
+            module, donor.deployment_assets
+        )
+    elif drift == "target-assets":
+        evidence.target.deployment_assets = drifted_deployment_assets(
+            module, target.deployment_assets
+        )
+    elif drift == "runtime-equivalence":
+        evidence.runtime_equivalence = object()
+    elif drift == "donor-sha":
+        evidence.donor.source_sha = "a" * 40
+    elif drift == "target-sha":
+        evidence.target.source_sha = "b" * 40
+    else:  # pragma: no cover - parameter table guard.
+        raise AssertionError(f"unknown Git evidence drift: {drift}")
+
+    monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
+
+    def recompute(
+        checkout: object,
+        *,
+        donor_sha: str,
+        target_sha: str,
+        approved_remote_ref: str,
+        workspace: Path,
+    ) -> object:
+        assert checkout.path == product_root
+        assert donor_sha == DONOR_SHA
+        assert target_sha == VALID_SHA
+        assert approved_remote_ref == "refs/remotes/origin/main"
+        assert workspace == state_directory
+        return evidence
+
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "recompute_runtime_equivalence",
+        recompute,
+    )
+    monkeypatch.setattr(module, "_assert_local_docker_daemon", lambda *_args: None)
+    monkeypatch.setattr(
+        module,
+        "_inspect_manifest_image",
+        lambda _runner, manifest: SimpleNamespace(
+            config={"source_sha": manifest.source_sha}
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_assert_reuse_image_equivalence",
+        lambda **_kwargs: None,
+    )
+
+    def unexpected_candidate_side_effect(*_args: object, **_kwargs: object) -> object:
+        pytest.fail(f"candidate side effect ran after {drift} Git evidence drift")
+
+    monkeypatch.setattr(
+        module,
+        "_create_candidate_data_directory",
+        unexpected_candidate_side_effect,
+    )
+
+    with pytest.raises(
+        module.DeploymentError,
+        match="current Git reuse evidence does not match",
+    ):
+        module.prepare_candidate(
+            argparse.Namespace(
+                build_manifest=str(target_path),
+                candidate_port="18088",
+                live_data_dir=str(app_root / "data-live"),
+                candidate_data_dir=str(app_root / f"data-candidate-{VALID_SHA[:12]}"),
+            ),
+            object(),
+        )
+
+    assert not (app_root / f"data-candidate-{VALID_SHA[:12]}").exists()
+    assert not (state_directory / f"candidate-{VALID_SHA[:12]}.json").exists()
+
+
+def test_prepare_preflight_repairs_the_retained_manifest_before_returning_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    _home, _app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    asset_text = write_deployment_assets(product_root)
+    manifest_path = write_canonical_legacy_manifest(
+        state_directory,
+        product_root=product_root,
+    )
+    events: list[str] = []
+
+    class RetainedCheckout:
+        path = product_root
+
+        def __enter__(self) -> Self:
+            events.append("checkout-enter")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            events.append("checkout-close")
+
+        def revalidate(self) -> None:
+            events.append("checkout-revalidate")
+
+    class RetainedAsset:
+        def __init__(self, relative_path: str) -> None:
+            self.data = asset_text[relative_path].encode("utf-8")
+            self.text = asset_text[relative_path]
+            self.relative_path = relative_path
+
+        def __enter__(self) -> Self:
+            events.append(f"asset-enter:{self.relative_path}")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            events.append(f"asset-close:{self.relative_path}")
+
+        def revalidate(self) -> None:
+            events.append(f"asset-revalidate:{self.relative_path}")
+
+    monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "open_canonical_checkout_root",
+        lambda _path: RetainedCheckout(),
+    )
+
+    def export_revision(
+        _checkout: object,
+        source_sha: str,
+        approved_ref: str,
+        **_kwargs: object,
+    ) -> object:
+        events.append("git")
+        assert source_sha == VALID_SHA
+        assert approved_ref == "refs/remotes/origin/main"
+        return SimpleNamespace(
+            source_sha=source_sha,
+            deployment_assets=manifest.deployment_assets,
+        )
+
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "export_revision_evidence",
+        export_revision,
+    )
+    monkeypatch.setattr(
+        module,
+        "_assert_local_docker_daemon",
+        lambda _runner, _daemon: events.append("daemon"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_inspect_manifest_image",
+        lambda _runner, _manifest: (
+            events.append("image")
+            or SimpleNamespace(config={"Env": [f"COMMERCE_OPS_SOURCE_SHA={VALID_SHA}"]})
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "safe_read_deployment_asset",
+        lambda _checkout, relative_path: RetainedAsset(relative_path),
+    )
+
+    with (
+        module._PROVENANCE.open_canonical_state_directory() as state,
+        module._PROVENANCE.BuildLock.acquire(state, VALID_SHA) as build_lock,
+        module._PROVENANCE.safe_read_direct_child(
+            state,
+            manifest_path.name,
+            expected_mode=0o600,
+            maximum_size=256 * 1024,
+        ) as target_read,
+    ):
+        manifest = module._PROVENANCE.parse_build_manifest_bytes(target_read.data)
+        monkeypatch.setattr(
+            target_read,
+            "fsync",
+            lambda: events.append("target-fsync"),
+        )
+        monkeypatch.setattr(
+            target_read,
+            "revalidate",
+            lambda: events.append("target-revalidate"),
+        )
+        monkeypatch.setattr(state, "fsync", lambda: events.append("state-fsync"))
+        monkeypatch.setattr(
+            build_lock,
+            "revalidate",
+            lambda: events.append("lock-revalidate"),
+        )
+
+        verified = module._verify_prepare_inputs(
+            state=state,
+            build_lock=build_lock,
+            target_manifest_read=target_read,
+            build_manifest=manifest,
+            runner=object(),
+        )
+
+    assert (
+        verified.deployment_assets.compose_yaml == asset_text[DEPLOYMENT_ASSET_PATHS[0]]
+    )
+    assert verified.image_config == {"Env": [f"COMMERCE_OPS_SOURCE_SHA={VALID_SHA}"]}
+    assert events.index("git") < events.index("daemon") < events.index("image")
+    assert events.index("image") < events.index("target-fsync")
+    assert events.index("target-fsync") < events.index("state-fsync")
+    assert events.index("state-fsync") < events.index("target-revalidate")
+    assert events.index("target-revalidate") < events.index("lock-revalidate")
+    for relative_path in DEPLOYMENT_ASSET_PATHS:
+        assert events.index(f"asset-enter:{relative_path}") < events.index(
+            "target-fsync"
+        )
+        assert events.index(f"asset-revalidate:{relative_path}") > events.index(
+            "state-fsync"
+        )
+
+
+def test_reuse_prepare_preflight_binds_the_canonical_donor_and_target_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_deploy_tool()
+    _home, _app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    write_deployment_assets(product_root)
+    donor, target, donor_path, target_path = write_reuse_manifest_chain(
+        module,
+        state_directory,
+        product_root,
+    )
+    events: list[str] = []
+
+    monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
+    real_open_checkout = module._PROVENANCE.open_canonical_checkout_root
+
+    def record_checkout_open(repository: Path) -> object:
+        events.append("checkout-open")
+        return real_open_checkout(repository)
+
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "open_canonical_checkout_root",
+        record_checkout_open,
+    )
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "recompute_runtime_equivalence",
+        lambda _checkout, **_kwargs: (
+            events.append("git") or matching_reuse_git_evidence(donor, target)
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_assert_local_docker_daemon",
+        lambda *_args: events.append("daemon"),
+    )
+
+    def inspect_image(_runner: object, manifest: object) -> object:
+        events.append(f"image:{manifest.source_sha}")
+        return SimpleNamespace(config={"source_sha": manifest.source_sha})
+
+    monkeypatch.setattr(module, "_inspect_manifest_image", inspect_image)
+
+    def compare_images(**kwargs: object) -> None:
+        events.append("image-equivalence")
+        assert kwargs["target_manifest"] is target
+        assert kwargs["donor_manifest"] == donor
+
+    monkeypatch.setattr(module, "_assert_reuse_image_equivalence", compare_images)
+    real_direct_read = module._PROVENANCE.safe_read_direct_child
+    direct_names: list[str] = []
+
+    def record_direct_read(state: object, name: str, **kwargs: object) -> object:
+        direct_names.append(name)
+        events.append("donor-read")
+        opened = real_direct_read(state, name, **kwargs)
+        real_revalidate = opened.revalidate
+
+        def revalidate() -> None:
+            events.append("donor-revalidate")
+            real_revalidate()
+
+        monkeypatch.setattr(opened, "revalidate", revalidate)
+        return opened
+
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "safe_read_direct_child",
+        record_direct_read,
+    )
+    real_asset_read = module._PROVENANCE.safe_read_deployment_asset
+    asset_paths: list[str] = []
+
+    def record_asset_read(checkout: object, relative_path: str) -> object:
+        asset_paths.append(relative_path)
+        opened = real_asset_read(checkout, relative_path)
+        real_revalidate = opened.revalidate
+
+        def revalidate() -> None:
+            events.append(f"asset-revalidate:{relative_path}")
+            real_revalidate()
+
+        monkeypatch.setattr(opened, "revalidate", revalidate)
+        return opened
+
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "safe_read_deployment_asset",
+        record_asset_read,
+    )
+
+    with (
+        module._PROVENANCE.open_canonical_state_directory() as state,
+        module._PROVENANCE.BuildLock.acquire(state, VALID_SHA) as build_lock,
+        real_direct_read(
+            state,
+            target_path.name,
+            expected_mode=0o600,
+            maximum_size=256 * 1024,
+        ) as target_read,
+    ):
+        verified = module._verify_prepare_inputs(
+            state=state,
+            build_lock=build_lock,
+            target_manifest_read=target_read,
+            build_manifest=target,
+            runner=object(),
+        )
+
+    assert direct_names == [donor_path.name]
+    assert asset_paths == list(DEPLOYMENT_ASSET_PATHS)
+    assert events.index("donor-read") < events.index("checkout-open")
+    assert events.index("git") < events.index("image:" + VALID_SHA)
+    assert events.index("image:" + VALID_SHA) < events.index("image:" + DONOR_SHA)
+    assert events.index("image:" + DONOR_SHA) < events.index("image-equivalence")
+    assert "donor-revalidate" in events
+    for relative_path in DEPLOYMENT_ASSET_PATHS:
+        assert f"asset-revalidate:{relative_path}" in events
+    assert verified.image_config == {"source_sha": VALID_SHA}
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    (
+        "donor-read",
+        "manifest-chain",
+        "git-equivalence",
+        "daemon",
+        "target-image",
+        "donor-image",
+        "image-equivalence",
+        "asset",
+        "manifest-fsync",
+        "state-fsync",
+    ),
+)
+def test_each_reuse_provenance_failure_stops_before_candidate_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    module = load_deploy_tool()
+    _home, app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    write_deployment_assets(product_root)
+    donor, target, donor_path, target_path = write_reuse_manifest_chain(
+        module,
+        state_directory,
+        product_root,
+    )
+    monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "recompute_runtime_equivalence",
+        lambda _checkout, **_kwargs: matching_reuse_git_evidence(donor, target),
+    )
+    monkeypatch.setattr(module, "_assert_local_docker_daemon", lambda *_args: None)
+    monkeypatch.setattr(
+        module,
+        "_inspect_manifest_image",
+        lambda _runner, manifest: SimpleNamespace(
+            config={"source_sha": manifest.source_sha}
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_assert_reuse_image_equivalence",
+        lambda **_kwargs: None,
+    )
+    sentinel = f"{failure_stage} reuse provenance sentinel"
+
+    def fail_provenance(*_args: object, **_kwargs: object) -> object:
+        raise module._PROVENANCE.ProvenanceError(sentinel)
+
+    def fail_deployment(*_args: object, **_kwargs: object) -> object:
+        raise module.DeploymentError(sentinel)
+
+    if failure_stage == "donor-read":
+        real_read = module._PROVENANCE.safe_read_direct_child
+
+        def fail_donor_read(state: object, name: str, **kwargs: object) -> object:
+            if name == donor_path.name:
+                return fail_provenance()
+            return real_read(state, name, **kwargs)
+
+        monkeypatch.setattr(
+            module._PROVENANCE,
+            "safe_read_direct_child",
+            fail_donor_read,
+        )
+    elif failure_stage == "manifest-chain":
+        monkeypatch.setattr(
+            module._PROVENANCE,
+            "validate_candidate_manifest_chain",
+            fail_provenance,
+        )
+    elif failure_stage == "git-equivalence":
+        monkeypatch.setattr(
+            module._PROVENANCE,
+            "recompute_runtime_equivalence",
+            fail_provenance,
+        )
+    elif failure_stage == "daemon":
+        monkeypatch.setattr(module, "_assert_local_docker_daemon", fail_deployment)
+    elif failure_stage in {"target-image", "donor-image"}:
+
+        def fail_selected_image(_runner: object, manifest: object) -> object:
+            if (
+                failure_stage == "target-image" and manifest.source_sha == VALID_SHA
+            ) or (failure_stage == "donor-image" and manifest.source_sha == DONOR_SHA):
+                return fail_deployment()
+            return SimpleNamespace(config={"source_sha": manifest.source_sha})
+
+        monkeypatch.setattr(module, "_inspect_manifest_image", fail_selected_image)
+    elif failure_stage == "image-equivalence":
+        monkeypatch.setattr(
+            module,
+            "_assert_reuse_image_equivalence",
+            fail_deployment,
+        )
+    elif failure_stage == "asset":
+        monkeypatch.setattr(
+            module._PROVENANCE,
+            "safe_read_deployment_asset",
+            fail_provenance,
+        )
+    elif failure_stage == "manifest-fsync":
+        monkeypatch.setattr(module._PROVENANCE.SafeRead, "fsync", fail_provenance)
+    elif failure_stage == "state-fsync":
+        monkeypatch.setattr(
+            module._PROVENANCE.CanonicalStateDirectory,
+            "fsync",
+            fail_provenance,
+        )
+    else:  # pragma: no cover - parameter table guard
+        raise AssertionError(f"unknown failure stage: {failure_stage}")
+
+    def unexpected_side_effect(*_args: object, **_kwargs: object) -> object:
+        pytest.fail(f"candidate side effect ran after {failure_stage} failure")
+
+    for name in (
+        "_create_candidate_data_directory",
+        "_assert_compose_service_contract",
+        "_assert_candidate_absent",
+        "_created_project_network",
+        "_assert_exact_project_container",
+    ):
+        monkeypatch.setattr(module, name, unexpected_side_effect)
+
+    with pytest.raises(module.DeploymentError, match=sentinel):
+        module.prepare_candidate(
+            argparse.Namespace(
+                build_manifest=str(target_path),
+                candidate_port="18088",
+                live_data_dir=str(app_root / "data-live"),
+                candidate_data_dir=str(app_root / f"data-candidate-{VALID_SHA[:12]}"),
+            ),
+            object(),
+        )
+
+    assert donor.source_sha == DONOR_SHA
+    assert not (app_root / f"data-candidate-{VALID_SHA[:12]}").exists()
+    assert not (state_directory / f"candidate-{VALID_SHA[:12]}.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("manifest_arm", "failure_stage"),
+    (
+        ("source", "target-manifest"),
+        *(
+            ("source", f"asset:{relative_path}")
+            for relative_path in DEPLOYMENT_ASSET_PATHS
+        ),
+        ("source", "checkout"),
+        ("source", "build-lock"),
+        ("reuse", "target-manifest"),
+        ("reuse", "donor-manifest"),
+        *(
+            ("reuse", f"asset:{relative_path}")
+            for relative_path in DEPLOYMENT_ASSET_PATHS
+        ),
+        ("reuse", "checkout"),
+        ("reuse", "build-lock"),
+    ),
+    ids=(
+        "source-target-manifest",
+        "source-compose",
+        "source-caddy-hardened",
+        "source-caddy-legacy",
+        "source-checkout",
+        "source-build-lock",
+        "reuse-target-manifest",
+        "reuse-donor-manifest",
+        "reuse-compose",
+        "reuse-caddy-hardened",
+        "reuse-caddy-legacy",
+        "reuse-checkout",
+        "reuse-build-lock",
+    ),
+)
+def test_final_identity_revalidation_failure_stops_before_candidate_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest_arm: str,
+    failure_stage: str,
+) -> None:
+    module = load_deploy_tool()
+    _home, _app_root, state_directory = configure_canonical_deploy_tree(
+        module,
+        tmp_path,
+        monkeypatch,
+    )
+    product_root = tmp_path / "product"
+    write_deployment_assets(product_root)
+    monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
+
+    donor: object | None = None
+    donor_path: Path | None = None
+    if manifest_arm == "source":
+        target, target_path = write_source_build_manifest(
+            module,
+            state_directory,
+            product_root,
+            schema=3,
+        )
+        monkeypatch.setattr(
+            module._PROVENANCE,
+            "export_revision_evidence",
+            lambda _checkout, *_args, **_kwargs: matching_source_git_evidence(target),
+        )
+    else:
+        donor, target, donor_path, target_path = write_reuse_manifest_chain(
+            module,
+            state_directory,
+            product_root,
+            donor_schema=3,
+        )
+        monkeypatch.setattr(
+            module._PROVENANCE,
+            "recompute_runtime_equivalence",
+            lambda _checkout, **_kwargs: matching_reuse_git_evidence(donor, target),
+        )
+        monkeypatch.setattr(
+            module,
+            "_assert_reuse_image_equivalence",
+            lambda **_kwargs: None,
+        )
+
+    monkeypatch.setattr(module, "_assert_local_docker_daemon", lambda *_args: None)
+    monkeypatch.setattr(
+        module,
+        "_inspect_manifest_image",
+        lambda _runner, manifest: SimpleNamespace(
+            config={"source_sha": manifest.source_sha}
+        ),
+    )
+
+    events: list[str] = []
+    barrier_crossed = False
+    failure_injected = False
+    sentinel = f"{manifest_arm} {failure_stage} final revalidation sentinel"
+
+    def run_revalidation(
+        stage: str,
+        real_revalidate: Callable[[], None],
+    ) -> None:
+        nonlocal failure_injected
+        if barrier_crossed and failure_stage == stage and not failure_injected:
+            failure_injected = True
+            events.append(f"revalidate-failure:{stage}")
+            raise module._PROVENANCE.ProvenanceError(sentinel)
+        real_revalidate()
+
+    real_direct_read = module._PROVENANCE.safe_read_direct_child
+
+    def tracked_direct_read(state: object, name: str, **kwargs: object) -> object:
+        opened = real_direct_read(state, name, **kwargs)
+        if name == target_path.name:
+            stage = "target-manifest"
+            real_fsync = opened.fsync
+
+            def tracked_target_fsync() -> None:
+                events.append("target-fsync")
+                real_fsync()
+
+            monkeypatch.setattr(opened, "fsync", tracked_target_fsync)
+        else:
+            assert donor_path is not None
+            assert name == donor_path.name
+            stage = "donor-manifest"
+        real_revalidate = opened.revalidate
+        monkeypatch.setattr(
+            opened,
+            "revalidate",
+            lambda: run_revalidation(stage, real_revalidate),
+        )
+        return opened
+
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "safe_read_direct_child",
+        tracked_direct_read,
+    )
+
+    real_asset_read = module._PROVENANCE.safe_read_deployment_asset
+
+    def tracked_asset_read(checkout: object, relative_path: str) -> object:
+        opened = real_asset_read(checkout, relative_path)
+        real_revalidate = opened.revalidate
+        stage = f"asset:{relative_path}"
+        monkeypatch.setattr(
+            opened,
+            "revalidate",
+            lambda: run_revalidation(stage, real_revalidate),
+        )
+        return opened
+
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "safe_read_deployment_asset",
+        tracked_asset_read,
+    )
+
+    real_open_checkout = module._PROVENANCE.open_canonical_checkout_root
+
+    def tracked_open_checkout(repository: Path) -> object:
+        checkout = real_open_checkout(repository)
+        real_revalidate = checkout.revalidate
+        monkeypatch.setattr(
+            checkout,
+            "revalidate",
+            lambda: run_revalidation("checkout", real_revalidate),
+        )
+        return checkout
+
+    monkeypatch.setattr(
+        module._PROVENANCE,
+        "open_canonical_checkout_root",
+        tracked_open_checkout,
+    )
+
+    real_acquire = module._PROVENANCE.BuildLock.acquire
+
+    def tracked_acquire(
+        _class: type[object],
+        state: object,
+        source_sha: str,
+    ) -> object:
+        build_lock = real_acquire(state, source_sha)
+        real_revalidate = build_lock.revalidate
+        monkeypatch.setattr(
+            build_lock,
+            "revalidate",
+            lambda: run_revalidation("build-lock", real_revalidate),
+        )
+        return build_lock
+
+    monkeypatch.setattr(
+        module._PROVENANCE.BuildLock,
+        "acquire",
+        classmethod(tracked_acquire),
+    )
+
+    real_state_fsync = module._PROVENANCE.CanonicalStateDirectory.fsync
+
+    def tracked_state_fsync(state: object) -> None:
+        nonlocal barrier_crossed
+        real_state_fsync(state)
+        events.append("state-fsync")
+        barrier_crossed = True
+
+    monkeypatch.setattr(
+        module._PROVENANCE.CanonicalStateDirectory,
+        "fsync",
+        tracked_state_fsync,
+    )
+
+    def unexpected_candidate_work(*_args: object, **_kwargs: object) -> Path:
+        events.append("candidate-side-effect")
+        raise AssertionError("candidate work started after identity drift")
+
+    monkeypatch.setattr(module, "_prepare_candidate_locked", unexpected_candidate_work)
+
+    with pytest.raises(module.DeploymentError, match=sentinel):
+        module.prepare_candidate(
+            argparse.Namespace(build_manifest=str(target_path)),
+            object(),
+        )
+
+    failure_event = f"revalidate-failure:{failure_stage}"
+    assert events.index("target-fsync") < events.index("state-fsync")
+    assert events.index("state-fsync") < events.index(failure_event)
+    assert "candidate-side-effect" not in events
 
 
 @pytest.mark.parametrize("candidate_shape", ["data-only", "state-only", "both"])
@@ -3272,13 +4611,12 @@ def test_prepare_rejects_every_preexisting_candidate_path_before_any_command(
         (candidate / ".stale").write_text("stale data\n", encoding="utf-8")
     elif candidate_shape == "subdirectory":
         (candidate / "nested").mkdir()
-    manifest = loaded_legacy_build_manifest(module, product_root)
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
-    monkeypatch.setattr(
-        module,
-        "_load_build_manifest",
-        lambda _path, **_kwargs: manifest,
+    manifest_path = write_canonical_legacy_manifest(
+        state_directory,
+        product_root=product_root,
     )
+    stub_prepare_preflight(module, monkeypatch, product_root)
 
     class NoCommandRunner:
         def run(
@@ -3287,7 +4625,7 @@ def test_prepare_rejects_every_preexisting_candidate_path_before_any_command(
             pytest.fail(f"no command may run with stale candidate data: {arguments}")
 
     arguments = argparse.Namespace(
-        build_manifest=str(state_directory / f"build-{VALID_SHA}.json"),
+        build_manifest=str(manifest_path),
         candidate_port="18088",
         live_data_dir=str(live),
         candidate_data_dir=str(candidate),
@@ -3323,13 +4661,12 @@ def test_prepare_rejects_stale_candidate_state_before_any_docker_call(
         stale_state.mkdir()
     else:
         stale_state.symlink_to(tmp_path / "missing-state")
-    manifest = loaded_legacy_build_manifest(module, product_root)
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
-    monkeypatch.setattr(
-        module,
-        "_load_build_manifest",
-        lambda _path, **_kwargs: manifest,
+    manifest_path = write_canonical_legacy_manifest(
+        state_directory,
+        product_root=product_root,
     )
+    stub_prepare_preflight(module, monkeypatch, product_root)
 
     class NoDockerRunner:
         def run(
@@ -3338,7 +4675,7 @@ def test_prepare_rejects_stale_candidate_state_before_any_docker_call(
             pytest.fail(f"Docker must not run with stale candidate state: {arguments}")
 
     arguments = argparse.Namespace(
-        build_manifest=str(state_directory / f"build-{VALID_SHA}.json"),
+        build_manifest=str(manifest_path),
         candidate_port="18088",
         live_data_dir=str(live),
         candidate_data_dir=str(candidate),
@@ -3361,6 +4698,10 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
     (tmp_path / "live").mkdir()
     contents = write_deployment_assets(product_root)
     manifest = loaded_legacy_build_manifest(module, product_root)
+    manifest_path = write_canonical_legacy_manifest(
+        state_directory,
+        product_root=product_root,
+    )
     identity = module.candidate_identity(VALID_SHA)
     network_name = f"{identity.project_name}_default"
     create_container_id = "1" * 64
@@ -3379,11 +4720,7 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
         }
     ]
     monkeypatch.setattr(module, "PRODUCT_ROOT", product_root)
-    monkeypatch.setattr(
-        module,
-        "_load_build_manifest",
-        lambda _path, **_kwargs: manifest,
-    )
+    stub_prepare_preflight(module, monkeypatch, product_root)
     monkeypatch.setattr(
         module,
         "_candidate_data_path_for_creation",
@@ -3514,7 +4851,7 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
 
     runner = ComposeRunner()
     arguments = argparse.Namespace(
-        build_manifest=str(state_directory / f"build-{VALID_SHA}.json"),
+        build_manifest=str(manifest_path),
         candidate_port="18088",
         live_data_dir=str(tmp_path / "live"),
         candidate_data_dir=str(tmp_path / "candidate"),
@@ -3537,7 +4874,7 @@ def test_prepare_uses_one_verified_compose_service_and_records_final_identity(
     assert all(call[1] == contents[DEPLOYMENT_ASSET_PATHS[0]] for call in compose_calls)
     assert exact_container_calls == [create_container_id, final_container_id]
     assert final_network_ids[-1] == final_container_id
-    assert daemon_checks == [DOCKER_DAEMON_ID, DOCKER_DAEMON_ID]
+    assert daemon_checks == [DOCKER_DAEMON_ID]
     assert written["schema"] == 3
     assert written["container_id"] == final_container_id
     assert written["docker_daemon_id"] == DOCKER_DAEMON_ID

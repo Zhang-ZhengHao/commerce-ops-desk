@@ -6,11 +6,13 @@ import copy
 import hashlib
 import importlib.util
 import json
+import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -152,6 +154,10 @@ REQUIRED_DEPLOY_API = (
     "_parse_candidate_state_bytes",
     "_write_candidate_state",
 )
+P3_3_IMAGE_EVIDENCE_API = (
+    "_inspect_manifest_image",
+    "_assert_reuse_image_equivalence",
+)
 
 
 class ExplodingMapping(Mapping[str, object]):
@@ -199,6 +205,11 @@ MISSING_DEPLOY_API = tuple(
     for name in REQUIRED_DEPLOY_API
     if not callable(getattr(DEPLOY_MODULE, name, None))
 )
+MISSING_P3_3_IMAGE_EVIDENCE_API = tuple(
+    name
+    for name in P3_3_IMAGE_EVIDENCE_API
+    if not callable(getattr(DEPLOY_MODULE, name, None))
+)
 
 
 @pytest.fixture(scope="module")
@@ -213,6 +224,11 @@ def deploy_module() -> ModuleType:
     if MISSING_DEPLOY_API:
         pytest.skip("P3.1 candidate-state API is not implemented yet")
     return DEPLOY_MODULE
+
+
+@pytest.fixture(scope="module")
+def p3_3_image_deploy_module(deploy_module: ModuleType) -> ModuleType:
+    return deploy_module
 
 
 def _source_manifest_payload(
@@ -1427,3 +1443,662 @@ def test_typed_manifest_arm_distinguishes_a_forbidden_reuse_donor() -> None:
     assert isinstance(source2.build, MODULE.SourceBuild)
     assert isinstance(source3.build, MODULE.SourceBuild)
     assert not isinstance(reuse.build, MODULE.SourceBuild)
+
+
+class ManifestImageRunner:
+    """Return fixed Docker image inspections without exposing a real daemon."""
+
+    def __init__(self, inspections: Mapping[str, Mapping[str, object]]) -> None:
+        self._inspections = {
+            reference: copy.deepcopy(dict(inspection))
+            for reference, inspection in inspections.items()
+        }
+        self.commands: list[list[str]] = []
+
+    def run(
+        self,
+        arguments: list[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        command = list(arguments)
+        self.commands.append(command)
+        assert command[:3] == ["/usr/bin/docker", "image", "inspect"]
+        assert len(command) == 4
+        reference = command[3]
+        assert reference in self._inspections
+        stdout = json.dumps([copy.deepcopy(self._inspections[reference])])
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+
+class RawManifestImageRunner:
+    """Return one deliberately malformed Docker inspection response."""
+
+    def __init__(self, stdout: str) -> None:
+        self._stdout = stdout
+
+    def run(
+        self,
+        arguments: list[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        command = list(arguments)
+        assert command[:3] == ["/usr/bin/docker", "image", "inspect"]
+        return subprocess.CompletedProcess(command, 0, self._stdout, "")
+
+
+def _manifest_image_document(
+    provenance_module: ModuleType,
+    manifest: Any,
+) -> dict[str, object]:
+    source_sha = manifest.source_sha
+    image_id = manifest.image_id
+    assert isinstance(source_sha, str)
+    assert isinstance(image_id, str)
+    labels = {
+        "org.opencontainers.image.revision": source_sha,
+        "org.example.runtime-contract": "stable-v1",
+        **dict(provenance_module.expected_reserved_provenance_labels(manifest)),
+    }
+    return {
+        "Id": image_id,
+        "Os": "linux",
+        "Architecture": "amd64",
+        "Variant": "",
+        "RootFS": {
+            "Type": "layers",
+            "Layers": [f"sha256:{'a' * 64}", f"sha256:{'b' * 64}"],
+        },
+        "Config": {
+            "User": "10001:10001",
+            "ExposedPorts": {"8000/tcp": {}},
+            "Env": [
+                "LANG=C.UTF-8",
+                f"COMMERCE_OPS_SOURCE_SHA={source_sha}",
+                "PORT=8000",
+            ],
+            "Entrypoint": None,
+            "Cmd": ["python", "-m", "commerce_ops.main"],
+            "Healthcheck": {
+                "Test": ["CMD", "python", "-m", "commerce_ops.healthcheck"],
+                "Interval": 30_000_000_000,
+            },
+            "Volumes": {"/app/data": {}},
+            "WorkingDir": "/app",
+            "Shell": ["/bin/sh", "-c"],
+            "Labels": labels,
+        },
+    }
+
+
+def _runner_for_manifest_image(
+    manifest: Any,
+    *,
+    tag_document: Mapping[str, object],
+    immutable_document: Mapping[str, object],
+) -> ManifestImageRunner:
+    image_reference = manifest.image_reference
+    image_id = manifest.image_id
+    assert isinstance(image_reference, str)
+    assert isinstance(image_id, str)
+    return ManifestImageRunner(
+        {
+            image_reference: tag_document,
+            image_id: immutable_document,
+        }
+    )
+
+
+def _runner_for_reuse_images(
+    target_manifest: Any,
+    target_document: Mapping[str, object],
+    donor_manifest: Any,
+    donor_document: Mapping[str, object],
+) -> ManifestImageRunner:
+    inspections: dict[str, Mapping[str, object]] = {}
+    for manifest, document in (
+        (target_manifest, target_document),
+        (donor_manifest, donor_document),
+    ):
+        image_reference = manifest.image_reference
+        image_id = manifest.image_id
+        assert isinstance(image_reference, str)
+        assert isinstance(image_id, str)
+        inspections[image_reference] = document
+        inspections[image_id] = document
+    return ManifestImageRunner(inspections)
+
+
+def _deploy_provenance_module(deploy_module: ModuleType) -> ModuleType:
+    provenance_module = deploy_module._PROVENANCE
+    assert isinstance(provenance_module, ModuleType)
+    return provenance_module
+
+
+def _reuse_image_evidence(
+    deploy_module: ModuleType,
+    *,
+    target_document: Mapping[str, object] | None = None,
+) -> tuple[object, object, object, object]:
+    provenance_module = _deploy_provenance_module(deploy_module)
+    donor_manifest = _load_source_manifest(provenance_module, schema=3)
+    target_manifest = _load_reuse_target_for_donor(provenance_module, donor_manifest)
+    donor_document = _manifest_image_document(provenance_module, donor_manifest)
+    if target_document is None:
+        target_document = _manifest_image_document(provenance_module, target_manifest)
+    runner = _runner_for_reuse_images(
+        target_manifest,
+        target_document,
+        donor_manifest,
+        donor_document,
+    )
+    target_image = deploy_module._inspect_manifest_image(runner, target_manifest)
+    donor_image = deploy_module._inspect_manifest_image(runner, donor_manifest)
+    return target_manifest, target_image, donor_manifest, donor_image
+
+
+def test_p3_3_image_evidence_api_is_present() -> None:
+    assert not MISSING_P3_3_IMAGE_EVIDENCE_API, (
+        "missing P3.3 image evidence API: " + ", ".join(MISSING_P3_3_IMAGE_EVIDENCE_API)
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("schema2-source", "schema3-source", "schema3-reuse"),
+)
+def test_manifest_image_inspection_binds_tag_and_immutable_id(
+    p3_3_image_deploy_module: ModuleType,
+    case: str,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    manifest = _load_manifest(provenance_module, case)
+    document = _manifest_image_document(provenance_module, manifest)
+    runner = _runner_for_manifest_image(
+        manifest,
+        tag_document=document,
+        immutable_document=document,
+    )
+
+    image = deploy_module._inspect_manifest_image(runner, manifest)
+
+    assert image is not None
+    assert runner.commands == [
+        ["/usr/bin/docker", "image", "inspect", manifest.image_reference],
+        ["/usr/bin/docker", "image", "inspect", manifest.image_id],
+    ]
+
+
+@pytest.mark.parametrize("mismatched_surface", ("tag", "immutable"))
+def test_manifest_image_inspection_rejects_an_id_mismatch_on_either_surface(
+    p3_3_image_deploy_module: ModuleType,
+    mismatched_surface: str,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    manifest = _load_manifest(provenance_module, "schema3-source")
+    tag_document = _manifest_image_document(provenance_module, manifest)
+    immutable_document = copy.deepcopy(tag_document)
+    mismatched_document = (
+        tag_document if mismatched_surface == "tag" else immutable_document
+    )
+    mismatched_document["Id"] = OTHER_DONOR_IMAGE_ID
+    runner = _runner_for_manifest_image(
+        manifest,
+        tag_document=tag_document,
+        immutable_document=immutable_document,
+    )
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._inspect_manifest_image(runner, manifest)
+
+
+def test_manifest_image_inspection_rejects_tag_and_id_surface_drift(
+    p3_3_image_deploy_module: ModuleType,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    manifest = _load_manifest(provenance_module, "schema3-source")
+    tag_document = _manifest_image_document(provenance_module, manifest)
+    immutable_document = copy.deepcopy(tag_document)
+    immutable_config = immutable_document["Config"]
+    assert isinstance(immutable_config, dict)
+    immutable_config["WorkingDir"] = "/replaced"
+    runner = _runner_for_manifest_image(
+        manifest,
+        tag_document=tag_document,
+        immutable_document=immutable_document,
+    )
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._inspect_manifest_image(runner, manifest)
+
+
+@pytest.mark.parametrize(
+    ("tag_value", "immutable_value"),
+    ((False, 0), (0, False)),
+)
+def test_manifest_image_inspection_uses_strict_json_types_between_surfaces(
+    p3_3_image_deploy_module: ModuleType,
+    tag_value: object,
+    immutable_value: object,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    manifest = _load_manifest(provenance_module, "schema3-source")
+    tag_document = _manifest_image_document(provenance_module, manifest)
+    immutable_document = copy.deepcopy(tag_document)
+    for document, value in (
+        (tag_document, tag_value),
+        (immutable_document, immutable_value),
+    ):
+        config = document["Config"]
+        assert isinstance(config, dict)
+        healthcheck = config["Healthcheck"]
+        assert isinstance(healthcheck, dict)
+        healthcheck["Interval"] = value
+    runner = _runner_for_manifest_image(
+        manifest,
+        tag_document=tag_document,
+        immutable_document=immutable_document,
+    )
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._inspect_manifest_image(runner, manifest)
+
+
+@pytest.mark.parametrize("response", ("zero", "multiple", "invalid-json"))
+def test_manifest_image_inspection_rejects_invalid_docker_response_shape(
+    p3_3_image_deploy_module: ModuleType,
+    response: str,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    manifest = _load_manifest(provenance_module, "schema3-source")
+    document = _manifest_image_document(provenance_module, manifest)
+    if response == "zero":
+        stdout = "[]"
+    elif response == "multiple":
+        stdout = json.dumps([document, document])
+    elif response == "invalid-json":
+        stdout = "["
+    else:  # pragma: no cover - parameter table guard
+        raise AssertionError(f"unknown Docker response: {response}")
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._inspect_manifest_image(
+            RawManifestImageRunner(stdout),
+            manifest,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-config",
+        "invalid-config",
+        "missing-labels",
+        "invalid-labels",
+        "missing-environment",
+        "invalid-environment",
+    ),
+)
+def test_manifest_image_inspection_rejects_incomplete_config_surfaces(
+    p3_3_image_deploy_module: ModuleType,
+    mutation: str,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    manifest = _load_manifest(provenance_module, "schema3-source")
+    document = _manifest_image_document(provenance_module, manifest)
+    config = document["Config"]
+    assert isinstance(config, dict)
+    if mutation == "missing-config":
+        del document["Config"]
+    elif mutation == "invalid-config":
+        document["Config"] = []
+    elif mutation == "missing-labels":
+        del config["Labels"]
+    elif mutation == "invalid-labels":
+        config["Labels"] = []
+    elif mutation == "missing-environment":
+        del config["Env"]
+    elif mutation == "invalid-environment":
+        config["Env"] = {}
+    else:  # pragma: no cover - parameter table guard
+        raise AssertionError(f"unknown image-config mutation: {mutation}")
+    runner = _runner_for_manifest_image(
+        manifest,
+        tag_document=document,
+        immutable_document=document,
+    )
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._inspect_manifest_image(runner, manifest)
+
+
+def test_manifest_image_inspection_rejects_matching_non_finite_numbers(
+    p3_3_image_deploy_module: ModuleType,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    manifest = _load_manifest(provenance_module, "schema3-source")
+    document = _manifest_image_document(provenance_module, manifest)
+    config = document["Config"]
+    assert isinstance(config, dict)
+    healthcheck = config["Healthcheck"]
+    assert isinstance(healthcheck, dict)
+    healthcheck["Interval"] = float("inf")
+    runner = _runner_for_manifest_image(
+        manifest,
+        tag_document=document,
+        immutable_document=document,
+    )
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._inspect_manifest_image(runner, manifest)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-rootfs-type",
+        "invalid-rootfs-layers",
+        "invalid-rootfs-layer",
+        "invalid-os",
+        "invalid-architecture",
+        "invalid-variant",
+    ),
+)
+def test_manifest_image_inspection_rejects_malformed_runtime_surfaces(
+    p3_3_image_deploy_module: ModuleType,
+    mutation: str,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    manifest = _load_manifest(provenance_module, "schema3-source")
+    document = _manifest_image_document(provenance_module, manifest)
+    rootfs = document["RootFS"]
+    assert isinstance(rootfs, dict)
+    if mutation == "missing-rootfs-type":
+        del rootfs["Type"]
+    elif mutation == "invalid-rootfs-layers":
+        rootfs["Layers"] = None
+    elif mutation == "invalid-rootfs-layer":
+        rootfs["Layers"] = ["not-a-digest"]
+    elif mutation == "invalid-os":
+        document["Os"] = True
+    elif mutation == "invalid-architecture":
+        document["Architecture"] = None
+    elif mutation == "invalid-variant":
+        document["Variant"] = []
+    else:  # pragma: no cover - parameter table guard
+        raise AssertionError(f"unknown runtime-surface mutation: {mutation}")
+    runner = _runner_for_manifest_image(
+        manifest,
+        tag_document=document,
+        immutable_document=document,
+    )
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._inspect_manifest_image(runner, manifest)
+
+
+@pytest.mark.parametrize("surface", ("daemon", "image"))
+def test_prepare_docker_provenance_errors_do_not_expose_captured_output(
+    p3_3_image_deploy_module: ModuleType,
+    surface: str,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    manifest = _load_manifest(provenance_module, "schema3-source")
+    canary = "fictional-docker-stderr-canary"
+
+    class FailingRunner:
+        def run(self, _arguments: list[str], **_kwargs: object) -> object:
+            raise deploy_module.DeploymentError(f"captured output: {canary}")
+
+    with pytest.raises(deploy_module.DeploymentError) as captured:
+        if surface == "daemon":
+            deploy_module._assert_local_docker_daemon(
+                FailingRunner(),
+                manifest.docker_daemon_id,
+            )
+        else:
+            deploy_module._inspect_manifest_image(FailingRunner(), manifest)
+
+    assert canary not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("case", "mutation"),
+    (
+        ("schema3-source", "oci-revision"),
+        ("schema3-source", "source-environment"),
+        ("schema3-source", "duplicate-environment-name"),
+        ("schema2-source", "schema2-reserved-label"),
+        ("schema3-source", "schema3-source-label"),
+        ("schema3-reuse", "reuse-label"),
+        ("schema3-reuse", "unknown-reserved-label"),
+    ),
+)
+def test_manifest_image_inspection_rejects_manifest_binding_drift(
+    p3_3_image_deploy_module: ModuleType,
+    case: str,
+    mutation: str,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    manifest = _load_manifest(provenance_module, case)
+    document = _manifest_image_document(provenance_module, manifest)
+    config = document["Config"]
+    assert isinstance(config, dict)
+    labels = config["Labels"]
+    environment = config["Env"]
+    assert isinstance(labels, dict)
+    assert isinstance(environment, list)
+
+    if mutation == "oci-revision":
+        labels["org.opencontainers.image.revision"] = DONOR_SHA
+    elif mutation == "source-environment":
+        environment[1] = f"COMMERCE_OPS_SOURCE_SHA={DONOR_SHA}"
+    elif mutation == "duplicate-environment-name":
+        environment.append("PORT=9000")
+    elif mutation == "schema2-reserved-label":
+        labels[BUILD_KIND_LABEL] = "source-build"
+    elif mutation == "schema3-source-label":
+        del labels[BUILD_KIND_LABEL]
+    elif mutation == "reuse-label":
+        del labels[REUSED_FROM_IMAGE_ID_LABEL]
+    elif mutation == "unknown-reserved-label":
+        labels[f"{RESERVED_LABEL_PREFIX}unexpected"] = "value"
+    else:  # pragma: no cover - parameter table guard
+        raise AssertionError(f"unknown image mutation: {mutation}")
+
+    runner = _runner_for_manifest_image(
+        manifest,
+        tag_document=document,
+        immutable_document=document,
+    )
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._inspect_manifest_image(runner, manifest)
+
+
+def test_reuse_image_equivalence_allows_only_the_approved_metadata_rebinding(
+    p3_3_image_deploy_module: ModuleType,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    target_manifest, target_image, donor_manifest, donor_image = _reuse_image_evidence(
+        deploy_module
+    )
+
+    assert (
+        deploy_module._assert_reuse_image_equivalence(
+            target_manifest=target_manifest,
+            target_image=target_image,
+            donor_manifest=donor_manifest,
+            donor_image=donor_image,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("target_value", "donor_value"),
+    (
+        (30_000_000_000, 30_000_000_000.0),
+        (False, 0),
+        (0, False),
+    ),
+)
+def test_reuse_image_equivalence_uses_strict_json_types_for_config(
+    p3_3_image_deploy_module: ModuleType,
+    target_value: object,
+    donor_value: object,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    donor_manifest = _load_source_manifest(provenance_module, schema=3)
+    target_manifest = _load_reuse_target_for_donor(provenance_module, donor_manifest)
+    target_document = _manifest_image_document(provenance_module, target_manifest)
+    donor_document = _manifest_image_document(provenance_module, donor_manifest)
+    for document, value in (
+        (target_document, target_value),
+        (donor_document, donor_value),
+    ):
+        config = document["Config"]
+        assert isinstance(config, dict)
+        healthcheck = config["Healthcheck"]
+        assert isinstance(healthcheck, dict)
+        healthcheck["Interval"] = value
+    runner = _runner_for_reuse_images(
+        target_manifest,
+        target_document,
+        donor_manifest,
+        donor_document,
+    )
+    target_image = deploy_module._inspect_manifest_image(runner, target_manifest)
+    donor_image = deploy_module._inspect_manifest_image(runner, donor_manifest)
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._assert_reuse_image_equivalence(
+            target_manifest=target_manifest,
+            target_image=target_image,
+            donor_manifest=donor_manifest,
+            donor_image=donor_image,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "rootfs-layer-order",
+        "rootfs-type",
+        "os",
+        "architecture",
+        "variant",
+        "extra-config-field",
+        "absent-versus-null",
+        "list-order",
+        "unapproved-config-field",
+        "unapproved-environment",
+        "unapproved-label",
+    ),
+)
+def test_reuse_image_equivalence_rejects_every_unapproved_drift(
+    p3_3_image_deploy_module: ModuleType,
+    mutation: str,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    provenance_module = _deploy_provenance_module(deploy_module)
+    donor_manifest = _load_source_manifest(provenance_module, schema=3)
+    target_manifest = _load_reuse_target_for_donor(provenance_module, donor_manifest)
+    target_document = _manifest_image_document(provenance_module, target_manifest)
+    rootfs = target_document["RootFS"]
+    config = target_document["Config"]
+    assert isinstance(rootfs, dict)
+    assert isinstance(config, dict)
+
+    if mutation == "rootfs-layer-order":
+        layers = rootfs["Layers"]
+        assert isinstance(layers, list)
+        layers.reverse()
+    elif mutation == "rootfs-type":
+        rootfs["Type"] = "overlay"
+    elif mutation == "os":
+        target_document["Os"] = "windows"
+    elif mutation == "architecture":
+        target_document["Architecture"] = "arm64"
+    elif mutation == "variant":
+        target_document["Variant"] = "v8"
+    elif mutation == "extra-config-field":
+        config["StopSignal"] = "SIGTERM"
+    elif mutation == "absent-versus-null":
+        del config["Entrypoint"]
+    elif mutation == "list-order":
+        command = config["Cmd"]
+        assert isinstance(command, list)
+        command[0], command[1] = command[1], command[0]
+    elif mutation == "unapproved-config-field":
+        config["WorkingDir"] = "/srv/app"
+    elif mutation == "unapproved-environment":
+        environment = config["Env"]
+        assert isinstance(environment, list)
+        environment[-1] = "PORT=9000"
+    elif mutation == "unapproved-label":
+        labels = config["Labels"]
+        assert isinstance(labels, dict)
+        labels["org.example.runtime-contract"] = "drifted"
+    else:  # pragma: no cover - parameter table guard
+        raise AssertionError(f"unknown equivalence mutation: {mutation}")
+
+    runner = _runner_for_reuse_images(
+        target_manifest,
+        target_document,
+        donor_manifest,
+        _manifest_image_document(provenance_module, donor_manifest),
+    )
+    target_image = deploy_module._inspect_manifest_image(runner, target_manifest)
+    donor_image = deploy_module._inspect_manifest_image(runner, donor_manifest)
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._assert_reuse_image_equivalence(
+            target_manifest=target_manifest,
+            target_image=target_image,
+            donor_manifest=donor_manifest,
+            donor_image=donor_image,
+        )
+
+
+def test_reuse_image_equivalence_requires_distinct_target_and_donor_images(
+    p3_3_image_deploy_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deploy_module = p3_3_image_deploy_module
+    target_manifest, target_image, donor_manifest, donor_image = _reuse_image_evidence(
+        deploy_module
+    )
+    target_manifest = replace(target_manifest, image_id=donor_image.image_id)
+    target_image = replace(target_image, image_id=donor_image.image_id)
+    chain_validation_calls = 0
+
+    def accept_modified_chain(_target: object, _donor: object) -> None:
+        nonlocal chain_validation_calls
+        chain_validation_calls += 1
+
+    monkeypatch.setattr(
+        deploy_module._PROVENANCE,
+        "validate_candidate_manifest_chain",
+        accept_modified_chain,
+    )
+
+    with pytest.raises(deploy_module.DeploymentError):
+        deploy_module._assert_reuse_image_equivalence(
+            target_manifest=target_manifest,
+            target_image=target_image,
+            donor_manifest=donor_manifest,
+            donor_image=donor_image,
+        )
+
+    assert chain_validation_calls == 0
