@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 
 SOURCE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -38,6 +40,26 @@ DEPLOYMENT_ASSET_PATHS = (
     "deploy/workstation/commerce-ops-desk.v0.2.0.Caddyfile.template",
 )
 GIT_COMMAND = ("git", "--no-replace-objects")
+
+
+def _load_verified_provenance_module() -> ModuleType:
+    module_path = Path(__file__).with_name("verified_provenance.py")
+    module_name = "commerce_ops_verified_provenance_builder"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("verified provenance module could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if sys.modules.get(module_name) is module:
+            del sys.modules[module_name]
+        raise
+    return module
+
+
+_PROVENANCE = _load_verified_provenance_module()
 
 
 class BuildError(RuntimeError):

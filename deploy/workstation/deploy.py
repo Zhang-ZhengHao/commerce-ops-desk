@@ -12,6 +12,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -36,8 +37,28 @@ from ipaddress import (
     ip_network,
 )
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 from typing import Any, cast
+
+
+def _load_verified_provenance_module() -> ModuleType:
+    module_path = Path(__file__).with_name("verified_provenance.py")
+    module_name = "commerce_ops_verified_provenance_deploy"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("verified provenance module could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if sys.modules.get(module_name) is module:
+            del sys.modules[module_name]
+        raise
+    return module
+
+
+_PROVENANCE = _load_verified_provenance_module()
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = PRODUCT_ROOT / "deploy" / "workstation" / "compose.yaml"

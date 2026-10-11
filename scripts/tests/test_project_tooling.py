@@ -201,6 +201,27 @@ class ProjectToolingContractTest(unittest.TestCase):
         )
         self.assertIn("main SQLite/full-stack verification gate", makefile.read_text())
 
+    def test_makefile_static_checks_cover_every_deployment_python_module(self) -> None:
+        contents = (PRODUCT_ROOT / "Makefile").read_text()
+        deployment_modules = (
+            "deploy/workstation/verified_provenance.py",
+            "deploy/workstation/build_verified_image.py",
+            "deploy/workstation/deploy.py",
+        )
+        static_commands = tuple(
+            line
+            for line in contents.splitlines()
+            if "ruff check" in line
+            or "ruff format --check" in line
+            or "mypy --config-file backend/pyproject.toml" in line
+        )
+
+        self.assertEqual(len(static_commands), 3)
+        for command in static_commands:
+            for module in deployment_modules:
+                with self.subTest(command=command, module=module):
+                    self.assertIn(module, command)
+
     def test_environment_example_is_runnable_without_containing_credentials(
         self,
     ) -> None:
