@@ -73,6 +73,9 @@ SENSITIVE_RUNTIME_BASENAMES = frozenset(
     }
 )
 
+# Owner-approved email metadata in this already-public, immutable merge only.
+APPROVED_METADATA_EMAIL_COMMITS = frozenset({"cb345a9299d9e65537e69de83c608744f83d45b1"})
+
 
 def run_git(
     repository: Path, *arguments: str, input_bytes: bytes | None = None
@@ -131,8 +134,9 @@ def generic_secret_is_high_confidence(match: re.Match[str]) -> bool:
 
 def contains_personal_email(text: str) -> bool:
     for match in EMAIL_PATTERN.finditer(text):
-        domain = match.group("email").rsplit("@", 1)[1].lower()
-        if domain != "users.noreply.github.com":
+        email = match.group("email").lower()
+        domain = email.rsplit("@", 1)[1]
+        if domain != "users.noreply.github.com" and email != "noreply@github.com":
             return True
     return False
 
@@ -322,7 +326,10 @@ def history_findings(repository: Path) -> set[Finding]:
             content = read_object(repository, object_id, object_type)
         else:
             continue
-        findings.update(findings_for_content(source, content))
+        content_findings = findings_for_content(source, content)
+        if object_type == "commit" and object_id in APPROVED_METADATA_EMAIL_COMMITS:
+            content_findings.discard(Finding(source, "identity.personal_email"))
+        findings.update(content_findings)
     return findings
 
 

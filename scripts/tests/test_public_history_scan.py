@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import runpy
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 SCAN_PROGRAM = PRODUCT_ROOT / "scripts" / "scan_public_history.py"
@@ -188,6 +190,39 @@ class PublicHistoryScanTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, self.output(result))
         self.assertIn("PASS", result.stdout)
         self.assertNotIn(fake_token, self.output(result))
+
+    def test_github_system_noreply_is_allowed_in_commit_metadata(self) -> None:
+        self.repository.git("config", "user.email", "noreply" + "@github.com")
+        self.repository.write_text("README.md", "# Platform metadata fixture\n")
+        self.repository.commit_all("GitHub system metadata fixture")
+
+        result = self.run_scan()
+
+        self.assertEqual(result.returncode, 0, self.output(result))
+
+    def test_approved_metadata_email_keeps_secrets_and_new_emails_blocked(self) -> None:
+        namespace = runpy.run_path(str(SCAN_PROGRAM))
+        history_findings = namespace["history_findings"]
+        personal_email = "owner" + "@private." + "example"
+        fake_token = "gh" + "p_" + ("Y9" * 20)
+        self.repository.git("config", "user.email", personal_email)
+        self.repository.write_text("README.md", "# Historical fixture\n")
+        self.repository.commit_all("historical fixture\n\n" + fake_token)
+        approved_sha = self.repository.git("rev-parse", "HEAD").stdout.strip()
+
+        with patch.dict(
+            history_findings.__globals__,
+            {"APPROVED_METADATA_EMAIL_COMMITS": frozenset({approved_sha})},
+        ):
+            rules = {finding.rule for finding in history_findings(self.repository.path)}
+            self.assertNotIn("identity.personal_email", rules)
+            self.assertIn("secret.github_token", rules)
+
+            self.repository.write_text("notes.txt", "new commit\n")
+            self.repository.commit_all("unapproved author metadata")
+            rules = {finding.rule for finding in history_findings(self.repository.path)}
+            self.assertIn("identity.personal_email", rules)
+            self.assertIn("secret.github_token", rules)
 
     def test_package_scopes_and_database_userinfo_are_not_personal_emails(self) -> None:
         self.repository.write_text(
