@@ -74,7 +74,9 @@ SENSITIVE_RUNTIME_BASENAMES = frozenset(
 )
 
 # Owner-approved email metadata in this already-public, immutable merge only.
-APPROVED_METADATA_EMAIL_COMMITS = frozenset({"cb345a9299d9e65537e69de83c608744f83d45b1"})
+APPROVED_METADATA_EMAIL_COMMITS = frozenset(
+    {"cb345a9299d9e65537e69de83c608744f83d45b1"}
+)
 
 
 def run_git(
