@@ -14,5 +14,5 @@ pluggy==1.6.0
 Pygments==2.21.0
 pytest==9.1.1
 ruff==0.16.10
-setuptools==84.0.0
+setuptools==84.1.0
 truststore==0.10.4
