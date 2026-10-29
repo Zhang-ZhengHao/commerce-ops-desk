@@ -1958,9 +1958,8 @@ def test_recompute_runtime_equivalence_accepts_the_reviewed_real_history(
         str(PRODUCT_ROOT),
         str(repository),
     )
-    target_sha = (
-        run_test_git(repository, "rev-parse", "HEAD").decode("ascii").removesuffix("\n")
-    )
+    # Pin the reviewed transition; dependency updates change runtime inputs.
+    target_sha = "6483c024e986e64c926e9f14dea4b7dd99ad2046"
     approved_ref = "refs/remotes/origin/approved"
     run_test_git(repository, "update-ref", approved_ref, target_sha)
     attacker_bin = tmp_path / "attacker-bin"
