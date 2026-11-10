@@ -2,7 +2,7 @@
 
 All notable changes to CommerceOps Desk are documented here. The project follows semantic versioning once a release is published.
 
-## [Unreleased]
+## [0.2.1] - 2026-11-10
 
 ### Added
 
